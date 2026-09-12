@@ -1,0 +1,9 @@
+# dsh-liubian bundle 层：向组合挂流变系统的 Node half
+# （工具面 / 上下文注入 / 自动日记 / 技能落盘）。
+#
+# 本文件是 **bundle 包内层**，只声明"这个包挂哪些插件 id"。
+# 启停覆盖请写 profile 层（$DSH_HOME/profiles/<name>/cordis.patch.yml），
+# 不要写到这里 —— 产品层不该动，写错层是 bundle 特有的坑。
+- insert:
+    - id: dsh-liubian
+      name: 'dsh-liubian'

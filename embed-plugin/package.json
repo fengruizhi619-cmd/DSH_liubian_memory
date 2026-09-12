@@ -23,5 +23,10 @@
     "llama.cpp",
     "vector"
   ],
-  "license": "BSD-3-Clause"
+  "license": "BSD-3-Clause",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
 }

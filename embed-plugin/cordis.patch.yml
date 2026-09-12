@@ -1,0 +1,8 @@
+# dsh-liubian-embed bundle 层：向组合挂本地语义向量服务的 Node half
+# （探活 / 拉起 llama.cpp / 等待就绪 / 关停，端口 8082）。
+#
+# 本文件是 **bundle 包内层**，只声明"这个包挂哪些插件 id"。
+# 启停覆盖请写 profile 层（$DSH_HOME/profiles/<name>/cordis.patch.yml）。
+- insert:
+    - id: dsh-liubian-embed
+      name: 'dsh-liubian-embed'
