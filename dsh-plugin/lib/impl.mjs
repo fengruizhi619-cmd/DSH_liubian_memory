@@ -71,6 +71,14 @@ export const DEFAULTS = {
   memoryTagTopN: 5,          // 让模型挑几个 tag
   memoryTagHints: 100,       // 送给模型的标签候选个数（写日记同款：语义选前 N）
   memoryTimeoutMs: 120000,   // 本地向量 + helper 的超时（helper 首次要读 6114 篇向量，给足）
+  // ── 检索侧外部 API（与写日记**分开的 key**）──
+  // 用途只有一处：联合检索里"让模型从候选标签里挑 N 个 tag"那一次调用（screenQueryTags）。
+  // 用户 2026-09-12 要求检索走另一把 key（基址同 DeepSeek）。留空则回退用写日记那把 key。
+  memoryApiKey: '',
+  memoryApiUrl: 'https://api.deepseek.com/chat/completions',
+  memoryApiModel: 'deepseek-flash',
+  memoryApiTimeoutMs: 60000,
+  memoryApiJsonMode: true,
   // ── 自动日记（外部 API 撰写，下一轮写上一轮）──
   // 开关与 key 放在独立文件 ~/.dsh/liubian/diary.json，避免和主配置混在一起
   diaryMaxChars: 500,        // 每篇日记正文上限（字）；一轮要写几篇由内容决定，不设上限
@@ -756,6 +764,10 @@ export function registerTools(ctx, cfg) {
         `[端点] ${dc.url}　[模型] ${dc.model}　[temperature] ${dc.temperature}　[maxTokens] ${dc.maxTokens}`,
         `[规则] 下一轮写上一轮｜每篇 ≤${cfg.diaryMaxChars} 字（超出新建，篇数不限）`,
         `[标签] ${svc}｜字典 ${tagN} 个｜[工作区] ${cfg.diaryWorkspace}`,
+        `[检索侧 API] ${(() => {
+          const api = retrievalApiConfig(cfg, dc)
+          return `${api.model}　key ${maskKey(api.apiKey)}　来源 ${api.source}`
+        })()}`,
         `[本会话] 已封口 ${buf ? buf.sealed.length : 0} 轮｜待写 ${takeUnwrittenTurn(sessionId) ? '有' : '无'}`,
         `[待补队列] ${pending.length} 条`,
         `[已写日志] ${writtenKeys.size} 条`,
@@ -1092,8 +1104,13 @@ async function takeProfileMessage(cfg, agent) {
 
 /** 外部 API：从标签候里挑出与本轮最相关?N 个（与写日记同一个端?key/模型）?*/
 export async function screenQueryTags(cfg, text, hints, log) {
+  // 检索侧用**独立的外部 API**（memoryApiKey），与写日记的 key 分开。
+  // 没配 memoryApiKey 时回退到写日记那把 key（dc），保证单独部署也能用。
   const dc = diaryConfig()
-  if (!dc.enabled || !dc.apiKey) return { tags: [], why: '外部 API 未配置（写日记的 key 为空或未开启）' }
+  const api = retrievalApiConfig(cfg, dc)
+  if (!api.apiKey) {
+    return { tags: [], why: '检索侧外部 API 未配置（memoryApiKey 与写日记 key 都为空）' }
+  }
   if (!hints.length) return { tags: [], why: '标签候选为空' }
   const n = Math.max(1, Number(cfg.memoryTagTopN) || 5)
   const sys = [
@@ -1110,7 +1127,7 @@ export async function screenQueryTags(cfg, text, hints, log) {
   ].join('\n')
   const user = `[候选标签（按相似度降序）]\n${hints.join('、')}\n\n[本轮内容]\n${String(text).slice(0, Number(cfg.memoryQueryChars) || 6000)}`
   const payload = { messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }
-  const res = await callDiaryApi(cfg, { ...dc, timeoutMs: Math.max(20000, Number(cfg.memoryTimeoutMs) || 60000) }, payload)
+  const res = await callDiaryApi(cfg, api, payload)
   if (!res.ok) return { tags: [], why: `挑标签失败：${res.error}` }
   // ⚠️ 这里不能用 res.entries：callDiaryApi 只认写日记的 {"diaries":[...]} 形状，
   // 而本接口返回的是 {"tags":[...]} —— 之前就是因为这个被当成"未返回预期 JSON"。
@@ -1387,6 +1404,7 @@ export const __test = {
   tagDictionary,
   // - 联合索（纯函数，自检用）-
   screenQueryTags,
+  retrievalApiConfig,
   jointQuery,
   fuseScores,
   memoryRetrieval,
@@ -1440,6 +1458,31 @@ export const DIARY_DEFAULTS = {
   temperature: 0.3,
   maxTokens: 4096,
   jsonMode: true,
+}
+
+/**
+ * 检索侧外部 API 的配置（与写日记**分开的 key**）。
+ *
+ * 用户规格（2026-09-12）：检索日记走另一个 API（基址同 DeepSeek）。
+ * 检索侧只有一处外部调用：`screenQueryTags` —— 让模型从候选标签里挑 N 个 tag。
+ * 语义向量那一路走的是**本地**嵌入服务（llama.cpp:8082），不经外部 API。
+ *
+ * 回退规则：`memoryApiKey` 为空 → 用写日记那把 key，这样只配写日记也能直接跑，
+ * 不会因为漏配而让检索整条失效。
+ */
+export function retrievalApiConfig(cfg, dc) {
+  const d = dc || diaryConfig()
+  const key = String(cfg.memoryApiKey || '').trim() || String(d.apiKey || '').trim()
+  return {
+    url: normalizeDiaryUrl(cfg.memoryApiUrl || d.url || DIARY_DEFAULTS.url),
+    apiKey: key,
+    model: String(cfg.memoryApiModel || '').trim() || d.model || DIARY_DEFAULTS.model,
+    temperature: 0.2,                     // 挑标签要稳，别发散
+    maxTokens: Math.max(512, Number(d.maxTokens) || 4096),
+    jsonMode: cfg.memoryApiJsonMode !== false,
+    timeoutMs: Math.max(20000, Number(cfg.memoryApiTimeoutMs) || Number(cfg.memoryTimeoutMs) || 60000),
+    source: String(cfg.memoryApiKey || '').trim() ? 'memoryApiKey' : 'diary-key(fallback)',
+  }
 }
 
 export function diaryConfig() {
