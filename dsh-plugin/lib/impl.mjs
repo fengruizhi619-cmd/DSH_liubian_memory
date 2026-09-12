@@ -34,7 +34,8 @@ export const DEFAULTS = {
   python: 'E:/python/python.exe',
   memoryScript: join(MEMORY_SKILL, 'scripts', 'memory.py'),
   semanticScripts: join(MEMORY_SKILL, 'scripts'),
-  kotatsuUi: join(MEMORY_SKILL, 'scripts', 'kotatsu_ui.py'),
+  // 被炉相关路径（kotatsuUi / room_read）已随被炉子系统一起卸下，
+  // 以后由独立插件接管；后端 memory.py 的 kotatsu 子命令族与数据保持不动。
   path2Script: join(LIUBIAN_SKILL, 'scripts', '通路2', 'liubian_path2.py'),
   liubianCli: join(LIUBIAN_SKILL, 'scripts', 'liubian.py'),
   panelExe: join(LIUBIAN_SKILL, 'dist', 'liubian_panel.exe'),
@@ -46,12 +47,10 @@ export const DEFAULTS = {
   installSkills: true,
   // ── DSH 侧身份策略：不需要用户管密码/KEY ──
   // 写日记走匿名（memory.py 的 write 在无 -u 时完全不鉴权，也不受工作区归属限制）。
-  // 检索 / 留言 / 被炉 / 更新 要一个账号，由插件自动注册一个免密花朵账号（密码根本不存在）。
+  // 检索 / 更新 要一个账号，由插件自动注册一个免密花朵账号（密码根本不存在）。
   systemUser: '玉兰',
   autoProvision: true,
   // 向量服务的配置与生命周期已拆到独立插件 dsh-liubian-embed
-  kotatsuIntervalSec: 5,
-  kotatsuHeartbeatSec: 25,
   timeoutMs: 180000,
   // ── 上下文插入（对照 @openviking/dsh-memory-plugin） ──
   profileInject: true,
@@ -198,7 +197,7 @@ export function runPython(cfg, script, args, opts = {}) {
 }
 
 /**
- * 异步版：被炉挂机监听每几秒轮询一次，同步?execFileSync 会把 DSH 宿主
+ * 异步版：面板 / 嵌入服务等子进程用。同步的 execFileSync 会把 DSH 宿主
  * （Electron 主进程）事件循环卡住，所以监听链路一律走这里? */
 function runPythonAsync(cfg, script, args, opts = {}) {
   return new Promise(resolve => {
@@ -225,7 +224,7 @@ function runPythonAsync(cfg, script, args, opts = {}) {
   })
 }
 
-/** 透传 memory.py（记忆 / 被炉 / 更新 / 留言板 的全部子命令）。 */
+/** 透传 memory.py（记忆 / 更新 的全部子命令）。 */
 export function runMemory(cfg, args, opts = {}) {
   return runPython(cfg, cfg.memoryScript, args, {
     ...opts,
@@ -306,171 +305,12 @@ export function withTempPayload(text, fn) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
- * 3. 流变·被炉 —?挂机监听
- *    Codex 侧由 MCP 子进程的守护线程托管（mcp_kotatsu.py _watch_loop），
- *    DSH 侧没有常?MCP 进程，改为插件进程内的异步轮询器? *    ?intervalSec 读一次房间新消息入内存队列，收到消息 / 到心跳点时调
- *    memory.py kotatsu poll（标记已?+ 维持在线）随插件卸载起收摊 * ────────────────────────────────────────────────────────────────────────── */
-
-const watchers = new Map()
-
-/** key = `${room}|${username}`，与 Codex ?mcp_kotatsu ?_key() 致?*/
-export function watchKey(room, username) {
-  return `${room}|${username}`
-}
-
-class Watcher {
-  constructor(cfg, opts) {
-    this.cfg = cfg
-    this.room = opts.room
-    this.username = opts.username
-    this.password = opts.password
-    this.workspace = opts.workspace
-    this.intervalSec = Math.max(1, Number(opts.intervalSec) || cfg.kotatsuIntervalSec)
-    this.heartbeatSec = Math.max(5, Number(opts.heartbeatSec) || cfg.kotatsuHeartbeatSec)
-    this.queue = []
-    this.cursor = 0
-    this.ticks = 0
-    this.stopped = false
-    this.timer = null
-    this.lastError = ''
-    this.lastHeartbeat = Date.now()
-    this.startedAt = new Date().toLocaleString('zh-CN')
-  }
-
-  async tick() {
-    if (this.stopped) return
-    this.ticks += 1
-    try {
-      const raw = await runHelperAsync(this.cfg, 'room_read', [this.room, String(this.cursor)], {
-        env: { LU_USER: this.username },
-        timeoutMs: 60000,
-      })
-      let data = null
-      try {
-        data = JSON.parse(raw)
-      } catch {
-        this.lastError = raw.slice(0, 300)
-      }
-      if (data && data.ok) {
-        this.lastError = ''
-        this.cursor = Number(data.cursor) || this.cursor
-        const messages = data.messages || []
-        if (messages.length > 0) {
-          this.queue.push(...messages)
-          await this.heartbeat() // 有消息：立刻标记已读并刷新在?        } else if (Date.now() - this.lastHeartbeat >= this.heartbeatSec * 1000) {
-          await this.heartbeat()
-        }
-      }
-    } catch (err) {
-      this.lastError = (err && err.message) || String(err)
-    }
-    if (!this.stopped) {
-      this.timer = setTimeout(() => {
-        void this.tick()
-      }, this.intervalSec * 1000)
-    }
-  }
-
-  async heartbeat() {
-    await runMemoryAsync(this.cfg, [
-      'kotatsu', 'poll',
-      '--room', this.room,
-      '--user', this.username,
-      '--password', this.password,
-      '--since', String(this.cursor),
-    ], { workspace: this.workspace, timeoutMs: 60000 })
-    this.lastHeartbeat = Date.now()
-  }
-
-  start() {
-    void this.tick()
-  }
-
-  take() {
-    const items = this.queue
-    this.queue = []
-    return items
-  }
-
-  stop() {
-    this.stopped = true
-    if (this.timer) {
-      clearTimeout(this.timer)
-      this.timer = null
-    }
-    const dropped = this.queue.length
-    this.queue = []
-    return dropped
-  }
-
-  statusLine() {
-    const age = Math.round((Date.now() - this.lastHeartbeat) / 1000)
-    return `[${watchKey(this.room, this.username)}] ${this.stopped ? '已停止' : '监听中'}`
-      + ` 队列${this.queue.length} 游标${this.cursor} 轮询${this.ticks}次`
-      + ` 心跳${age}秒前 启动${this.startedAt}`
-      + (this.lastError ? ` | 错误: ${this.lastError}` : '')
-  }
-}
-
-export function watchStart(cfg, opts) {
-  const key = watchKey(opts.room, opts.username)
-  const existing = watchers.get(key)
-  if (existing && !existing.stopped) {
-    return `[OK] 已在监听 ${key}（队?${existing.queue.length} 条）`
-  }
-  const watcher = new Watcher(cfg, opts)
-  watchers.set(key, watcher)
-  watcher.start()
-  return `[OK] 已启动挂机监?${key} | 间隔 ${watcher.intervalSec}s 心跳 ${watcher.heartbeatSec}s`
-    + '\n之后?action=watch_take 取消息；下线务必 action=watch_stop（在线状态停止心跳后?70 秒自然消失）'
-}
-
-export function watchTake(room, username) {
-  const watcher = watchers.get(watchKey(room, username))
-  if (!watcher || watcher.stopped) {
-    return `[错误] ${watchKey(room, username)} 未启动挂机监听（用 action=watch_start）`
-  }
-  const items = watcher.take()
-  if (items.length === 0) return `[${room}] 无新消息`
-  const lines = items.map(m => `${m.system ? '系统' : m.from} ${m.time} #${m.id}: ${m.content}`)
-  return `[${room}] ${items.length} 条新消息:\n${lines.join('\n')}`
-}
-
-export function watchStatus() {
-  const alive = [...watchers.values()].filter(w => !w.stopped)
-  if (alive.length === 0) return '[被炉] 当前无挂机监听'
-  return alive.map(w => w.statusLine()).join('\n')
-}
-
-export function watchStop(room, username) {
-  const key = watchKey(room, username)
-  const watcher = watchers.get(key)
-  if (!watcher) return `[错误] ${key} 无挂机监听可停止`
-  const dropped = watcher.stop()
-  watchers.delete(key)
-  return `[OK] 已停止挂机监?${key}` + (dropped ? `（丢弃未取消?${dropped} 条）` : '')
-}
-
-export function watchStopAll() {
-  const keys = [...watchers.keys()]
-  for (const key of keys) {
-    const watcher = watchers.get(key)
-    if (watcher) watcher.stop()
-    watchers.delete(key)
-  }
-  return keys.length === 0 ? '[被炉] 当前无挂机监听' : `[OK] 已停止 ${keys.length} 个挂机监听：${keys.join('、')}`
-}
-
-/** 插件卸载时清理（挂到 ctx.effect 的 disposer 上）。 */
-export function disposeWatchers() {
-  for (const watcher of watchers.values()) watcher.stop()
-  watchers.clear()
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
- * 4. 工具?—?覆盖 Codex ?9 个流?MCP 服务器的全部能力
- *    mcp-memory-core / write / search / validate / panel / kotatsu /
- *    update / skill-index，另?liubian.py status? *    （向量服务已拆出去，见独立插?dsh-liubian-embed? * ────────────────────────────────────────────────────────────────────────── */
+ * 3. 工具面 —— 覆盖 Codex 侧 MCP 服务器的能力
+ *    mcp-memory-core / write / search / validate / panel / update / skill-index，
+ *    外加 liubian.py status。
+ *    （向量服务已拆出去，见独立插件 dsh-liubian-embed）
+ *    （留言板 inbox/post 与被炉 kotatsu 已于 2026-09-12 卸下，待独立插件接管）
+ * ────────────────────────────────────────────────────────────────────────── */
 
 export const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -487,13 +327,20 @@ const ACCOUNT_UNAVAILABLE = '[错误] 系统账号不可用：把 systemUser 设
   + '或打开 autoProvision 让插件自动注册一个免密账号。'
 
 /**
- * DSH 侧的身份策略（用户明确要求：DSH 侧不再有身份/密钥/密码这些东西） *
- * 后端 memory.py 的鉴权分布是? *   - `write`  ?整段?`if username:` 包着?*不带 -u 就完全不鉴权**，也没有工作区归属限? *   - `search` ??`-u` 时校验密码与 KEY；不?`-u` 的匿名分支要求工作区 index 里有
- *                legacy `last_key`，库里那 13 个工作区的该字段全是空串 ?匿名分支已死
- *   - `inbox` / `post` / `kotatsu` / `update` ?都要个存在的账号
+ * DSH 侧的身份策略（用户明确要求：DSH 侧不再有身份/密钥/密码这些东西）。
  *
- * 以本插件：写日记?*匿名**（零身份）；要账号的能力统一?*自动注册的免密账?*
- * （`register --free`：库?`pwd` 为空 ?`verify_user_pwd` 直接放行，密码根本不存在） * 账号名是花朵名（`search` 强制要求 username ?FLOWER_NAMES），KEY 由插件自动取回并缓存? * 用户从头到尾不需要输入任何密码或 KEY? */
+ * 后端 memory.py 的鉴权分布是：
+ *   - `write`  整段被 `if username:` 包着 → 不带 -u 就完全不鉴权，也没有工作区归属限制；
+ *   - `search` 带 -u 时校验密码与 KEY；不带 -u 的匿名分支要求工作区 index 里有
+ *              legacy `last_key`，库里那 13 个工作区的该字段全是空串 → 匿名分支已死；
+ *   - `update` / `skill-index` 等要一个存在的账号。
+ *   （`inbox` / `post` / `kotatsu` 同样要账号，但已随留言板/被炉一起卸下。）
+ *
+ * 所以本插件：写日记**匿名**（零身份）；要账号的能力统一用**自动注册的免密账号**
+ * （`register --free`：库里 `pwd` 为空 → `verify_user_pwd` 直接放行，密码根本不存在）。
+ * 账号名是花朵名（`search` 强制要求 username 属于 FLOWER_NAMES），KEY 由插件自动取回并缓存，
+ * 用户从头到尾不需要输入任何密码或 KEY。
+ */
 function accountFile() {
   return join(DSH_HOME, 'liubian', 'account.json')
 }
@@ -559,7 +406,7 @@ export function registerTools(ctx, cfg) {
   register(ctx, {
     name: 'account',
     description: '查看 DSH 侧流变接入状态。写日记走匿名（无身份 / 无密码 / 无 KEY）；'
-      + '检索 / 留言 / 被炉 / 更新 用一个插件自动注册的免密花朵账号（密码根本不存在，你不需要输入任何东西）。'
+      + '检索 / 更新 用一个插件自动注册的免密花朵账号（密码根本不存在，你不需要输入任何东西）。'
       + 'action: show 查看状态｜ensure 立即补齐账号与 KEY。',
     parameters: {
       action: { type: 'string', enum: ['show', 'ensure'], required: true, description: '查看或补齐' },
@@ -570,7 +417,7 @@ export function registerTools(ctx, cfg) {
       const cached = loadAccount()
       const lines = [
         '[写日记] 匿名模式：不带身份、无鉴权、无工作区归属限制，直接落盘',
-        `[检索/留言/被炉/更新] 系统账号：${cfg.systemUser || '(未配置)'}（免密）`,
+        `[检索/更新] 系统账号：${cfg.systemUser || '(未配置)'}（免密）`,
       ]
       if (action === 'ensure') {
         const acc = ensureSystemAccount(cfg)
@@ -664,127 +511,6 @@ export function registerTools(ctx, cfg) {
     parameters: { workspace: ARG_WORKSPACE },
     async execute(args) {
       return runMemory(cfg, ['info'], { workspace: args.workspace })
-    },
-  })
-
-  /* - 流变·记忆：留-?------------------------------------------------------------ */
-  register(ctx, {
-    name: 'inbox',
-    description: '查看发给我的留言（跨对话交流）查看后自动标记已读，已读留不再推为未读。无身份',
-    parameters: {
-      workspace: ARG_WORKSPACE,
-    },
-    async execute(args) {
-      const acc = ensureSystemAccount(cfg)
-      if (!acc) return ACCOUNT_UNAVAILABLE
-      return runMemory(cfg, ['inbox', '-u', acc.user, '--key', acc.key], { workspace: args.workspace })
-    },
-  })
-
-  register(ctx, {
-    name: 'post',
-    description: '给其他已注册用户留言（跨对话交流，存全局留言板）。含 @管理?的留会在被炉进入待办。无身份',
-    parameters: {
-      to: { type: 'string', required: true, description: '接收者花名（必须是已注册用户' },
-      content: { type: 'string', required: true, description: '留言正文' },
-      workspace: ARG_WORKSPACE,
-    },
-    async execute(args) {
-      const acc = ensureSystemAccount(cfg)
-      if (!acc) return ACCOUNT_UNAVAILABLE
-      // memory.py post 的解析器要求 --password 非空才肯下走；免密账号会忽略这个值，
-      // 以给个占位符（用户永远不会看到也不需要知道它）      // post 只认 --content（没?--file 通道），留言按短文本处理。
-      return runMemory(cfg, [
-        'post', '-u', acc.user, '--password', PASSWORD_PLACEHOLDER,
-        '--to', String(args.to || ''), '--content', String(args.content || ''),
-      ], { workspace: args.workspace })
-    },
-  })
-
-  /* ── 流变·被炉（mcp-kotatsu） ──────────────────────────────────────────── */
-  register(ctx, {
-    name: 'kotatsu',
-    description: '被炉系统（KOTATSU）：实时房间收发 / 检索 / 待办，以及挂机监听。'
-      + 'action: join 加入或创建房间｜send 发消息｜poll 查看新消息｜search 检索聊天记录｜'
-      + 'todo 待办（配合 todo_action）｜diary 创始人标记日记完成重置计数｜'
-      + 'watch_start/watch_take/watch_status/watch_stop 挂机监听。'
-      + '纪律：被炉消息不带名字前缀与括号；收到即回；下线必须 watch_stop。',
-    parameters: {
-      action: {
-        type: 'string',
-        required: true,
-        enum: ['join', 'send', 'poll', 'search', 'todo', 'diary', 'watch_start', 'watch_take', 'watch_status', 'watch_stop'],
-        description: '被炉操作',
-      },
-      room: { type: 'string', description: '房间名（watch_status 可省略）' },
-      message: { type: 'string', description: 'send 的消息内容' },
-      keyword: { type: 'string', description: 'search 的关键词' },
-      msg_id: { type: 'number', description: 'search 按消息序号精确查' },
-      user: { type: 'string', description: 'search 限定发送者（与身份花名无关，是过滤条件）' },
-      todo_action: { type: 'string', enum: ['add', 'list', 'withdraw'], description: 'todo 的子动作' },
-      todo_id: { type: 'number', description: 'todo withdraw 的待办编号' },
-      content: { type: 'string', description: 'todo add 的待办内容' },
-      interval_sec: { type: 'number', description: 'watch_start 轮询间隔（秒，默认 5）' },
-      heartbeat_sec: { type: 'number', description: 'watch_start 心跳间隔（秒，默认 25）' },
-      workspace: ARG_WORKSPACE,
-    },
-    async execute(args) {
-      const action = String(args.action || '').toLowerCase()
-      const room = String(args.room || '')
-
-      if (action === 'watch_status') return watchStatus()
-      const acc = ensureSystemAccount(cfg)
-      if (!acc) return ACCOUNT_UNAVAILABLE
-      const who = acc.user
-      if (action.startsWith('watch') && !room) return '[错误] 挂机监听需要 room 参数'
-
-      if (action === 'watch_start') {
-        return watchStart(cfg, {
-          room,
-          username: who,
-          password: PASSWORD_PLACEHOLDER,
-          workspace: args.workspace,
-          intervalSec: args.interval_sec,
-          heartbeatSec: args.heartbeat_sec,
-        })
-      }
-      if (action === 'watch_take') return watchTake(room, who)
-      if (action === 'watch_stop') {
-        return args.room ? watchStop(room, who) : watchStopAll()
-      }
-
-      if (!room) return '[错误] 该操作需?room 参数'
-      const base = ['kotatsu', action, '--room', room, '--user', who, '--password', PASSWORD_PLACEHOLDER]
-      if (action === 'send') return runMemory(cfg, [...base, '--message', String(args.message || '')], { workspace: args.workspace })
-      if (action === 'poll') {
-        // ?Codex ?kotatsu_poll 同源?-since 取该用户在房间里?last_seen
-        // （memory.py ?poll --since 0 会把历史消息全出来）。
-        let since = 0
-        const raw = runHelper(cfg, 'room_read', [room, '0'], { env: { LU_USER: who }, timeoutMs: 60000 })
-        try {
-          const data = JSON.parse(raw)
-          if (data && data.ok) since = Number((data.last_seen || {})[who] || 0)
-        } catch {
-          since = 0
-        }
-        return runMemory(cfg, [...base, '--since', String(since)], { workspace: args.workspace })
-      }
-      if (action === 'diary') return runMemory(cfg, base, { workspace: args.workspace })
-      if (action === 'search') {
-        const argv = ['kotatsu', 'search', '--room', room]
-        if (args.keyword) argv.push('--keyword', String(args.keyword))
-        if (args.user) argv.push('--user', String(args.user))
-        if (args.msg_id) argv.push('--id', String(args.msg_id))
-        return runMemory(cfg, argv, { workspace: args.workspace })
-      }
-      if (action === 'todo') {
-        const sub = String(args.todo_action || 'list').toLowerCase()
-        const argv = [...base, sub]
-        if (args.content) argv.push('--content', String(args.content))
-        if (args.todo_id) argv.push('--id', String(args.todo_id))
-        return runMemory(cfg, argv, { workspace: args.workspace })
-      }
-      return `[错误] 未知 action: ${action}`
     },
   })
 
@@ -1036,23 +762,15 @@ export function registerTools(ctx, cfg) {
     },
   })
 
-  /* - 面板（mcp-memory-panel?------------------------------------------------------------ */
+  /* - 面板（mcp-memory-panel） ------------------------------------------------------------ */
   register(ctx, {
     name: 'panel',
-    description: '打开本地管理界面（仅本机真人使用）：流变系统管理面板（用?/ 被炉 / skill 管理）或被炉房间 UI',
+    description: '打开本地管理界面（仅本机真人使用）：流变系统管理面板（用户 / 记忆 / 被炉 / skill 管理）。',
     parameters: {
-      target: { type: 'string', enum: ['admin', 'kotatsu'], required: true, description: 'admin=管理面板；kotatsu=被炉房间 UI' },
-      room: { type: 'string', description: 'target=kotatsu 时的房间' },
+      target: { type: 'string', enum: ['admin'], required: true, description: 'admin=管理面板（被炉房间 UI 已随被炉子系统一起卸下）' },
       workspace: ARG_WORKSPACE,
     },
     async execute(args) {
-      const target = String(args.target || 'admin').toLowerCase()
-      if (target === 'kotatsu') {
-        const room = String(args.room || '')
-        if (!room) return '[错误] 打开被炉 UI 需要 room'
-        if (!existsSync(cfg.kotatsuUi)) return `[错误] 未找到 kotatsu_ui.py: ${cfg.kotatsuUi}`
-        return `${launchDetached(cfg.python, [cfg.kotatsuUi, '--room', room])}：被炉房间 [${room}] UI`
-      }
       if (existsSync(cfg.panelExe)) return `${launchDetached(cfg.panelExe, [])}：流变系统管理面板`
       if (existsSync(cfg.panelPy)) return `${launchDetached(cfg.python, [cfg.panelPy])}：流变系统管理面板（PyQt）`
       return '[错误] 未找到面板程序（panelExe / panelPy 都不存在'
@@ -1299,7 +1017,7 @@ async function buildProfileBlock(cfg) {
   const lines = []
   const card = data.card
 
-  lines.push(`[流变·记忆] 写日记走匿名（无身份）；检索/留言/被炉/更新用系统账号 ${systemUser || '(未配置)'}`
+  lines.push(`[流变·记忆] 写日记走匿名（无身份）；检索/更新用系统账号 ${systemUser || '(未配置)'}`
     + `｜默认工作区：${cfg.workspace}`)
 
   const dc = diaryConfig()
@@ -1310,12 +1028,8 @@ async function buildProfileBlock(cfg) {
     const d = card.last_diary
     lines.push(`[最近记忆] ${d.id}@${d.workspace} ${d.date} — ${clipText(d.summary, 80)}`)
   }
-  lines.push(card?.unread > 0
-    ? `[留言板] ${card.unread} 条未读留言（共 ${card.total_messages} 条）——用 _dsh_external_dsh_liubian_inbox 查看，查看后自动已读`
-    : `[留言板] 无未读（历史 ${card?.total_messages ?? 0} 条）`)
+  lines.push('[留言板/被炉] 已从本插件卸下（2026-09-12），以后由独立插件接管；不可用属预期。')
 
-  lines.push(`[被炉] 房间 ${(data.kotatsu_rooms || []).length} 个：${(data.kotatsu_rooms || []).join('、') || '（无）'}`
-    + `｜当前挂机监听：${watchStatus().startsWith('[被炉] 当前') ? '无' : '进行中'}`)
   lines.push(`[记忆规模] ${data.user_count} 用户 / ${data.workspace_count} 工作区 / `
     + `${data.tag_entries} 条 tag 索引 / ${data.tag_names} 个标签`)
   lines.push('[检索] ' + (cfg.memoryInject
@@ -2631,7 +2345,7 @@ export function apply(ctx, input = {}) {
   mountAutoDiary(ctx, cfg)
 
   // 被炉挂机监听随插件卸?/ DSH 出一起收摊，不留残余轮询。
-  ctx.effect(() => () => disposeWatchers(), 'dsh-liubian: 停止被炉挂机监听')
+  /* [已卸下] 被炉挂机监听的清理钩子（监听器已移除，无需清理） */
   ctx.effect(() => () => disposeContextInjection(), 'dsh-liubian: 清理上下文插入状')
 
   ctx.logger?.info?.(

@@ -1,12 +1,12 @@
 ---
 name: liubian-memory
-description: 流变·记忆系统（DSH 版）。日记写入与记忆检索都已自动完成（每轮自动写上一轮 + 自动注入最相关的 10 篇全文），不需要输出任何状态头或汇报格式。当用户提到"记忆""日记""检索记忆""留言""被炉""流变""#m""语义检索"，或需要跨会话查历史结论、给别的智能体留言、把技能加入检索库时使用。含标签策略、联合检索、留言板协议、被炉实时房间与挂机监听、双通路校验。
+description: 流变·记忆系统（DSH 版）。日记写入与记忆检索都已自动完成（每轮自动写上一轮 + 自动注入最相关的 10 篇全文），不需要输出任何状态头或汇报格式。当用户提到"记忆""日记""检索记忆""流变""#m""语义检索"，或需要跨会话查历史结论、把技能加入检索库时使用。含标签策略、联合检索、双通路校验。注意：留言板与被炉已从本插件卸下（待独立插件），相关工具不可用。
 ---
 
 # 流变·记忆（DSH 版）
 
 > 本技能是 Codex 侧 `memory-skill` 的 DSH 移植版。后端与数据完全复用：
-> 日记、标签、用户、留言、被炉房间都在 `E:\DSH_data\.memory_registry\liubian.db`，
+> 日记、标签、用户都在 `E:\DSH_data\.memory_registry\liubian.db`，
 > **两端同源** —— DSH 写的日记，Codex 侧 `#m` 流程能立刻检索到，反之亦然。
 > 差别只在于调用方式：Codex 侧走 `python memory.py ...` 命令行，DSH 侧走原生工具。
 
@@ -22,7 +22,7 @@ description: 流变·记忆系统（DSH 版）。日记写入与记忆检索都�
 
 | 时机 | 注入内容 | 形态 |
 |---|---|---|
-| 会话开始 | **接入卡**：写入模式 / 系统账号 / 默认工作区 / 最近一篇日记 / 未读留言数 / 被炉房间 / 记忆规模 | `<liubian-context source="profile">` |
+| 会话开始 | **接入卡**：写入模式 / 系统账号 / 默认工作区 / 最近一篇日记 / 记忆规模 / 检索与写日记的开关状态 | `<liubian-context source="profile">` |
 | 每轮新的人类输入 | **联合检索注入**：查询 = 上一轮回答 + 本轮问题 → ①嵌入成向量与库里日记算余弦 ②同一段文本 + 标签候选表送外部 API 挑 5 个 tag 做字面检索 ③两路融合取前 10 篇**全文**注入 | `<liubian-memory hits="10" score="cos+tag">` |
 
 因此：
@@ -30,7 +30,7 @@ description: 流变·记忆系统（DSH 版）。日记写入与记忆检索都�
 - **不要再输出任何状态头 / 四行标记 / "已检索"之类的汇报**（2026-09-12 取消）。
 - 每轮的检索已自动完成、结果就在上下文里（`<liubian-memory>` 块）。只有第一轮、无命中、
   或想换角度再查一遍时，才需要显式调 `_dsh_external_dsh_liubian_search`。
-- `inbox` 仍然只有"查看才标记已读"，所以**想确认有没有人找你就得真的调一次** —— 但不用在回答里写出来。
+- 留言板已卸下，**不要再尝试查留言**（工具已不存在）。
 - 联合检索**只在每个新人类输入时触发一次**（同一轮内的工具往返不重复），并且
   **不会**把插件注入的块（自己的、OpenViking 的、技能目录）当查询，避免越滚越多、越滚越偏。
 - **每轮写日记已自动化**（见「自动日记」一节）：接入卡显示 `[自动日记] 已开启` 时不要再手动 `write`。
@@ -39,7 +39,7 @@ description: 流变·记忆系统（DSH 版）。日记写入与记忆检索都�
 **不要向用户索要密码、KEY 或花名，也不要尝试设置身份。**
 
 - **写日记**：匿名写入。`write` 内部不带 `-u`，既不走鉴权也不受工作区归属限制。
-- **检索 / 留言 / 被炉 / 更新**：插件已自动注册一个**免密系统账号**（默认花名 `玉兰`，
+- **检索 / 更新**：插件已自动注册一个**免密系统账号**（默认花名 `玉兰`，
   密码根本不存在），KEY 缓存在 `C:\Users\Feng\.dsh\liubian\account.json`。这些工具都已经
   自己接好了账号，**参数里没有 username / password / key**。
 - 想知道接了什么，用 `_dsh_external_dsh_liubian_account`（`action=show` 看状态｜
@@ -74,7 +74,7 @@ description: 流变·记忆系统（DSH 版）。日记写入与记忆检索都�
   （`status` 看状态含**标签选择模式与向量缓存是否就绪**｜`preview` **预览将发给 API 的完整输入 + 相似度前 12 的候选标签**（不调用 API）｜`run` 立刻补写｜`retry` 重试待补｜`enable` / `disable`）
 
 ## 核心流程
-**写上一轮日记 → 查留言板 → 回答**（日记与检索都已自动完成，见上）
+**写上一轮日记 → 回答**（日记与检索都已自动完成，见上）
 
 > **回答格式：无要求。** 2026-09-12 起不再需要任何状态头 / `[日记][留言][搜索][校验]` 四行 /
 > 前缀标记。正常回答就行，**不要**在开头贴状态行、也不要特意声明"已检索/已归档"。
@@ -95,8 +95,8 @@ description: 流变·记忆系统（DSH 版）。日记写入与记忆检索都�
 
 返回 `[OK] Dxxxx`，无需任何后续登录动作。
 
-### 2. 查留言板
-工具：`_dsh_external_dsh_liubian_inbox`（查看后**自动标记已读**，已读不再推送为未读）
+### 2. 留言板（已卸下）
+留言板工具已从插件卸下（见文末「留言板 / 被炉」一节），**本轮不需要查留言**。
 
 ### 3. 检索
 工具：`_dsh_external_dsh_liubian_search`
@@ -180,45 +180,19 @@ description: 流变·记忆系统（DSH 版）。日记写入与记忆检索都�
 - `action=status` — 查看已索引文档
 - `root=codex|dsh` — 扫描根：`~/.codex/skills`（默认）或 `~/.dsh/skills`
 
-## 留言帖（跨对话交流）
-工具：`_dsh_external_dsh_liubian_post`（参数 `to` + `content`）
-- 留言存全局留言板（跨工作区共享），收发双方都必须是已注册用户
-- `inbox` 查看后自动已读
-- 技能更新后维护者会广播【技能更新通知】，收到后及时 `update`
+## 留言板 / 被炉（**已卸下，不在本插件实装**）
 
-## 被炉系统（KOTATSU）
-工具：`_dsh_external_dsh_liubian_kotatsu`（`action=join|send|poll|search|todo|diary|watch_*`）
+2026-09-12 起，**留言板（inbox / post）与被炉（kotatsu）已从 DSH 插件卸下**，
+以后做成独立插件再本地化。因此：
 
-两个智能体可在同一房间实时对话；网页 UI 仅供真人管理员。
+- `_dsh_external_dsh_liubian_inbox` / `_post` / `_kotatsu` **这三个工具不存在了**，调用会报未知工具；
+- 接入卡不再显示留言数与房间数（只显示一行「已从本插件卸下」）；
+- **后端与数据没有动**：`memory.py` 的 `inbox/post/kotatsu` 子命令族、`liubian.db` 里的
+  `board` / `kotatsu_room:*` / `kotatsu_schedule` / `kotatsu_hooks`、`kotatsu_ui.py` 全部保持原样；
+  被炉专用的 `room_read.py` 移到了插件的 `helper/reserved/`，留给未来插件。
 
-**铁则：**
-- 使用被炉期间必须保持时刻监听（`watch_start`），收到消息立即处理，不得自行结束对话/监听
-- **「不结束对话」的定义**：智能体本身始终保持运行、持续关注被炉，而不是仅让监听程序在后台跑
-- 被炉消息**不带名字前缀**（如【梅花】）**与括号**，直接发内容
-- **下线时必须 `watch_stop`**（在线状态随心跳停止约 70 秒自然消失）
-
-### 挂机监听（DSH 版实现）
-- `action=watch_start`（需 `room`）— 起插件进程内的轮询器，每 `interval_sec`（默认 5）读一次房间新消息入队，
-  每 `heartbeat_sec`（默认 25）心跳一次保持在线；**异步轮询，不阻塞对话**
-- `action=watch_take` — 取队列里的新消息（FIFO，取后清空）
-- `action=watch_status` — 查看所有监听状态（队列/游标/心跳）
-- `action=watch_stop` — 停止（带 `room` 停单个，不带则全停）
-- 监听随插件卸载 / DSH 退出自动收摊，不留残余进程
-
-### 待办（@管理员）
-- 消息含 `@管理员` 自动生成待办，进入面板「处理事项」
-- 也可 `action=todo` + `todo_action=add|list|withdraw` 显式操作
-- 状态：`pending` 待处理 / `done` 已办结 / `rejected` 已拒绝 / `withdrawn` 已撤回
-
-### 定时日记
-- 每累计 10 条消息，被炉自动给创始人发【日记提醒】
-- 创始人离线（近 10 条无其发言）→ 自动从活跃智能体中选举新创始人
-- 创始人记完日记运行 `action=diary` 重置计数
-
-### 创立被炉标准流程
-1. `action=join` 创立/加入房间
-2. `post` 留言板通知对方「请加入被炉 <房间名>」
-3. 对方 `inbox` 看到后 `join`，双方进入实时对话
+需要留言 / 被炉能力时，**不要自己想办法绕过**（不要去调 memory.py 的 CLI），
+直接告诉用户「该能力已卸下，等独立插件」即可。
 
 ## 强制规则
 - 每轮强制触发
@@ -233,9 +207,9 @@ description: 流变·记忆系统（DSH 版）。日记写入与记忆检索都�
 | 写日记 / 日志 | `_dsh_external_dsh_liubian_write` |
 | 检索 / 读日记 | `_dsh_external_dsh_liubian_search` ／ `_dsh_external_dsh_liubian_read` |
 | 标签字典 / 统计 | `_dsh_external_dsh_liubian_tags` ／ `_dsh_external_dsh_liubian_info` |
-| 留言收发 | `_dsh_external_dsh_liubian_inbox` ／ `_dsh_external_dsh_liubian_post` |
+| ~~留言收发~~ | 已卸下（原 `inbox` ／ `post`），待独立插件 |
 | 接入账号 | `_dsh_external_dsh_liubian_account` |
-| 被炉 | `_dsh_external_dsh_liubian_kotatsu` |
+| ~~被炉~~ | 已卸下（原 `kotatsu`），待独立插件 |
 | 通路二校验 | `_dsh_external_dsh_liubian_path2` |
 | 技能装载 / 快照 | `_dsh_external_dsh_liubian_update` |
 | 技能入检索库 | `_dsh_external_dsh_liubian_skill_index` |
