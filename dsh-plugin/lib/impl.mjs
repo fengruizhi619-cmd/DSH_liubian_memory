@@ -2,7 +2,12 @@
  * @dsh-external/dsh-liubian —— 流变系统 DSH 移植版（实现主体）
  * 单文件实现：入口壳 main.mjs 用 `?t=<时间戳>` 动态导入本文件，单文件 =
  * 单个 URL = 整张依赖图一次刷新，改完代码热注入即生效（不用重启 DSH）。
- * 结构对照 @openviking/dsh-memory-plugin（DSH 的记忆插件）? *   ?= MCP 代理 + 能提供方 + 生命周期钩子，把 OpenViking 接进 DSH? *   本插?= 原生工具?+ 能落盘，?Codex 侧的流变系统接进 DSH? * 差别在于流变系统的后端是-?Python CLI（memory.py / liubian.py / 通路二）? * 不是常驻服务，所以不-?MCP 代理这一跳 */
+ * 结构对照 @openviking/dsh-memory-plugin（DSH 的记忆插件）：
+ *   它 = MCP 代理 + 技能提供方 + 生命周期钩子，把 OpenViking 接进 DSH；
+ *   本插件 = 原生工具面 + 技能落盘，把 Codex 侧的流变系统接进 DSH。
+ * 差别在于流变系统的后端是一组 Python CLI（memory.py / liubian.py / 通路二），
+ * 不是常驻服务，所以不需要 MCP 代理这一跳。
+ */
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -13,14 +18,15 @@ import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 /* ──────────────────────────────────────────────────────────────────────────
- * 1. 路径与身份（对应 DSH 记忆插件?config.mjs / shared/credentials.mjs? * ────────────────────────────────────────────────────────────────────────── */
+ * 1. 路径与身份（对应 DSH 记忆插件的 config.mjs / shared/credentials.mjs）
+ * ────────────────────────────────────────────────────────────────────────── */
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
 
-/** 版本号（同时写进挂载日志，方便确认热注入拿到的是新代码不?ESM 缓存里的旧模块）?*/
+/** 版本号（同时写进挂载日志，方便确认热注入拿到的是新代码而不是 ESM 缓存里的旧模块）。 */
 export const PLUGIN_VERSION = '1.0.0'
 
-/** DSH 家目录（身份文件落在这里，与 Codex 侧凭据互不干扰）?*/
+/** DSH 家目录（身份文件落在这里，与 Codex 侧凭据互不干扰）。 */
 export const DSH_HOME = process.env.DSH_HOME || join(HOME, '.dsh')
 
 /** Codex 侧技能根目录（记忆系统 / 流变系统的源码与数据都在那边）。 */
@@ -34,8 +40,6 @@ export const DEFAULTS = {
   python: 'E:/python/python.exe',
   memoryScript: join(MEMORY_SKILL, 'scripts', 'memory.py'),
   semanticScripts: join(MEMORY_SKILL, 'scripts'),
-  // 被炉相关路径（kotatsuUi / room_read）已随被炉子系统一起卸下，
-  // 以后由独立插件接管；后端 memory.py 的 kotatsu 子命令族与数据保持不动。
   path2Script: join(LIUBIAN_SKILL, 'scripts', '通路2', 'liubian_path2.py'),
   liubianCli: join(LIUBIAN_SKILL, 'scripts', 'liubian.py'),
   panelExe: join(LIUBIAN_SKILL, 'dist', 'liubian_panel.exe'),
@@ -142,13 +146,17 @@ export function registryDb(cfg) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
- * 2. 子进程桥 —??Codex 侧已跑的 Python 实现原样接进? *    （Codex 侧等价物?mcp/_common.py 里的 subprocess.run? * ────────────────────────────────────────────────────────────────────────── */
+ * 2. 子进程桥 —— 把 Codex 侧已跑通的 Python 实现原样接进来
+ *    （Codex 侧等价物是 mcp/_common.py 里的 subprocess.run）
+ * ────────────────────────────────────────────────────────────────────────── */
 
-/** 插件自带 python helper 目录（读注册表 / 读被炉房间 / 技能文档索引）。 */
+/** 插件自带 python helper 目录（读注册表 / 技能文档索引）。 */
 const HELPER_DIR = fileURLToPath(new URL('../helper/', import.meta.url))
 
 /**
- * memory.py ?`Path.cwd().name` 判定当前工作区，以必须显式指?cwd? * 工作区目录不存在时回工作区根目录，避免 cwd 指向不存在的路径? */
+ * memory.py 用 `Path.cwd().name` 判定当前工作区，所以必须显式指定 cwd。
+ * 工作区目录不存在时退回工作区根目录，避免 cwd 指向不存在的路径。
+ */
 export function workspaceDir(cfg, workspace) {
   const ws = String(workspace || cfg.workspace || '').trim()
   if (ws) {
@@ -168,7 +176,7 @@ function decode(value) {
   }
 }
 
-/** 把子进程失败折算成模型能读懂的文本（优先 stdout —?python 侧错误都打在 stdout）?*/
+/** 把子进程失败折算成模型能读懂的文本（优先 stdout —— python 侧错误都打在 stdout）。 */
 function describeFailure(err) {
   const stdout = decode(err && err.stdout).trim()
   const stderr = decode(err && err.stderr).trim()
@@ -188,7 +196,8 @@ function baseEnv(extra) {
 }
 
 /**
- * 同步跑一?python 脚本? * stdio 显式设成 ['ignore','pipe','pipe']：不?stdin 接管道，
+ * 同步跑一个 python 脚本。
+ * stdio 显式设成 ['ignore','pipe','pipe']：不把 stdin 接管道，
  * 免得 python 侧任何 stdin 探测把调用挂住（Codex 侧用 stdin=DEVNULL，同源）。
  */
 export function runPython(cfg, script, args, opts = {}) {
@@ -210,7 +219,8 @@ export function runPython(cfg, script, args, opts = {}) {
 
 /**
  * 异步版：面板 / 嵌入服务等子进程用。同步的 execFileSync 会把 DSH 宿主
- * （Electron 主进程）事件循环卡住，所以监听链路一律走这里? */
+ * （Electron 主进程）事件循环卡住，所以监听链路一律走这里。
+ */
 function runPythonAsync(cfg, script, args, opts = {}) {
   return new Promise(resolve => {
     const child = execFile(cfg.python, [script, ...args], {
@@ -275,12 +285,12 @@ export function runPath2(cfg, question, outPath) {
   return runPython(cfg, cfg.path2Script, args, { timeoutMs: 300000 })
 }
 
-/** 流变统一 CLI（status / 旧命令传）?*/
+/** 流变统一 CLI（status / 旧命令透传）。 */
 export function runLiubianCli(cfg, args, opts = {}) {
   return runPython(cfg, cfg.liubianCli, args, { cwd: workspaceDir(cfg, opts.workspace), ...opts })
 }
 
-/** 无窗口后台启动（面板 / 被炉 UI / 嵌入服务），不阻塞主对话。 */
+/** 无窗口后台启动（面板 / 嵌入服务），不阻塞主对话。 */
 export function launchDetached(cmd, args, cwd) {
   try {
     // ⚠️ 不要加 detached: true —— 它会被 Node 升级成 CREATE_NEW_CONSOLE，
@@ -324,12 +334,11 @@ export function withTempPayload(text, fn) {
  *    mcp-memory-core / write / search / validate / panel / update / skill-index，
  *    外加 liubian.py status。
  *    （向量服务已拆出去，见独立插件 dsh-liubian-embed）
- *    （留言板 inbox/post 与被炉 kotatsu 已于 2026-09-12 卸下，待独立插件接管）
  * ────────────────────────────────────────────────────────────────────────── */
 
 export const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
-/** 有工具的统一输出契约：一个字符串，渲染成单个 text 块?*/
+/** 所有工具的统一输出契约：一个字符串，渲染成单个 text 块。 */
 const OUT = {
   schema: { type: 'string' },
   render: (_args, value) => [{ type: 'text', text: String(value) }],
@@ -349,7 +358,6 @@ const ACCOUNT_UNAVAILABLE = '[错误] 系统账号不可用：把 systemUser 设
  *   - `search` 带 -u 时校验密码与 KEY；不带 -u 的匿名分支要求工作区 index 里有
  *              legacy `last_key`，库里那 13 个工作区的该字段全是空串 → 匿名分支已死；
  *   - `update` / `skill-index` 等要一个存在的账号。
- *   （`inbox` / `post` / `kotatsu` 同样要账号，但已随留言板/被炉一起卸下。）
  *
  * 所以本插件：写日记**匿名**（零身份）；要账号的能力统一用**自动注册的免密账号**
  * （`register --free`：库里 `pwd` 为空 → `verify_user_pwd` 直接放行，密码根本不存在）。
@@ -375,7 +383,9 @@ function saveAccount(patch) {
 let activeLogger = null
 
 /**
- * 保证系统账号可用：已缓存?KEY 仍与注册表一致就直接用；否则（首?/ ?rename / 被删? * 自动注册个免密花朵账号并取回 KEY。返}${ user, key } ?null? */
+ * 保证系统账号可用：已缓存的 KEY 仍与注册表一致就直接用；否则（首次 / 被 rename / 被删）
+ * 自动注册一个免密花朵账号并取回 KEY。返回 { user, key } 或 null。
+ */
 export function ensureSystemAccount(cfg) {
   const cached = loadAccount()
   const user = String(cfg.systemUser || cached.user || '').trim()
@@ -458,7 +468,7 @@ export function registerTools(ctx, cfg) {
     parameters: {
       tags: { type: 'string', required: true, description: '标签，逗号分隔，至少 5 个；细小标签优先于宽泛词（"记忆skill-标签优化"优于"经验"）' },
       summary: { type: 'string', required: true, description: '句话摘要' },
-      content: { type: 'string', required: true, description: '正文（覆盖本轮对话要点；?20KB 自动改走临时文件通道，不受命令行长度限制' },
+      content: { type: 'string', required: true, description: '正文（覆盖本轮对话要点；超 20KB 自动改走临时文件通道，不受命令行长度限制' },
       kind: { type: 'string', enum: ['diary', 'log'], description: 'diary=日常日记（默认）；log=工作流/实践日志' },
       workspace: ARG_WORKSPACE,
     },
@@ -482,10 +492,10 @@ export function registerTools(ctx, cfg) {
   /* - 流变·记忆：检索（mcp-memory-search?------------------------------------------------------------ */
   register(ctx, {
     name: 'search',
-    description: '全局索流变记忆（跨全部工作区），tag 命中与语义向?1:1 融合'
-      + '结果?@工作?标识；同时附带技能揽（SKILL.md）语义命中tags 至少 4 个无身份',
+    description: '全局检索流变记忆（跨全部工作区），tag 命中与语义向量 1:1 融合，'
+      + '结果带 @工作区 标识；同时附带技能总揽（SKILL.md）语义命中。tags 至少 4 个。无需身份。',
     parameters: {
-      tags: { type: 'string', required: true, description: '索标签，逗号分隔，至?4 个；未精确匹配的标签会自动扩' },
+      tags: { type: 'string', required: true, description: '检索标签，逗号分隔，至少 4 个；未精确匹配的标签会自动扩展' },
       workspace: ARG_WORKSPACE,
     },
     async execute(args) {
@@ -515,7 +525,7 @@ export function registerTools(ctx, cfg) {
 
   register(ctx, {
     name: 'tags',
-    description: '列出指定工作区（或全）已使用的全部标签及使用次数 —?写日记前先看这里，优先复用已有细小标签',
+    description: '列出指定工作区（或全）已使用的全部标签及使用次数 —— 写日记前先看这里，优先复用已有细小标签。',
     parameters: { workspace: ARG_WORKSPACE },
     async execute(args) {
       return runMemory(cfg, ['tags'], { workspace: args.workspace })
@@ -638,11 +648,11 @@ export function registerTools(ctx, cfg) {
   register(ctx, {
     name: 'path2',
     description: '流变·通路二：无上下文外部双 API 校验。API-A 生成初始回答，API-B 按五维度'
-      + '（辑断裂 / 未回答问?/ 证据缺失 / 过度声称 / 答非问）列出问题清单，返}${initial_answer, problems[]}'
-      + '不检索记忆不写日记不继承上下文；事实核对由主智能体对照路的记忆结裁决',
+      + '（逻辑断裂 / 未回答问题 / 证据缺失 / 过度声称 / 答非所问）列出问题清单，返回 {initial_answer, problems[]}。'
+      + '不检索记忆不写日记不继承上下文；事实核对由主智能体对照通路一的记忆总结裁决。',
     parameters: {
       question: { type: 'string', required: true, description: '要校验的问题或待审文' },
-      out_path: { type: 'string', description: '可：?JSON 结果同时写入指定文件' },
+      out_path: { type: 'string', description: '可选：把 JSON 结果同时写入指定文件' },
     },
     async execute(args) {
       return runPath2(cfg, String(args.question || ''), args.out_path ? String(args.out_path) : undefined)
@@ -794,9 +804,9 @@ export function registerTools(ctx, cfg) {
   /* - 面板（mcp-memory-panel） ------------------------------------------------------------ */
   register(ctx, {
     name: 'panel',
-    description: '打开本地管理界面（仅本机真人使用）：流变系统管理面板（用户 / 记忆 / 被炉 / skill 管理）。',
+    description: '打开本地管理界面（仅本机真人使用）：流变系统管理面板（用户 / 记忆 / skill 管理）。',
     parameters: {
-      target: { type: 'string', enum: ['admin'], required: true, description: 'admin=管理面板（被炉房间 UI 已随被炉子系统一起卸下）' },
+      target: { type: 'string', enum: ['admin'], required: true, description: 'admin=管理面板' },
       workspace: ARG_WORKSPACE,
     },
     async execute(args) {
@@ -806,25 +816,36 @@ export function registerTools(ctx, cfg) {
     },
   })
 
-  /* 语义向量服务（mcp-embed-model）已拆到独立插件 dsh-liubian-embed?     本插件不再持有它的配置工具与生命周期，检索侧只依赖HTTP 调不到就回?tag」?*/
+  /* 语义向量服务（mcp-embed-model）已拆到独立插件 dsh-liubian-embed：
+     本插件不再持有它的配置、工具与生命周期，检索侧只依赖「HTTP 调不到就回退纯 tag」。 */
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
  * 5. 上下文插入 —— 对照 @openviking/dsh-memory-plugin 的接线方式
  * 那个插件用两条钩子把记忆塞进上下文：
- *   agent/session-start ?agent.inject(profileMessage)  会话头塞「用户画?+ 可用记忆? *   agent/pre-step      ??next() 返回的消息尾部追?recallMessage，每轮按 prompt 自动召回
+ *   agent/session-start → agent.inject(profileMessage)  会话开头塞「用户画像 + 可用记忆」
+ *   agent/pre-step      → 在 next() 返回的消息尾部追加 recallMessage，每轮按 prompt 自动召回
  * 本插件照搬同一套接线：「画像」换成流变身份卡，「召回」换成 memory.py search
- * （tag + 语义 1:1 融合，顺带命中技能揽），于是?Codex ?#m 流程用的是同条检索链路 *
+ * （tag + 语义 1:1 融合，顺带命中技能总揽），于是和 Codex 侧 #m 流程用的是同一条检索链路。
+ *
  * 没有移植 capture：OpenViking 把每轮都写进它自己的会话库，而流变日记是用户精心
- * 打标签的记忆资产 —?自动把原始对话灌进去只会污染索，写日记仍由技能流程显? * 调用 write 完成? * ────────────────────────────────────────────────────────────────────────── */
+ * 打标签的记忆资产 —— 自动把原始对话灌进去只会污染检索，写日记仍由技能流程显式
+ * 调用 write 完成。
+ * ────────────────────────────────────────────────────────────────────────── */
 
 export const PLUGIN_SOURCE = 'dsh-liubian'
 
 /**
- * dsh 自己的消息构造器。拿不到（版本宿?/ 解析不到 @deepseek-ai/dsh-llm）就-? * 等价的最小结?—?免得为了个构造函数把整个插件拖垮? *
- * ⚠️ id 是硬性要求，不是可项：DSH ?user/message 事件在从磁盘冷读重放时要? * dsh-session ?adoptSessionEvent() 校验（`data.id` 必须是非空字符串），?id 会抛
+ * dsh 自己的消息构造器。拿不到（老版本宿主 / 解析不到 @deepseek-ai/dsh-llm）就退回
+ * 等价的最小结构 —— 免得为了一个构造函数把整个插件拖垮。
+ * ⚠️ id 是硬性要求，不是可选项：DSH 的 user/message 事件在从磁盘冷读重放时要过
+ * dsh-session 的 adoptSessionEvent() 校验（`data.id` 必须是非空字符串），缺 id 会抛
  *   SessionPersistenceCorruptionError: session event at seq N lacks an identified message
- * 整个会话的历史就此打不开（GUI 显示「历史加载失败）。本插件?node_modules 里没? * @deepseek-ai/dsh-llm，import 必然失败，所以之前永远走手搓分支、每条注入消息都?id? * 把宿主会话日志写坏了。回分支必须自己?uuid（与宿主 createMessage ? * MessageId(crypto.randomUUID()) 同形） */
+ * 整个会话的历史就此打不开（GUI 显示「历史加载失败」）。本插件的 node_modules 里没有
+ * @deepseek-ai/dsh-llm，import 必然失败，所以之前永远走手搓分支、每条注入消息都缺 id，
+ * 把宿主会话日志写坏了。回退分支必须自己补 uuid（与宿主 createMessage 的
+ * MessageId(crypto.randomUUID()) 同形）。
+ */
 let createUserMessageFn = null
 try {
   const llm = await import('@deepseek-ai/dsh-llm')
@@ -855,22 +876,27 @@ function messageText(message) {
   return parts.join('\n')
 }
 
-/** 自己注入的块要认出来，否则会拿自己的召回结果当查询越滚越多?*/
+/** 自己注入的块要认出来，否则会拿自己的召回结果当查询、越滚越多。 */
 function isOurMessage(message) {
   return message?.source?.kind === 'plugin' && message.source.plugin === PLUGIN_SOURCE
 }
 
-/** 任何插件注入的块（本插件的OpenViking 的别的插件的）都是合成内容，不是人说的话?*/
+/** 任何插件注入的块（本插件的、OpenViking 的、别的插件的）都是合成内容，不是人说的话。 */
 function isPluginMessage(message) {
   return message?.source?.kind === 'plugin'
 }
 
 /**
  * 真正的人话 = role 为 user 且 source.kind 为空 / 'user'。
- * 实测（recallDebug 打出来的真实消息表）这一层至少有四种「非人的 user 消息? *   kind='plugin'（本插件的身份卡/召回块OpenViking 的画像块、system-prompt 的运行时快照? *   kind='skill-catalog'（技能目?system-reminder，长度可?6900 字）
+ * 实测（recallDebug 打出来的真实消息表）这一层至少有四种「非人」的 user 消息：
+ *   kind='plugin'（本插件的身份卡/召回块、OpenViking 的画像块、system-prompt 的运行时快照）
+ *   kind='skill-catalog'（技能目录 system-reminder，长度可达 6900 字）
  *   kind='tool'（工具结果）
  *   role='assistant'
- * 早先只排除了 kind='plugin'，结果查询落?6900 字的能目录上? * 选出来的 tag 变成「音频特?/ 触发条件 / 蒸馏」这类噪?—?用户问的?6章 * 米娅、莉诺尔个都没进标签? */
+ * 早先只排除了 kind='plugin'，结果查询落在 6900 字的技能目录上，
+ * 选出来的 tag 变成「音频特征 / 触发条件 / 蒸馏」这类噪声 —— 用户问的第76章、
+ * 米娅、莉诺尔一个都没进标签。
+ */
 function isHumanMessage(message) {
   if (!message || message.role !== 'user') return false
   const kind = message.source?.kind
@@ -887,7 +913,9 @@ function promptText(messages) {
 }
 
 /**
- * 本轮真正的人?—?倒着找第条人类消息 * 遇到助手消息或工具结果就停：说明新一轮提问还没发生，本轮不该重复召回? */
+ * 本轮真正的人话 —— 倒着找第一条人类消息。
+ * 遇到助手消息或工具结果就停：说明新一轮提问还没发生，本轮不该重复召回。
+ */
 function currentPrompt(messages) {
   const list = messages || []
   for (let i = list.length - 1; i >= 0; i -= 1) {
@@ -899,7 +927,7 @@ function currentPrompt(messages) {
   return ''
 }
 
-/** 是否存在条得召回的新人类输入?*/
+/** 是否存在一条值得召回的新人类输入。 */
 function isFreshUserPrompt(messages) {
   return currentPrompt(messages) !== ''
 }
@@ -982,8 +1010,10 @@ const RECALL_STOP_EN = new Set([
 
 /**
  * 从 prompt 挑候选 tag：CJK（含数字，这样「第76章」这类章节号才拿得到）+ 拉丁词，
- * 先按「是否出现在真实标签字典里筛选，再按元组长度加权排序? * 挑出来的 tag 交给 memory.py search 做模糊扩?—??Codex ?#m 流程同一条链路，
- * 因此 tag 命中与语义向量仍然是 1:1 融合? */
+ * 先按「是否出现在真实标签字典里」筛选，再按元组长度加权排序。
+ * 挑出来的 tag 交给 memory.py search 做模糊扩展 —— 与 Codex 侧 #m 流程同一条链路，
+ * 和 Codex 侧 #m 流程同一条链路，因此 tag 命中与语义向量仍然是 1:1 融合。
+ */
 function candidateTags(text, gramSet, max) {
   const grams = new Map()
   const bump = (s, w) => {
@@ -1018,7 +1048,7 @@ function candidateTags(text, gramSet, max) {
   return picked
 }
 
-/* - 身份卡（会话启动注入?------------------------------------------------------------ */
+/* - 身份卡（会话启动注入）------------------------------------------------------------ */
 
 const profileCache = { at: 0, block: '' }
 
@@ -1054,12 +1084,11 @@ async function buildProfileBlock(cfg) {
   const dc = diaryConfig()
   lines.push(dc.enabled && dc.apiKey
     ? '[自动日记] 已开启：下一轮会自动写上一轮（外部 API 撰写）。**不要再手动 write，会写重**'
-    : '[自动日记] 未开启：仍按技能流程手动 write。')
+    : '[自动日记] 未开启：按技能流程手动 write（至少 5 个细小标签）。')
   if (card?.last_diary) {
     const d = card.last_diary
     lines.push(`[最近记忆] ${d.id}@${d.workspace} ${d.date} — ${clipText(d.summary, 80)}`)
   }
-  lines.push('[留言板/被炉] 已从本插件卸下（2026-09-12），以后由独立插件接管；不可用属预期。')
 
   lines.push(`[记忆规模] ${data.user_count} 用户 / ${data.workspace_count} 工作区 / `
     + `${data.tag_entries} 条 tag 索引 / ${data.tag_names} 个标签`)
@@ -1067,10 +1096,6 @@ async function buildProfileBlock(cfg) {
     ? `每轮已自动注入 ${cfg.memoryTopN} 篇相关日记全文（语义向量 + 标签两路融合）——不用再重复搜；`
       + '只有第一轮 / 无命中 / 想换角度时才用 _dsh_external_dsh_liubian_search（至少 4 个标签）。'
     : '本轮无自动注入，需要时用 _dsh_external_dsh_liubian_search（至少 4 个标签）。'))
-  lines.push('[写日记] ' + (diaryConfig().enabled
-    ? '**已自动化**（下轮自动写上一轮），不要再手动 write'
-    : '手动 write，至少 5 个细小标签。'))
-  lines.push('[回答格式] 无要求：不要输出状头 / 四行标记 / "已检?之类的汇报，正常回答即可')
 
   // 预算裁剪：超预算就条丢，先丢末尾的说明行。
   const budget = Number(cfg.profileTokenBudget) || 700
@@ -1082,8 +1107,12 @@ async function buildProfileBlock(cfg) {
 
 /* - 每轮记忆注入 ------------------------------------------------------------
  *
- * 旧的"自动召回"（从 prompt ?tag ??memory.py search ?只注?*索摘?*? * 已于 2026-09-12 整体删除，用户要?把那个全是简介的注入删掉"? * 现在唯一的一条是 `memoryRetrieval()`（见?8 节）：tag -?+ 语义路融合，
- * 注入?N ?*正文全文**。旧?tag 挑函?`candidateTags` 保留 — * 标签向量缓存没建好时，语义标签会回它做字面兜底 */
+ * 旧的"自动召回"（从 prompt 挑 tag → 调 memory.py search → 只注入**检索摘要**）
+ * 已于 2026-09-12 整体删除，用户要求"把那个全是简介的注入删掉"。
+ * 现在唯一的一条是 `memoryRetrieval()`（见第 8 节）：tag 一路 + 语义一路融合，
+ * 注入前 N 篇**正文全文**。旧的 tag 挑选函数 `candidateTags` 保留 ——
+ * 标签向量缓存没建好时，语义选标签会退回它做字面兜底。
+ */
 
 /* - 接线 ------------------------------------------------------------ */
 
@@ -1110,12 +1139,16 @@ async function takeProfileMessage(cfg, agent) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
- * 8. 联合索注?—?tag -?+ 语义路，加权融合，注入前 N ?*全文**
+ * 8. 联合检索注入 —— tag 一路 + 语义一路，加权融合，注入前 N 篇**全文**
  *
  * 用户定的规格（2026-09-12）：
  *   查询 = **最新轮的用户问题 + 上一轮的回答**
- *   ?语义路：把查询文本嵌入（同一个本?qwen3-emb）→ 与库里每篇日记的向量算余? *   ?tag 路：?*同一段查询文?+ 标签候表**送外?API ?模型?5 ?tag ?字面-? *   ?两路加权融合，取综合得分高的 10 篇，?*全文**注入上下? *
- * 标签候表的取法与写日记完全同款：语义选前 memoryTagHints 个（同一份向量缓存）? * （旧?recall —??prompt 挑字?tag、只注入索摘?—?已于同日整体删除。）
+ *   ①语义路：把查询文本嵌入（同一个本地 qwen3-emb）→ 与库里每篇日记的向量算余弦
+ *   ②tag 路：把**同一段查询文本 + 标签候选表**送外部 API，由模型挑 5 个 tag 做字面检索
+ *   ③两路加权融合，取综合得分高的 10 篇，以**全文**注入上下文
+ *
+ * 标签候选表的取法与写日记完全同款：语义选前 memoryTagHints 个（同一份向量缓存）。
+ * （旧的 recall —— 从 prompt 挑字面 tag、只注入检索摘要 —— 已于同日整体删除。）
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** 外部 API：从标签候选里挑出与本轮最相关的 N 个（与写日记同一个端点/key/模型）。 */
@@ -1152,7 +1185,7 @@ export async function screenQueryTags(cfg, text, hints, log) {
   else if (Array.isArray(res.entries)) list = res.entries            // 兜底：万一模型套了 diaries
   list = list.map(t => String(t || '').trim().replace(/^#/, '')).filter(Boolean)
   const cand = new Set(hints)
-  // ⚠️ 只认候里真有的：模型经常自己造词（实测挑?联合/候融?这类不在表里的）。
+  // ⚠️ 只认候选里真有的：模型经常自己造词（实测挑出"联合/候选融合"这类不在表里的），
   // 那种标签在检索时会被二次模糊扩展，反而比它替代掉的真标签更差。
   const valid = [...new Set(list.filter(t => cand.has(t)))]
   const rejected = list.filter(t => !cand.has(t))
@@ -1217,14 +1250,14 @@ export function fuseScores(cfg, semResults, pickedTags, tagMap) {
   return out
 }
 
-/** 把命中条目拼成注入块（全文优先，超预算就降级为摘要）?*/
+/** 把命中条目拼成注入块（全文优先，超预算就降级为摘要）。 */
 function formatMemoryBlock(results, cfg) {
   const perEntry = Math.max(500, Number(cfg.memoryContentChars) || 3000)
   const total = Math.max(2000, Number(cfg.memoryTotalChars) || 30000)
   const head = [
     `<liubian-memory hits="${results.length}" score="cos+tag">`,
     '说明：以下是本地记忆库里与本轮最相关的日记（综合分 = 语义余弦 + 标签命中加成，降序），',
-    '已给?*正文全文**供你直接参，不要逐条复述',
+    '已给出**正文全文**供你直接参考，不要逐条复述。',
   ]
   const parts = []
   let used = head.join('\n').length
@@ -1295,7 +1328,9 @@ export async function skillHitsFor(cfg, query) {
 }
 
 /**
- * 双路-??注入块查询文?= 上一轮回?+ 新轮用户问题? * 任何路失败都只是少一路（融合自动化为单路），绝不抛 */
+ * 双路检索的注入块：查询文本 = 上一轮回答 + 新轮用户问题。
+ * 任何一路失败都只是少一路（融合自动化为单路），绝不抛。
+ */
 export async function memoryRetrieval(cfg, messages, ctx, agent) {
   if (!cfg.memoryInject) return null
   const question = currentPrompt(messages)
@@ -1323,7 +1358,7 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     skillHitsFor(cfg, query),
   ])
   if (!vec.length && !picked.tags.length && !skillHits.length) return null
-  // ?让模型从候里?N ?tag（与语义-?*并行**：语义-元数据顺手起取。
+  // 让模型从候选里挑 N 个 tag（与语义路**并行**：语义-元数据顺手一起取）。
   const [cand, tagSide] = await Promise.all([
     vec.length
       ? jointQuery(cfg, { workspace, vec, top: Math.max(200, topN * 20), full: false, mode: 'semantic' })
@@ -1382,7 +1417,7 @@ export async function queryEmbedding(cfg, text) {
   return (vecs && vecs[0]) || []
 }
 
-/** 取最后一条助手正文（跳过工具结果、插件消息）?*/
+/** 取最后一条助手正文（跳过工具结果、插件消息）。 */
 export function previousAssistantText(messages) {
   const list = Array.isArray(messages) ? messages : []
   for (let i = list.length - 1; i >= 0; i -= 1) {
@@ -1462,7 +1497,7 @@ export function disposeContextInjection() {
   contextStates.clear()
 }
 
-/** 纯函数测试缝（自/诊断用，不参与运行时）?*/
+/** 纯函数测试缝（自检 / 诊断用，不参与运行时）。 */
 export const __test = {
   candidateTags,
   estimateTokens,
@@ -1514,14 +1549,18 @@ export const __test = {
 /* ──────────────────────────────────────────────────────────────────────────
  * 6. 自动日记 —— 由外部 API 撰写，**下一轮写上一轮**
  *
- * 用户定的规格? *   1. 触发：下轮开始时写上轮（不是 turn/end 立刻写）
+ * 用户定的规格：
+ *   1. 触发：下一轮开始时写上一轮（不是 turn/end 立刻写）
  *   2. 每一轮都要写；**末轮由下一轮代写**，本插件不做收尾兜底
- *   3. 仍按工作区署? *   4. 标签字典随输入过去：**优先复用已有标签，允许新?*
- *   5. 输入 = 上一轮的**完整对话**（提?+ 助手正文 + 工具轨迹? *   6. 每篇正文 ?00 字，超了?*再新建一?*；一轮几?*不设上限**
- *   7. 失败不阻塞对话：?pending 队列、下轮补? *   8. 启用后不再手动写日记
+ *   3. 仍按工作区署名
+ *   4. 标签字典随输入送过去：**优先复用已有标签，允许新建**
+ *   5. 输入 = 上一轮的**完整对话**（提问 + 助手正文 + 工具轨迹）
+ *   6. 每篇正文 ≤500 字，超了就**再新建一篇**；一轮几篇**不设上限**
+ *   7. 失败不阻塞对话：落 pending 队列、下轮补写
+ *   8. 启用后不再手动写日记
  *
  * 采集与写入分离：轮次内容用 `session/event` 累积（免疫上下文压缩），
- * 写入时机只有-?—?pre-step（下轮的第一步）? * ────────────────────────────────────────────────────────────────────────── */
+ * 写入时机只有一处 —— pre-step（下轮的第一步）。 * ────────────────────────────────────────────────────────────────────────── */
 
 export function diaryConfigFile() { return join(DSH_HOME, 'liubian', 'diary.json') }
 export function diaryLogFile() { return join(DSH_HOME, 'liubian', 'auto_diary_log.jsonl') }
@@ -1569,7 +1608,10 @@ export function diaryConfig() {
 }
 
 /**
- * 端点容错：用?文档里给的多半是**基址**（`https://api.deepseek.com`? * `.../v1`），但真正要 POST 的是 `{基址}/chat/completions`? * 这里统一补齐，省得因为少段路径白折腾轮 */
+ * 端点容错：用户/文档里给的多半是**基址**（`https://api.deepseek.com`、
+ * `.../v1`），但真正要 POST 的是 `{基址}/chat/completions`。
+ * 这里统一补齐，省得因为少一段路径白折腾一轮。
+ */
 export function normalizeDiaryUrl(raw) {
   let u = String(raw || '').trim().replace(/\/+$/, '')
   if (!u) return DIARY_DEFAULTS.url
@@ -1647,15 +1689,15 @@ export function takeUnwrittenTurn(sessionId) {
   return null
 }
 
-/* - 提示?------------------------------------------------------------ */
+/* - 提示词 ------------------------------------------------------------ */
 
 function buildDiarySystemPrompt(cfg) {
   const max = Number(cfg.diaryMaxChars) || 500
   return [
-    '你是「流变·记忆系统的日记撰写员输入是某个智能体与用户之间**轮完整对?*',
+    '你是「流变·记忆系统」的日记撰写员。输入是某个智能体与用户之间**一轮完整对话**，',
     '你要把它写成可长期检索的记忆日记，只输出 JSON',
     '',
-    '输出格式（严?JSON，不要代码块围栏，不要任何解释）',
+    '输出格式（严格 JSON，不要代码块围栏，不要任何解释）：',
     '{"diaries":[{"tags":["标签1","标签2","标签3","标签4","标签5"],"summary":"一句话摘要","content":"正文"}]}',
     '',
     '硬规则：',
@@ -1714,7 +1756,11 @@ function buildDiaryUserPrompt(cfg, turn, hints, workspace) {
 
 /**
  * 完整流程的第 2 步：把**全部标签表**取出来随对话送进 API。
- * 用户定的规则?026-09-12）：与其费劲?关联??200 个，不如直接把全表过? * —?模型拿到全量词表才能真的做到"优先复用已有标签"，挑选本来就该由模型做 * 顺序按使用次数降序，万一日后要截断（`diaryTagHints` > 0 时按字符预算截尾部）? * 丢掉的是冷门的标签，而不是字母序靠前的那批 */
+ * 用户定的规则（2026-09-12）：与其费劲算"关联度"挑 200 个，不如直接把全表送过去
+ * —— 模型拿到全量词表才能真的做到"优先复用已有标签"，挑选本来就该由模型做。
+ * 顺序按使用次数降序，万一日后需要截断（`diaryTagHints` > 0 时按字符预算截尾部），
+ * 丢掉的是最冷门的标签，而不是字母序靠前的那批。
+ */
 export async function allTagsFor(cfg) {
   const dict = await tagDictionary(cfg)
   if (!dict || !dict.names.length) return []
@@ -1746,18 +1792,31 @@ export async function allTagsFor(cfg) {
 /* ── 语义选标签：助手正文 → 向量 → 与标签向量算余弦 → 取前 N（用户 2026-09-12 定的方案）
  * 为什么不用标签名去嵌入-是嵌入**助手正文**：正文是整个回答，信息量大；
  * 标签名平均只有几个字，短文本嵌入的区分度差（实测时它们之间的余弦普遍在 0.5 以上）。
- * 成本控制的关键：**标签的向量只算一次，落盘缓存**? *   13930 个标?× 1024 ?float32 ?57MB，缓存文件放?~/.dsh/liubian/ 下；
- *   缓存的有效由「标签个?+ 高频标签?+ 低频标签名三元的签名判定
- *   （字典是按使用次数降序的，这三元变就说明标签表变了，重建） *   真正每轮的开只有 1 次嵌入调?+ 13930 次点积，毫秒级 *   首次（或标签表变化后）建缓存?1~2 分钟?*后台建，不阻塞对?*，这轮回整张表? *
+ * 成本控制的关键：**标签的向量只算一次，落盘缓存**。
+ *   13930 个标签 × 1024 维 float32 ≈ 57MB，缓存文件放在 ~/.dsh/liubian/ 下；
+ *   缓存的有效性由「标签个数 + 高频标签名 + 低频标签名」三元的签名判定
+ *   （字典是按使用次数降序的，这三元一变就说明标签表变了，重建）。
+ *   真正每轮的开销只有 1 次嵌入调用 + 13930 次点积，毫秒级。
+ *   首次（或标签表变化后）建缓存要 1~2 分钟：**后台建，不阻塞对话**，这一轮退回整张表。
+ *
  * 顺序仍是余弦降序，所以日后要截断也是从尾部砍（最不相关的先丢） * ------------------------------------------------------------ */
 
-/** 标签向量缓存文件（二进制，别当文本读）?*/
+/** 标签向量缓存文件（二进制，别当文本读）。 */
 export function tagVecFile() { return join(DSH_HOME, 'liubian', 'tag_vectors.bin') }
 
 /**
  * 标签表签名：**只要"标签集合大致没变"就认缓存**? *
  * ⚠️ 踩过的坑（两个，都实测过）：
- *   ?原来?首次"建缓存，标签表一变签名对不上 ?缓存永远失效、每轮静默回整张表? *      语义选标签悄悄死掉（已改为签名不符就重建） *   ?原来?*全表**哈希进签??签名永远对不上因为库?count=1 的标签占绝大多数? *      它们的相对顺序受其它会话并发写影响的尾部抖动，就能让全表哈希每次都变? *      结果每轮都判缓存失效 ??60 秒重建一?54MB 向量，比不用缓存还糟? * 以签名只?*稳定的部?*：标签个?+ 高频的前 8 个名字 * 缓存里存它自己那?names，运行期律以缓存?names 为准（自洽）? * 不从实时表的位置去索引向?—?这样排序抖动不会错配向量? * 而真正的增删标签（个数变?/ 头部变化）会如实触发重建? */
+ *   · 原来只按"首次"建缓存，标签表一变签名对不上 → 缓存永远失效、每轮静默回退整张表，
+ *      语义选标签悄悄死掉（已改为签名不符就重建）
+ *   · 原来把**全表**哈希进签名 → 签名永远对不上，因为库里 count=1 的标签占绝大多数，
+ *      它们的相对顺序受其它会话并发写影响的尾部抖动，就能让全表哈希每次都变，
+ *      结果每轮都判缓存失效 → 每 60 秒重建一次 54MB 向量，比不用缓存还糟
+ * 所以签名只取**稳定的部分**：标签个数 + 高频的前 8 个名字
+ * 缓存里存它自己那份 names，运行期一律以缓存的 names 为准（自洽），
+ * 不从实时表的位置去索引向量 —— 这样排序抖动不会错配向量，
+ * 而真正的增删标签（个数变化 / 头部变化）会如实触发重建。
+ */
 function tagSignature(names) {
   const head = names.slice(0, 8).join('\u0001')
   return `${names.length}|${head}`
@@ -1766,7 +1825,7 @@ function tagSignature(names) {
 let tagVecMemo = null   // { sig, names, dim, vecs: Float32Array, at }
 let tagVecBuilding = false
 
-/** 调本地嵌入服务（llama.cpp /v1/embeddings，qwen3-emb?024 维）?*/
+/** 调本地嵌入服务（llama.cpp /v1/embeddings，qwen3-emb，1024 维）。 */
 async function embedTexts(cfg, texts, timeoutMs = 120000) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -1829,7 +1888,7 @@ function saveTagVecCache(sig, names, dim, vecs) {
   } catch { /* 落盘失败就每轮重算，不影响功能 */ }
 }
 
-/** 逐个回调式建缓存（避免一次把 57MB 都堆在临时数组里）?*/
+/** 逐个回调式建缓存（避免一次把 57MB 都堆在临时数组里）。 */
 async function buildTagVecCache(cfg, sig, names, dim, log) {
   const vecs = new Float32Array(names.length * dim)
   const batch = Math.max(4, Number(cfg.diaryTagEmbedBatch) || 32)
@@ -1838,7 +1897,7 @@ async function buildTagVecCache(cfg, sig, names, dim, log) {
     const chunk = names.slice(start, start + batch)
     const out = await embedTexts(cfg, chunk)
     if (!out || out.length !== chunk.length) {
-      log?.warn?.(`[dsh-liubian] 标签向量建缓存中断（?${start} 个），下轮重试`)
+      log?.warn?.(`[dsh-liubian] 标签向量建缓存中断（已写 ${start} 个），下轮重试`)
       return null
     }
     out.forEach((v, i) => {
@@ -1858,7 +1917,7 @@ async function buildTagVecCache(cfg, sig, names, dim, log) {
 
 /**
  * 取标签向量缓存。命中内存/磁盘就直接用；没有就在**后台**建，本次返回 null
- * （调用方回整张标签表，绝不因为建缓存卡住某一轮对话）? */
+ * （调用方回整张标签表，绝不因为建缓存卡住某一轮对话）。 */
 export async function tagVectors(cfg, log) {
   const names = await allTagsFor(cfg)
   if (!names.length) return null
@@ -1929,7 +1988,9 @@ export async function semanticTagHints(cfg, text, log) {
 }
 
 /**
- * 统一?本轮要哪些标?入口? *   semantic ?正文向量取前 N；失?缓存未就??整张? *   all      ?整张表（按使用次数降序）
+ * 统一的本轮标签选择入口：
+ *   semantic → 正文向量取前 N；失败或缓存未就绪则退整张表
+ *   all      → 整张表（按使用次数降序）
  *   none     ?不给（让模型完全自创，仅调试用）
  */
 export async function selectDiaryTags(cfg, turn, log) {
@@ -1964,8 +2025,11 @@ export async function buildDiaryPayload(cfg, turn, hints, workspace) {
   }
 }
 
-/* - 旧的"算关联度?200 个标?方案已于 2026-09-12 废弃 ------------------------------------------------------------
- * 理由：挑选本来就该由模型做插件按字面重合度预先筛?13k?00，等于在? * 候喂给模型之前先替它做了判断，还容易挑偏。现在改成把**全表**送进去 * 召回（recall）链路仍?candidateTags ?tag，未受影响 */
+/* - 旧的"算关联度挑 200 个标签"方案已于 2026-09-12 废弃 ------------------------------------------------------------
+ * 理由：挑选本来就该由模型做。插件按字面重合度预先筛掉 13k→200，等于在把
+ * 候选喂给模型之前先替它做了判断，还容易挑偏。现在改成把**全表**送进去。
+ * 召回（recall）链路仍用 candidateTags 挑 tag，未受影响。
+ */
 
 /* - 调用外部 API ------------------------------------------------------------ */
 
@@ -2059,10 +2123,14 @@ export function splitContent(text, max) {
 }
 
 /**
- * 归一化：切长?+ 标签补足? *
- * ⚠️ 这里有个必须守住的底线：后端的硬规则是每?? 个标签，标签不够?*必须?*? * ?*绝不?*拿提示词里的标签表头部去?—?那是常用的标签（银砂纪年/被炉/规则…）? * 与本篇内容毫无关系，补进去等于往索索引里灌噪声所以：
+ * 归一化：切长 + 标签补足。
+ * ⚠️ 这里有个必须守住的底线：后端的硬规则是每篇 ≥5 个标签，标签不够时**必须重试**，
+ * **绝不**拿提示词里的标签表头部去凑 —— 那是常用的标签（银砂纪年/被炉/规则…），
+ * 与本篇内容毫无关系，补进去等于往检索索引里灌噪声。所以：
  *   · 模型自己给的标签 ? ??直接用；
- *   · 只有 1~4 ??**原样保留**（宁可少?5 个，也不塞假标签），由上层决定重试 * 返回的每篇带 `tagCount`，调用方据此判断"这篇够不够格写库"? */
+ *   · 只有 1~4 个 → **原样保留**（宁可少于 5 个，也不塞假标签），由上层决定重试。
+ * 返回的每篇带 `tagCount`，调用方据此判断"这篇够不够格写库"。
+ */
 export function normalizeEntries(cfg, raw, hints) {
   const maxChars = Number(cfg.diaryMaxChars) || 500
   const out = []
@@ -2092,11 +2160,12 @@ export function isWritableEntry(e) {
   return Boolean(e && e.content && Array.isArray(e.tags) && e.tags.length >= 5)
 }
 
-/* - 写库（匿?write，零身份）─------------------------------------------------------------ */
+/* - 写库（匿名 write，零身份）──────────────────────────────────────────────── */
 
 /**
- * 写库（匿?write，零身份） *
- * ⚠️ 正文?`--content` 是塞?*命令行参?*的，Windows ?CreateProcess 命令? * 上限?32767 字符。日记正文一般几百字，但模型偶尔会吐长篇；所以超过阈值就改走
+/* ── 写库（匿名 write，零身份）────────────────────────────────────────────
+ * ⚠️ 正文走 `--content` 是塞进**命令行参数**的，Windows 的 CreateProcess 命令行
+ * 上限约 32767 字符。日记正文一般几百字，但模型偶尔会吐长篇；所以超过阈值就改走
  * `--file`（memory.py 支持，用 utf-8-sig 读），别等到某天突然写不进去才发现 */
 export function writeDiaryEntries(cfg, entries, workspace) {
   const written = []
@@ -2133,7 +2202,7 @@ function writeTempFile(text) {
   }
 }
 
-/* - 工作区署?------------------------------------------------------------ */
+/* - 工作区归属 ------------------------------------------------------------ */
 
 /** 'auto' → 会话 cwd 的目录名（且该目录真的在 liubianRoot 下）优先，否则回落默认工作区。 */
 export function resolveDiaryWorkspace(cfg, agent) {
@@ -2175,9 +2244,10 @@ function writePending(list) {
   } catch { /* 忽略 */ }
 }
 
-/* - 主流?------------------------------------------------------------ */
+/* - 主流程 ------------------------------------------------------------ */
 
-/** 记录 turn ?外部 API（标签?+ 上一轮对话）?归一??写库。异常全吞（绝不拖垮对话） *  rebuild=true 时跳?已写?查，专供待补队列重放已存下的轮次?*/
+/** 记录 turn → 外部 API（标签候选 + 上一轮对话）→ 归一化 → 写库。异常全吞（绝不拖垮对话）。
+ *  rebuild=true 时跳过"已写过"检查，专供待补队列重放已存下的轮次。 */
 export async function writeTurnDiary(ctx, cfg, agent, turn, opts = {}) {
   const sessionId = String((agent && agent.session && agent.session.id) || 'default')
   const key = `${sessionId}#${turn.turn}`
@@ -2303,7 +2373,10 @@ export async function flushPending(ctx, cfg, limit) {
   return { tried, done, left: rest.length }
 }
 
-/** 下一轮触发：写上-?+ ?pending?*fire-and-forget，绝不阻?*? *  末轮不在此列 —?本函数只?pre-step 调用，没人调用时么都不发生?*/
+/**
+ * 下一轮触发：写上一轮 + 补 pending。**fire-and-forget，绝不阻塞**。
+ *  末轮不在此列 —— 本函数只在 pre-step 调用，没人调用时什么都不发生。
+ */
 export function scheduleDiaryFlush(ctx, cfg, agent) {
   const dc = diaryConfig()
   if (!dc.enabled || !dc.apiKey) return
@@ -2320,10 +2393,14 @@ export function scheduleDiaryFlush(ctx, cfg, agent) {
 }
 
 /**
- * 启动预热：语义模式下把标签向量缓存读进内存；没有缓存则后台建? * 只在 semantic 模式 + 自动日记启时才做（关的时候白?57MB 内存没意义）? */
+ * 启动预热：语义模式下把标签向量缓存读进内存；没有缓存则后台建。
+ * 只在 semantic 模式 + 自动日记开启时才做（关着的时候白占 57MB 内存没意义）。
+ */
 /**
- * 启动预热：语义模式下把标签向量缓存读进内存；没有缓存（或标签表变了）则后台重建 * 只在 semantic 模式 + 自动日记启时才做（关的时候白?57MB 内存没意义）? *
- * wait=true 时会等缓存真的就绪（含重建，1~2 分钟）只?*插件启动**?*首次-?*用：
+ * 启动预热：语义模式下把标签向量缓存读进内存；没有缓存（或标签表变了）则后台重建。
+ * 只在 semantic 模式 + 自动日记开启时才做（关着的时候白占 57MB 内存没意义）。
+ *
+ * wait=true 时会等缓存真的就绪（含重建，1~2 分钟）。只给**插件启动**和**首次开启**用：
  * 否则第一轮会回整张标签表，白多花几万 token。重建是后台的，等待期间日志有进度 */
 export async function warmTagVectors(ctx, cfg, opts = {}) {
   if (String(cfg.diaryTagSelect || 'semantic').toLowerCase() !== 'semantic') return null
@@ -2358,7 +2435,7 @@ export async function warmTagVectors(ctx, cfg, opts = {}) {
 
 export function mountAutoDiary(ctx, cfg) {
   loadWrittenKeys()
-  // 语义选标签：启动时就把标签向量缓存读进内存（?0.2 ?/ 57MB），
+  // 语义选标签：启动时就把标签向量缓存读进内存（约 0.2 秒 / 57MB），
   // 这样**第一轮**就是语义选标签，而不是先回整张表、第二轮才生效。
   // 不 await：apply() 是同步挂载，让它自己在后台跑完（若需重建会等，见 wait）
   void warmTagVectors(ctx, cfg, { wait: true })
@@ -2419,11 +2496,14 @@ export function mountAutoDiary(ctx, cfg) {
 /** 插件自带技能目录（源）。 */
 const SKILLS_SRC = fileURLToPath(new URL('../skills/', import.meta.url))
 
-/** DSH 能目录（宿主的用户级能根，DSH 会自动发现这里的新技能）?*/
+/** DSH 能目录（宿主的用户级能根，DSH 会自动发现这里的新技能）。 */
 const SKILLS_DST = join(DSH_HOME, 'skills')
 
 /**
- * 把插件自带的 SKILL.md 同步?DSH 能目录 * 只在内容不同时写入（幂等），失败只告警-绝不因为技能落盘问题拖垮工具注册 * 新落盘的能要下一次会话才会出现在能目录里? */
+ * 把插件自带的 SKILL.md 同步到 DSH 技能目录。
+ * 只在内容不同时写入（幂等），失败只告警——绝不因为技能落盘问题拖垮工具注册。
+ * 新落盘的技能要下一次会话才会出现在技能目录里。
+ */
 function syncSkills(logger) {
   const written = []
   try {
@@ -2471,9 +2551,7 @@ export function apply(ctx, input = {}) {
   // 自动日记：采集（session/event）+ 下一轮写上一轮（末轮不兜底，交给下一次对话）
   mountAutoDiary(ctx, cfg)
 
-  // 被炉挂机监听随插件卸载 / DSH 退出一起收摊，不留残余轮询。
-  /* [已卸下] 被炉挂机监听的清理钩子（监听器已移除，无需清理） */
-  ctx.effect(() => () => disposeContextInjection(), 'dsh-liubian: 清理上下文插入状')
+  ctx.effect(() => () => disposeContextInjection(), 'dsh-liubian: 清理上下文插入状态')
 
   ctx.logger?.info?.(
     `[dsh-liubian] v${PLUGIN_VERSION} 流变系统已挂载：工具前缀 ${TOOL_PREFIX}，默认工作区}${cfg.workspace}」，后端 ${cfg.memoryScript}`,
