@@ -69,6 +69,8 @@ export const DEFAULTS = {
   memoryContentChars: 3000,  // 单篇注入正文上限（超长截断）
   memoryTotalChars: 30000,   // 整块注入上限（防一次吃掉太多上下文）
   memoryTagTopN: 5,          // 让模型挑几个 tag
+  memorySkillTopN: 3,        // 每轮注入几个**命中的技能**（只给名字+摘要，不给全文）
+  memorySkillTimeoutMs: 30000,
   memoryTagHints: 100,       // 送给模型的标签候选个数（写日记同款：语义选前 N）
   memoryTimeoutMs: 120000,   // 本地向量 + helper 的超时（helper 首次要读 6114 篇向量，给足）
   // ── 检索侧外部 API（与写日记**分开的 key**）──
@@ -599,11 +601,13 @@ export function registerTools(ctx, cfg) {
   /* - 能文档语义索引（mcp-skill-index?------------------------------------------------------------ */
   register(ctx, {
     name: 'skill_index',
-    description: '把技能揽（SKILL.md）加入语义检索库，之后写?问答时检索会自动命中该技能的风格包或蒸馏文档'
-      + 'action: index 定向索引个技能｜all 全量增量刷新｜status 查看已索引文档',
+    description: '把技能总揽（SKILL.md）加入语义检索库，之后检索会自动命中该技能。'
+      + 'action: index 定向索引一个技能（配 skill）｜all 全量增量刷新｜status 查看已索引文档｜'
+      + 'prune 清理"目录里已不存在"的失效条目（技能被删/被移走后会残留，用这个清；跨全部根判断，不会误删）。'
+      + 'root: codex=~/.codex/skills（默认）｜dsh=~/.dsh/skills。',
     parameters: {
-      action: { type: 'string', required: true, enum: ['index', 'all', 'status'], description: '索引操作' },
-      skill: { type: 'string', description: '能文件夹名（index 必填，status 可）' },
+      action: { type: 'string', required: true, enum: ['index', 'all', 'status', 'prune'], description: '索引操作' },
+      skill: { type: 'string', description: '技能文件夹名（index 必填，status 可）' },
       root: { type: 'string', enum: ['codex', 'dsh'], description: '扫描根：codex=~/.codex/skills（默认）｜dsh=~/.dsh/skills' },
     },
     async execute(args) {
@@ -613,7 +617,13 @@ export function registerTools(ctx, cfg) {
         ? join(DSH_HOME, 'skills')
         : cfg.codexSkills
       const out = runHelper(cfg, 'skill_index', [action, String(args.skill || '')], {
-        env: { LU_SCRIPTS: cfg.semanticScripts, LU_SKILLS_ROOT: root },
+        env: {
+          LU_SCRIPTS: cfg.semanticScripts,
+          LU_SKILLS_ROOT: root,
+          // all/prune 要跨全部根：单个根做全量刷新时，会把另一个根已索引的技能
+          // 当成"失效"整片删掉（2026-09-12 实测：库从 35 掉到 33）。
+          LU_ALL_ROOTS: `${join(DSH_HOME, 'skills')};${cfg.codexSkills}`,
+        },
         timeoutMs: 300000,
       })
       return action === 'status' ? out : out + `\n[扫描根] ${root}`
@@ -1231,6 +1241,52 @@ function formatMemoryBlock(results, cfg) {
   return head.join('\n') + parts.join('\n') + '\n</liubian-memory>'
 }
 
+/** 技能注入块：每轮只注入**命中的前 N 个技能的摘要行**（不给全文，控 token）。
+ *  用户规格（2026-09-12）：每次输出命中的前 3 个技能。 */
+function formatSkillBlock(hits, cfg) {
+  const top = Math.max(1, Number(cfg.memorySkillTopN) || 3)
+  const list = (hits || []).slice(0, top)
+  if (!list.length) return ''
+  const lines = [
+    `<liubian-skills hits="${list.length}">`,
+    '说明：以下技能与本轮主题相关（本地技能库语义命中）。需要细节时用 _dsh_external_dsh_liubian_update action=read_source skill=<名字> 读原文 —— 这里只给名字与摘要，不给全文。',
+  ]
+  for (const h of list) {
+    const sum = clipText(String(h.summary || '').trim(), 200) || '(无摘要)'
+    lines.push(`【${h.skill}】相似度 ${Number(h.score).toFixed(2)}｜${sum}`)
+  }
+  lines.push('</liubian-skills>')
+  return lines.join('\n')
+}
+
+/** 语义检索技能库（helper skill_index.py 的 search 动作，返回 JSON）。
+ *  一次调用扫**两个根**（DSH + Codex），由 helper 合并去重后给 top N。
+ *  失败一律返回空数组 —— 技能注入是附加项，缺了不影响日记注入。 */
+export async function skillHitsFor(cfg, query) {
+  const text = String(query || '').trim()
+  if (text.length < 4) return []
+  const top = Math.max(1, Number(cfg.memorySkillTopN) || 3)
+  try {
+    const raw = await runHelperAsync(cfg, 'skill_index', ['search', text.slice(0, 4000)], {
+      env: {
+        LU_SCRIPTS: cfg.semanticScripts,
+        LU_SKILLS_ROOT: `${join(DSH_HOME, 'skills')};${cfg.codexSkills}`,
+        LU_SKILL_TOP: String(top),
+      },
+      timeoutMs: Math.max(15000, Number(cfg.memorySkillTimeoutMs) || 30000),
+    })
+    const json = JSON.parse(String(raw || '').trim())
+    if (json && json.ok && Array.isArray(json.hits)) {
+      return json.hits.map(h => ({
+        skill: String(h.skill || ''),
+        summary: String(h.summary || ''),
+        score: Number(h.score) || 0,
+      }))
+    }
+  } catch { /* 技能注入失败就当没有 */ }
+  return []
+}
+
 /**
  * 双路-??注入块查询文?= 上一轮回?+ 新轮用户问题? * 任何路失败都只是少一路（融合自动化为单路），绝不抛 */
 export async function memoryRetrieval(cfg, messages, ctx, agent) {
@@ -1253,10 +1309,13 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
 
   const t0 = Date.now()
   const topN = Math.max(1, Number(cfg.memoryTopN) || 10)
-  // ?标签候（取法与写日记同款：语义前 N? 查询向量
+  // ① 标签候选（取法与写日记同款：语义选前 N）+ 查询向量 + 命中的技能（并行，互不依赖）
   const picked = await selectDiaryTags(cfg, { human: [question || ''], assistant: [reply || ''], tools: [] }, log)
-  const vec = await queryEmbedding(cfg, query)
-  if (!vec.length && !picked.tags.length) return null
+  const [vec, skillHits] = await Promise.all([
+    queryEmbedding(cfg, query),
+    skillHitsFor(cfg, query),
+  ])
+  if (!vec.length && !picked.tags.length && !skillHits.length) return null
   // ?让模型从候里?N ?tag（与语义-?*并行**：语义-元数据顺手起取。
   const [cand, tagSide] = await Promise.all([
     vec.length
@@ -1289,14 +1348,23 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     return { ...w, date: d.date || '', summary: d.summary || '', content: d.content || '', tags: d.tags || [] }
   })
   const block = formatMemoryBlock(final, cfg)
+  // 技能命中作为**独立块**附加（只给名字 + 摘要，不给全文）
+  const skillBlock = formatSkillBlock(skillHits, cfg)
   log?.info?.(
     `[dsh-liubian] 联合检索命中 ${final.length} 篇注入 ${block.length} 字`
     + `（模型挑 tag：${tagSide.tags.join('|') || '无'}｜候选 ${picked.tags.length} 个/${picked.mode}`
     + `｜tag 路 ${ranked.tagCandidates || 0} 篇、语义路 ${ranked.semCandidates || 0} 篇｜权重 tag ${ranked.wTag}`
     + `｜top1 ${final[0].id}@${final[0].ws} score=${final[0].score}`
+    + `｜技能命中 ${skillHits.length} 个${skillHits.length ? '：' + skillHits.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、') : ''}`
     + `｜${Date.now() - t0}ms）`,
   )
-  return { block, results: final, tags: tagSide.tags, mode: picked.mode }
+  return {
+    block: skillBlock ? `${block}\n\n${skillBlock}` : block,
+    results: final,
+    skills: skillHits,
+    tags: tagSide.tags,
+    mode: picked.mode,
+  }
 }
 
 /** 查询文本的嵌入向量（本地服务）。失败返回空数组 —— 语义一路缺席，tag 一路照跑。 */
@@ -1411,6 +1479,8 @@ export const __test = {
   queryEmbedding,
   previousAssistantText,
   formatMemoryBlock,
+  formatSkillBlock,
+  skillHitsFor,
   buildProfileBlock,
   ensureSystemAccount,
   accountFile,
