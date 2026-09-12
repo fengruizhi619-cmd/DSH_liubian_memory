@@ -7,7 +7,7 @@
 | 子系统 | 作用 | 主要文件 |
 |---|---|---|
 | **流变·记忆** memory | 日记写入、标签索引、跨会话检索、语义向量召回 | `memory/scripts/memory.py`、`memory_db.py`、`semantic_search.py` |
-| **流变·被炉** kotatsu | 多智能体实时房间：收发、待办、挂机监听 | `memory/mcp/mcp_kotatsu.py`、`memory/scripts/kotatsu_ui.py` |
+| **流变·被炉** kotatsu | 多智能体实时房间：收发、待办、挂机监听（**已从 DSH 插件卸下，待独立插件**） | `memory/mcp/mcp_kotatsu.py`、`memory/scripts/kotatsu_ui.py` |
 | **流变·更新** update | 技能装载 / 快照 / 哈希同步 / 订阅广播 | `memory/mcp/mcp_update.py`、`liubian/scripts/liubian.py` |
 | **流变·通路** path | 无上下文双 API 交叉校验（生成 → 五维度挑错） | `liubian/scripts/通路2/liubian_path2.py` |
 
@@ -148,7 +148,11 @@ liubian/
 │   ├── lib/main.mjs            入口壳（带缓存击穿的动态 import）
 │   ├── lib/impl.mjs            单文件实现（工具面 + 上下文注入 + 自动日记 + 联合检索）
 │   ├── helper/                 检索 / 统计 helper（Python）
+│   │   └── reserved/           已卸下子系统的 helper（被炉 room_read.py，留给未来插件）
 │   └── skills/                 随插件分发的技能
+├── embed-plugin/               向量服务插件（独立）：llama.cpp 嵌入服务生命周期
+│   ├── lib/impl.mjs            探活 / 拉起 / 关停 / 重启（直起 exe，无窗）
+│   └── README.md               含"为什么不能用 cmd/start 拉起"的实测记录
 └── docs/
 ```
 

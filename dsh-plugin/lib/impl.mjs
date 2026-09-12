@@ -271,9 +271,12 @@ export function runLiubianCli(cfg, args, opts = {}) {
 /** 无窗口后台启动（面板 / 被炉 UI / 嵌入服务），不阻塞主对话?*/
 export function launchDetached(cmd, args, cwd) {
   try {
+    // ⚠️ 不要加 detached: true —— 它会被 Node 升级成 CREATE_NEW_CONSOLE，
+    //    控制台窗口会**真的弹出来**（2026-09-12 实测：向量服务的 llama-server
+    //    就是这么被拉起来的，窗口枚举里一直是 VISIBLE）。
+    //    stdio:'ignore' + windowsHide 已经是「无窗后台」，足够用。
     const child = spawn(cmd, args, {
       cwd: cwd && existsSync(cwd) ? cwd : undefined,
-      detached: true,
       stdio: 'ignore',
       windowsHide: true,
     })
