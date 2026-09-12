@@ -1,0 +1,20 @@
+{
+  "api_a": {
+    "name": "初始回答",
+    "url": "https://api.deepseek.com/chat/completions",
+    "api_key": "PUT-YOUR-API-KEY-HERE",
+    "model": "deepseek-chat",
+    "temperature": 0.3,
+    "max_tokens": 2048,
+    "thinking": { "type": "disabled" }
+  },
+  "api_b": {
+    "name": "检验",
+    "url": "https://api.deepseek.com/chat/completions",
+    "api_key": "PUT-YOUR-SECOND-API-KEY-HERE",
+    "model": "deepseek-chat",
+    "temperature": 0.2,
+    "max_tokens": 2048,
+    "thinking": { "type": "enabled", "budget_tokens": 2048 }
+  }
+}

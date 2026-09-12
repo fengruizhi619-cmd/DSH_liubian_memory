@@ -1,0 +1,55 @@
+# 运行时与本地数据（不进版本控制）
+*.log
+*.log.old
+*.pyc
+__pycache__/
+.Python
+
+# 真实密钥：仓库里只保留 config.example.json
+liubian/scripts/通路2/config.json
+liubian/scripts/通路2/usage_log.jsonl
+
+# 记忆数据（个人内容 / 向量 / 备份）
+memory/scripts/memory/*
+!memory/scripts/memory/.gitkeep
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+embeddings*
+index.json*
+tags.json*
+cooccurrence.json*
+diaries/
+
+# 构建产物与打包
+build/
+dist/
+*.spec
+*.pkg
+*.pyz
+*.zip
+*.exe
+
+# 面板 / UI 的运行期产物
+shots/
+*.png.bak
+
+# DSH 侧
+dsh-plugin/node_modules/
+dsh-plugin/lib/_*.py
+dsh-plugin/lib/_*.cjs
+dsh-plugin/lib/_*.json
+dsh-plugin/lib/_*.txt
+dsh-plugin/lib/*.corrupt-*
+dsh-plugin/lib/*.bak*
+_scratch/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~

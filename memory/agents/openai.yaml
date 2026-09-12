@@ -1,0 +1,6 @@
+display_name: 记忆日记系统
+short_description: 通过标签日记实现长期记忆，支持多标签交叉检索
+default_prompt: 使用 $memory 记忆技能，开始新对话时先读取标签字典，检索相关日记，对话结束后写日记记录关键信息
+
+policy:
+  allow_implicit_invocation: true

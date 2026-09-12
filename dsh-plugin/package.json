@@ -1,0 +1,31 @@
+{
+  "name": "dsh-liubian",
+  "version": "0.1.0",
+  "description": "流变系统 DSH 移植版：记忆(日记/标签/语义检索/留言板) + 被炉(实时房间/挂机监听) + 更新(技能独立装载/快照广播) + 通路(双通路外部校验) + 面板。后端复用 Codex 侧 memory-skill / liubian 的 Python 实现与数据。",
+  "private": true,
+  "type": "module",
+  "main": "./lib/main.mjs",
+  "exports": {
+    ".": "./lib/main.mjs"
+  },
+  "files": [
+    "lib/",
+    "helper/",
+    "skills/",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2",
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "cordis": ">=4.0.0-rc <5"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "liubian",
+    "memory",
+    "kotatsu",
+    "diary"
+  ],
+  "license": "BSD-3-Clause"
+}
