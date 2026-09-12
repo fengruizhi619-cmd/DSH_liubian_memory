@@ -18,7 +18,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
 
 /** 版本号（同时写进挂载日志，方便确认热注入拿到的是新代码不?ESM 缓存里的旧模块）?*/
-export const PLUGIN_VERSION = '0.1.0'
+export const PLUGIN_VERSION = '1.0.0'
 
 /** DSH 家目录（身份文件落在这里，与 Codex 侧凭据互不干扰）?*/
 export const DSH_HOME = process.env.DSH_HOME || join(HOME, '.dsh')
