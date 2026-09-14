@@ -49,6 +49,14 @@ export const DEFAULTS = {
   /** ensure 等待就绪的上限（模型首次加载可能更久）。 */
   readyTimeoutMs: 45000,
   probeTimeoutMs: 3000,
+  /** 内存看门狗：llama-server 私有提交（PrivateMemorySize64）超过阈值就自动重启。
+   *  背景（2026-09-14 实测）：服务跑 5.5h 后私有提交涨到 10.9GB（模型才 ~0.7GB + 8k
+   *  KV ~2GB），约 9.1GB 被换出压进 Windows Memory Compression 池、仍占物理内存；
+   *  一重启就回落到 2.3GB、压缩池 9.5→0.9GB、释放 9.2GB。看门狗按提交量监控，
+   *  超限自动 stop → launch（fire-and-forget，不阻塞；下个周期自然恢复在线检查）。 */
+  watchdogEnabled: true,
+  watchdogIntervalSec: 300,   // 每多少秒查一次
+  watchdogLimitMb: 4096,      // 私有提交超过多少 MB 触发重启
 }
 
 export const TOOL_NAME = '_dsh_external_dsh_liubian_embed'
@@ -196,6 +204,25 @@ export function stopService(cfg) {
   }
 }
 
+const POWER_SHELL = 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+
+/** 读指定进程的私有提交内存（PrivateMemorySize64，单位 MB）。
+ *  这正是 Windows 计入提交额度 / Memory Compression 的那个数 —— 看门狗用它与
+ *  阈值比。读不到或进程已死返回 0（调用方当"跳过本轮"处理）。 */
+export function privateCommitMb(pid) {
+  if (!pid) return 0
+  try {
+    const out = execFileSync(POWER_SHELL, [
+      '-NoProfile', '-NonInteractive', '-Command',
+      `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).PrivateMemorySize64`,
+    ], { encoding: 'utf-8', windowsHide: true, timeout: 20000, maxBuffer: 1 << 20 })
+    const v = Number(String(out || '').trim())
+    return Number.isFinite(v) && v > 0 ? v / 1048576 : 0
+  } catch {
+    return 0
+  }
+}
+
 /** 冷却用的「按需带起来」：插件加载 / 外部触发都没有阻塞风险。 */
 let lastEnsureAt = 0
 export function ensureInFlow(cfg, logger, { force = false } = {}) {
@@ -208,6 +235,49 @@ export function ensureInFlow(cfg, logger, { force = false } = {}) {
     launch(cfg)
     logger?.info?.(`[dsh-embed] 向量服务离线，已在后台拉起（${cfg.launchViaCmd ? '脚本方式' : '直起 exe'}，无窗）`)
   })().catch(() => {})
+}
+
+/* ── 内存看门狗 ─────────────────────────────────────────────────────────── */
+
+let lastWatchdogRestart = ''   // 最近一次自动重启的时间 + 前后内存，status 里展示
+
+/** 单次检查：在线 → 读私有提交 → 超限就 stop + launch。失败只打 warn，绝不抛。 */
+export async function watchdogTick(cfg, logger) {
+  try {
+    const up = await probe(cfg)
+    if (!up.ok) return                       // 不在线：内存问题无从谈起，留给 ensureInFlow 带起
+    const pid = listeningPid(cfg.embedPort)
+    if (!pid) return
+    const mb = privateCommitMb(pid)
+    if (!mb) return
+    const limit = Math.max(512, Number(cfg.watchdogLimitMb) || 4096)
+    if (mb <= limit) return
+    logger?.warn?.(
+      `[dsh-embed] 看门狗：llama-server(PID ${pid}) 私有提交 ${mb.toFixed(0)}MB 超过 ${limit}MB，自动重启`,
+    )
+    const stopped = stopService(cfg)
+    await sleep(1500)
+    const launched = launch(cfg)
+    lastWatchdogRestart =
+      `${new Date().toLocaleString('zh-CN')}｜${mb.toFixed(0)}MB → 重启（stop=${stopped.ok ? 'ok' : 'fail'} launch=${launched}）`
+    logger?.info?.(`[dsh-embed] 看门狗重启完成：${lastWatchdogRestart}`)
+  } catch (err) {
+    logger?.warn?.(`[dsh-embed] 看门狗异常：${(err && err.message) || err}`)
+  }
+}
+
+/** 递归 setTimeout 的周期检查，随插件卸载清理。 */
+export function mountWatchdog(ctx, cfg) {
+  if (!cfg.watchdogEnabled) return
+  let timer = null
+  const loop = async () => {
+    await watchdogTick(cfg, ctx.logger)
+    timer = setTimeout(loop, (Number(cfg.watchdogIntervalSec) || 300) * 1000)
+  }
+  timer = setTimeout(loop, (Number(cfg.watchdogIntervalSec) || 300) * 1000)
+  ctx.effect(() => () => {
+    if (timer) clearTimeout(timer)
+  }, 'dsh-embed: 内存看门狗')
 }
 
 /* ── 工具面 ─────────────────────────────────────────────────────────────── */
@@ -243,6 +313,7 @@ function registerEmbedTool(ctx, cfg) {
           `[端口] ${cfg.embedPort}${pid ? `　PID ${pid}` : '　（无监听进程）'}`,
           `[启动方式] ${cfg.launchViaCmd ? `脚本 ${cfg.embedCmd}` : `直起 exe ${cfg.serverExe}（无窗）`}`,
           `[加载自动带起] ${cfg.autoEnsureOnLoad ? '开' : '关'}`,
+          `[看门狗] ${cfg.watchdogEnabled ? `开（私有提交 >${cfg.watchdogLimitMb}MB 自动重启，每 ${cfg.watchdogIntervalSec}s 查一次）` : '关'}${lastWatchdogRestart ? `｜最近一次：${lastWatchdogRestart}` : ''}`,
           `[配置文件] ${configFile()}${existsSync(configFile()) ? '' : '（尚未创建，用默认值）'}`,
           before.ok ? before.body : '',
         ].filter(Boolean).join('\n')
@@ -292,8 +363,12 @@ export function apply(ctx, input = {}) {
   // 探活 → 离线就带起来（不等待、不阻塞宿主启动）
   ensureInFlow(cfg, ctx.logger, { force: true })
 
+  // 内存看门狗：私有提交超限自动重启（防 llama-server 长期跑提交内存累积）
+  mountWatchdog(ctx, cfg)
+
   ctx.logger?.info?.(
-    `[dsh-liubian-embed] v${PLUGIN_VERSION} 向量服务插件已挂载：${cfg.embedUrl}（端口 ${cfg.embedPort}）`,
+    `[dsh-liubian-embed] v${PLUGIN_VERSION} 向量服务插件已挂载：${cfg.embedUrl}（端口 ${cfg.embedPort}）`
+    + `${cfg.watchdogEnabled ? `｜看门狗开（>${cfg.watchdogLimitMb}MB/每 ${cfg.watchdogIntervalSec}s）` : ''}`,
   )
 }
 
@@ -306,4 +381,6 @@ export const __test = {
   launch,
   ensureReady,
   configFile,
+  privateCommitMb,
+  watchdogTick,
 }

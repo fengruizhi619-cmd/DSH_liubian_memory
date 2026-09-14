@@ -1,32 +1,32 @@
 {
-  "name": "dsh-liubian-embed",
-  "version": "0.1.0",
-  "description": "本地语义向量服务插件（llama.cpp + Qwen3-Embedding-0.6B，端口 8082）：探活 / 拉起 / 等待就绪 / 关停。从 dsh-liubian 里拆出来的独立插件 —— 向量服务是通用能力，不属于记忆系统，单独放以后改起来互不牵连。",
-  "private": true,
-  "type": "module",
-  "main": "./lib/main.mjs",
-  "exports": {
-    ".": "./lib/main.mjs"
-  },
-  "files": [
-    "lib/",
-    "README.md"
-  ],
-  "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2",
-    "cordis": ">=4.0.0-rc <5"
-  },
-  "keywords": [
-    "deepseek-harness",
-    "dsh",
-    "embedding",
-    "llama.cpp",
-    "vector"
-  ],
-  "license": "BSD-3-Clause",
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  }
+    "name":  "dsh-liubian-embed",
+    "version":  "0.1.1",
+    "description":  "本地语义向量服务插件（llama.cpp + Qwen3-Embedding-0.6B，端口 8082）：探活 / 拉起 / 等待就绪 / 关停。从 dsh-liubian 里拆出来的独立插件 —— 向量服务是通用能力，不属于记忆系统，单独放以后改起来互不牵连。",
+    "private":  true,
+    "type":  "module",
+    "main":  "./lib/main.mjs",
+    "exports":  {
+                    ".":  "./lib/main.mjs"
+                },
+    "files":  [
+                  "lib/",
+                  "README.md"
+              ],
+    "peerDependencies":  {
+                             "@deepseek-ai/dsh-tools":  "\u003e=0.0.1-rc \u003c2",
+                             "cordis":  "\u003e=4.0.0-rc \u003c5"
+                         },
+    "keywords":  [
+                     "deepseek-harness",
+                     "dsh",
+                     "embedding",
+                     "llama.cpp",
+                     "vector"
+                 ],
+    "license":  "BSD-3-Clause",
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           }
+            }
 }
