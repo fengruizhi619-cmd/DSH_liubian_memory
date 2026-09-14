@@ -65,13 +65,19 @@ export const DEFAULTS = {
   //   ① 语义一路：拼成一段文本嵌入 → 与库里日记向量算余弦；
   //   ② tag 一路：同一段文本 + 标签候选表送外部 API → 模型挑 5 个 tag → 字面检索；
   //   ③ 融合取综合得分最高的 N 篇，**注入全文**。
+  // 用户规格（2026-09-13）：两级检索 ——
+  //   ① 联合检索（tag+语义融合）取前 memorySeedTop 篇作**主线**；
+  //   ② 用主线各自的向量各找回 memoryRelatedPerSeed 篇**关联**日记（第二跳）；
+  //   ③ 主线 + 关联合并，总篇数封顶 memoryTopN，**一起注入全文**。
   memoryInject: true,        // 关掉 = 本轮不注入记忆（旧的"只注入检索摘要"已整体删除，没有回退路径）
   memoryScope: 'global',     // 'global' = 跨全部工作区检索（推荐）｜'workspace' = 只查当前工作区
-  memoryTopN: 10,            // 注入几篇
+  memoryTopN: 30,            // 总注入篇数上限（主线 + 关联）
+  memorySeedTop: 5,          // 第一跳取前几篇作主线
+  memoryRelatedPerSeed: 5,   // 每条主线找回几篇关联（第二跳）
   memoryWTags: 0.5,          // 融合权重：tag 一路占多少（其余给语义）
   memoryQueryChars: 6000,    // 查询文本上限（用户问题 + 上一轮回答）
   memoryContentChars: 3000,  // 单篇注入正文上限（超长截断）
-  memoryTotalChars: 30000,   // 整块注入上限（防一次吃掉太多上下文）
+  memoryTotalChars: 60000,   // 整块注入上限（30 篇全文，防一次吃掉太多上下文）
   memoryTagTopN: 5,          // 让模型挑几个 tag
   memorySkillTopN: 3,        // 每轮注入几个**命中的技能**（只给名字+摘要，不给全文）
   memorySkillTimeoutMs: 30000,
@@ -1093,7 +1099,7 @@ async function buildProfileBlock(cfg) {
   lines.push(`[记忆规模] ${data.user_count} 用户 / ${data.workspace_count} 工作区 / `
     + `${data.tag_entries} 条 tag 索引 / ${data.tag_names} 个标签`)
   lines.push('[检索] ' + (cfg.memoryInject
-    ? `每轮已自动注入 ${cfg.memoryTopN} 篇相关日记全文（语义向量 + 标签两路融合）——不用再重复搜；`
+    ? `每轮已自动注入 ${cfg.memoryTopN} 篇相关日记全文（前 ${cfg.memorySeedTop} 篇主线 + 各 ${cfg.memoryRelatedPerSeed} 篇关联）——不用再重复搜；`
       + '只有第一轮 / 无命中 / 想换角度时才用 _dsh_external_dsh_liubian_search（至少 4 个标签）。'
     : '本轮无自动注入，需要时用 _dsh_external_dsh_liubian_search（至少 4 个标签）。'))
 
@@ -1198,17 +1204,19 @@ export async function screenQueryTags(cfg, text, hints, log) {
 /** 联合检索（helper/memory_query.py，只读 liubian.db）。
  *  mode: 'rank' 融合排序后只回 id+分数（默认）｜'semantic' 只回语义榜元数据
  *        ｜'ids' 按 ids 精确取正文｜'full' 直接回带正文的完整融合榜。 */
-export async function jointQuery(cfg, { workspace, tags, vec, top, full, mode, ids }) {
+export async function jointQuery(cfg, { workspace, tags, vec, top, full, mode, ids, seeds, exclude }) {
   try {
     const req = {
       workspace: workspace || '',
       tags: tags || [],
       vec: vec || [],
-      top: Math.max(1, Number(top) || Number(cfg.memoryTopN) || 10),
+      top: Math.max(1, Number(top) || Number(cfg.memoryTopN) || 30),
       wTag: Number(cfg.memoryWTags),
       full: full !== false,
       mode: mode || 'rank',
       ids: ids || [],
+      seeds: seeds || [],
+      exclude: exclude || [],
     }
     const raw = await runHelperAsync(cfg, 'memory_query', [], {
       timeoutMs: Math.max(15000, Number(cfg.memoryTimeoutMs) || 60000),
@@ -1256,16 +1264,18 @@ function formatMemoryBlock(results, cfg) {
   const total = Math.max(2000, Number(cfg.memoryTotalChars) || 30000)
   const head = [
     `<liubian-memory hits="${results.length}" score="cos+tag">`,
-    '说明：以下是本地记忆库里与本轮最相关的日记（综合分 = 语义余弦 + 标签命中加成，降序），',
+    '说明：以下是本地记忆库里与本轮最相关的日记（前几篇为**主线**=联合检索命中，其余为**关联**=沿主线语义邻域扩展的第二跳），',
     '已给出**正文全文**供你直接参考，不要逐条复述。',
   ]
   const parts = []
   let used = head.join('\n').length
   for (const r of results) {
-    const meta = `【${r.id}@${r.ws}】${r.date ? r.date + ' ' : ''}综合${Number(r.score).toFixed(2)}`
-      + `（语义 ${Number(r.sem).toFixed(2)}${Number(r.tag) > 0
-        ? ` + 标签${Number(r.tag).toFixed(2)}：${(r.matchedTags || []).join('/')}`
-        : '，无标签命中'}）`
+    const meta = `【${r.id}@${r.ws}】${r.date ? r.date + ' ' : ''}`
+      + (r.source === 'related'
+        ? `关联（语义 ${Number(r.sem).toFixed(2)}）`
+        : `综合${Number(r.score).toFixed(2)}（语义 ${Number(r.sem).toFixed(2)}${Number(r.tag) > 0
+          ? ` + 标签${Number(r.tag).toFixed(2)}：${(r.matchedTags || []).join('/')}`
+          : '，无标签命中'}）`)
     const body = String(r.content || '').trim()
     const text = body
       ? (body.length > perEntry ? body.slice(0, perEntry) + '……（正文截断）' : body)
@@ -1350,7 +1360,9 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     : ''
 
   const t0 = Date.now()
-  const topN = Math.max(1, Number(cfg.memoryTopN) || 10)
+  const topN = Math.max(1, Number(cfg.memoryTopN) || 30)              // 总注入上限（主线 + 关联）
+  const seedTop = Math.max(1, Number(cfg.memorySeedTop) || 5)         // 第一跳：前几篇作主线
+  const perSeed = Math.max(1, Number(cfg.memoryRelatedPerSeed) || 5)  // 第二跳：每条主线找回几篇关联
   // ① 标签候选（取法与写日记同款：语义选前 N）+ 查询向量 + 命中的技能（并行，互不依赖）
   const picked = await selectDiaryTags(cfg, { human: [question || ''], assistant: [reply || ''], tools: [] }, log)
   const [vec, skillHits] = await Promise.all([
@@ -1374,12 +1386,36 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     log?.warn?.(`[dsh-liubian] 融合排序失败：${(ranked && ranked.error) || '未知'}`)
     return null
   }
-  const winners = (ranked.results || []).slice(0, topN)
-  if (!winners.length) {
+  const seeds = (ranked.results || []).slice(0, seedTop)
+  if (!seeds.length) {
     log?.info?.(`[dsh-liubian] 联合检索无命中（tags=${tagSide.tags.join('|') || '无'}，语义候选 ${ranked.semCandidates || 0}）`)
     return null
   }
-  // 只取前 N 篇的正文
+  // 第二跳：用每条主线的向量找回关联日记（纯语义近邻，跨全部工作区）。
+  // 失败只退回主线（少一路，绝不抛）。
+  const seedKeys = seeds.map(r => `${r.ws}|${r.id}`)
+  const relatedRows = []
+  const rel = await jointQuery(cfg, {
+    workspace: '', mode: 'related', top: perSeed, full: false, seeds: seedKeys,
+  })
+  if (rel && rel.ok && rel.related) {
+    const seen = new Set(seeds.map(r => `${r.ws}#${r.id}`))
+    for (const s of seeds) {
+      for (const r of (rel.related[`${s.ws}|${s.id}`] || [])) {
+        const k = `${r.ws}#${r.id}`
+        if (seen.has(k)) continue
+        seen.add(k)
+        relatedRows.push({
+          ws: r.ws, id: r.id, sem: Number(r.sem) || 0, tag: 0,
+          score: Number(r.sem) || 0, source: 'related', fromSeed: `${s.ws}|${s.id}`,
+        })
+      }
+    }
+  } else {
+    log?.warn?.(`[dsh-liubian] 关联跳失败（已退回仅主线）：${(rel && rel.error) || '未知'}`)
+  }
+  const winners = [...seeds.map(r => ({ ...r, source: 'seed' })), ...relatedRows].slice(0, topN)
+  // 按 id 精确取正文（主线 + 关联一起）
   const detail = await jointQuery(cfg, {
     workspace, mode: 'ids', top: winners.length, full: true,
     ids: winners.map(r => `${r.ws}|${r.id}`),   // 用 "ws|id" 串：嵌套数组在序列化路上容易被二次编码
@@ -1393,7 +1429,7 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
   // 技能命中作为**独立块**附加（只给名字 + 摘要，不给全文）
   const skillBlock = formatSkillBlock(skillHits, cfg)
   log?.info?.(
-    `[dsh-liubian] 联合检索命中 ${final.length} 篇注入 ${block.length} 字`
+    `[dsh-liubian] 两级检索命中 ${final.length} 篇（主线 ${seeds.length} + 关联 ${relatedRows.length}）注入 ${block.length} 字`
     + `（模型挑 tag：${tagSide.tags.join('|') || '无'}｜候选 ${picked.tags.length} 个/${picked.mode}`
     + `｜tag 路 ${ranked.tagCandidates || 0} 篇、语义路 ${ranked.semCandidates || 0} 篇｜权重 tag ${ranked.wTag}`
     + `｜top1 ${final[0].id}@${final[0].ws} score=${final[0].score}`
@@ -1448,7 +1484,7 @@ async function memoryMessageFor(ctx, cfg, agent, messages, signal) {
 export function mountContextInjection(ctx, cfg) {
   ctx.logger?.info?.(
     `[dsh-liubian] 上下文插入：身份卡=${cfg.profileInject ? '开' : '关'}`
-    + ` 联合检索注入=${cfg.memoryInject ? `开（前 ${cfg.memoryTopN} 篇全文）` : '关'}`
+    + ` 两级检索注入=${cfg.memoryInject ? `开（主线 ${cfg.memorySeedTop} + 各 ${cfg.memoryRelatedPerSeed} 关联，封顶 ${cfg.memoryTopN}）` : '关'}`
     + ` 消息构造器=${createUserMessageFn ? 'dsh-llm' : '内置回退'}`,
   )
 
@@ -1849,8 +1885,11 @@ async function embedTexts(cfg, texts, timeoutMs = 120000) {
   }
 }
 
-/** 读缓存文件；签名不符 / 维度不对 / 与当前标签集合不-??null?*/
-function loadTagVecCache(cfg, sig, names) {
+/** 读缓存文件。**只校验维度和体量，不校验标签集合** —— 集合差集由调用方算
+ *  missing 做**增量补向量**（2026-09-14 根因修复：全量重建是内存放大器的根源，
+ *  底层 llama-server b10405 每请求滞留提交内存 ~1.2MB/批量请求，全量重建 13930 个
+ *  标签 = ~435 请求 ≈ 0.5GB/次，标签一多就反复重建 → 数小时攒到 10.9GB）。 */
+function loadTagVecCache(cfg, dim) {
   try {
     const file = tagVecFile()
     if (!existsSync(file)) return null
@@ -1858,22 +1897,17 @@ function loadTagVecCache(cfg, sig, names) {
     const nl = buf.indexOf(0x0a)
     if (nl <= 0) return null
     const meta = JSON.parse(buf.slice(0, nl).toString('utf8'))
-    if (!meta || meta.sig !== sig) return null
-    const dim = Number(meta.dim) || Number(cfg.diaryTagEmbedDim) || 1024
+    if (!meta) return null
+    const d = Number(meta.dim) || Number(cfg.diaryTagEmbedDim) || 1024
+    if (d !== Number(dim)) return null                 // 维度变了 → 只能全量重建
     const body = buf.slice(nl + 1)
     const n = Number(meta.n) || 0
-    if (n <= 0 || body.length < n * dim * 4) return null
+    if (n <= 0 || body.length < n * d * 4) return null
     const cachedNames = Array.isArray(meta.names) ? meta.names : []
     if (cachedNames.length !== n) return null
-    // 签名只保证"大致没变"，这里再核一次**集合**是否真的相同（O(n) 的 Set 运算）：
-    // 只要实时字典里出现了缓存没覆盖的标签，就重建，避免一直用旧标签集。
-    if (Array.isArray(names) && names.length) {
-      const have = new Set(cachedNames)
-      if (names.some(x => !have.has(x))) return null
-    }
     // Buffer 可能不是 4 字节对齐的，必须 copy 一份再当 Float32Array 用
-    const copy = new Uint8Array(body.slice(0, n * dim * 4))
-    return { sig, names: cachedNames, dim, vecs: new Float32Array(copy.buffer), at: Date.now() }
+    const copy = new Uint8Array(body.slice(0, n * d * 4))
+    return { sig: meta.sig || '', names: cachedNames, dim: d, vecs: new Float32Array(copy.buffer), at: Date.now() }
   } catch {
     return null
   }
@@ -1915,6 +1949,36 @@ async function buildTagVecCache(cfg, sig, names, dim, log) {
   return { sig, names, dim, vecs, at: Date.now() }
 }
 
+/** 增量补向量：只嵌入**新增**的标签，追加进现有缓存（根因修复，见 loadTagVecCache）。
+ *  新标签通常一次几十个 → 一两个批量请求、几 MB，而不是全量 13930 个 ≈ 0.5GB。 */
+async function appendTagVecCache(cfg, cached, missing, dim, log) {
+  const batch = Math.max(4, Number(cfg.diaryTagEmbedBatch) || 32)
+  const newNames = cached.names.concat(missing)
+  const newVecs = new Float32Array(newNames.length * dim)
+  newVecs.set(cached.vecs)                       // 旧向量原样（已归一化）
+  let done = 0
+  for (let start = 0; start < missing.length; start += batch) {
+    const chunk = missing.slice(start, start + batch)
+    const out = await embedTexts(cfg, chunk)
+    if (!out || out.length !== chunk.length) {
+      log?.warn?.(`[dsh-liubian] 标签向量增量中断（已补 ${done}/${missing.length}），下轮继续`)
+      return null                                // 不落盘：旧缓存文件原样，下轮重试
+    }
+    out.forEach((v, i) => {
+      const at = (cached.names.length + start + i) * dim
+      let sum = 0
+      for (let k = 0; k < dim; k += 1) { const x = Number(v[k]) || 0; newVecs[at + k] = x; sum += x * x }
+      const norm = Math.sqrt(sum) || 1e-9
+      for (let k = 0; k < dim; k += 1) newVecs[at + k] /= norm
+    })
+    done += chunk.length
+  }
+  const sig = tagSignature(newNames)
+  saveTagVecCache(sig, newNames, dim, newVecs)
+  log?.info?.(`[dsh-liubian] 标签向量缓存增量完成：+${missing.length}（共 ${newNames.length}，${(newVecs.byteLength / 1048576).toFixed(1)}MB）`)
+  return { sig, names: newNames, dim, vecs: newVecs, at: Date.now() }
+}
+
 /**
  * 取标签向量缓存。命中内存/磁盘就直接用；没有就在**后台**建，本次返回 null
  * （调用方回整张标签表，绝不因为建缓存卡住某一轮对话）。 */
@@ -1924,20 +1988,42 @@ export async function tagVectors(cfg, log) {
   const sig = tagSignature(names)
   if (tagVecMemo && tagVecMemo.sig === sig) return tagVecMemo
   const dim = Number(cfg.diaryTagEmbedDim) || 1024
-  const cached = loadTagVecCache(cfg, sig, names)
+  const cached = loadTagVecCache(cfg, dim)
   if (cached) {
-    tagVecMemo = cached
-    return cached
+    // 集合差集判定（不再靠签名）：缺几个就只补几个，追加进缓存。
+    const have = new Set(cached.names)
+    const missing = names.filter(n => !have.has(n))
+    if (missing.length === 0) {
+      tagVecMemo = { ...cached, sig }
+      return tagVecMemo
+    }
+    // 增量补向量（后台），本轮先用旧缓存（新标签少算几个候选而已，不阻塞）
+    if (!tagVecBuilding) {
+      tagVecBuilding = true
+      log?.info?.(
+        `[dsh-liubian] 标签表新增 ${missing.length} 个标签，增量补向量（全量 ${names.length}，而非重算全部）`,
+      )
+      void (async () => {
+        try {
+          const built = await appendTagVecCache(cfg, cached, missing, dim, log)
+          if (built) tagVecMemo = built
+        } catch (err) {
+          log?.warn?.(`[dsh-liubian] 标签向量增量构建失败（下轮重试）：${(err && err.message) || err}`)
+        } finally {
+          tagVecBuilding = false
+        }
+      })()
+    }
+    return cached   // 旧缓存仍可用（缺新标签的向量，语义选标签少算几个而已）
   }
-  // 缓存文件失效（标签表变了）或还没建：**必须重建**。
+  // 缓存文件不存在 / 维度变了 → **必须全量重建**。
   // ⚠️ 踩过的坑：这里原来只"首次"建一次，于是标签表一变签名对不上，
   // 缓存就永远失效 → 每轮都静默退回整张标签表，语义选标签悄悄死掉。
-  // 只要签名不符就得重建，并留下日志；重建期间本轮仍退回整张表，不影响写日记。
   if (!tagVecBuilding) {
     tagVecBuilding = true
     const hadCache = existsSync(tagVecFile())
     log?.info?.(
-      `[dsh-liubian] ${hadCache ? '标签表已变化，重建' : '首次建立'}标签向量缓存：`
+      `[dsh-liubian] ${hadCache ? '标签向量缓存维度变化，重建' : '首次建立'}标签向量缓存：`
       + `${names.length} 个标签（约 1~2 分钟，期间先用整张标签表；之后自动切回语义选标签）`,
     )
     void (async () => {
