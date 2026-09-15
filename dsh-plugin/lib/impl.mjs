@@ -502,22 +502,71 @@ export function registerTools(ctx, cfg) {
   /* - 流变·记忆：检索（mcp-memory-search?------------------------------------------------------------ */
   register(ctx, {
     name: 'search',
-    description: '全局检索流变记忆（跨全部工作区），tag 命中与语义向量 1:1 融合，'
-      + '结果带 @工作区 标识；同时附带技能总揽（SKILL.md）语义命中。tags 至少 4 个。无需身份。',
+    description: '显式检索记忆（两级配方，与自动注入同源）：tag + 语义融合取前 5 篇主线，'
+      + '再沿主线各扩 5 篇关联，至多 30 篇。返回**摘要列表**保证广度，'
+      + '看中哪篇用 _dsh_external_dsh_liubian_read Dxxxx@工作区 取全文。tags 至少 4 个。无需身份。',
     parameters: {
-      tags: { type: 'string', required: true, description: '检索标签，逗号分隔，至少 4 个；未精确匹配的标签会自动扩展' },
+      tags: { type: 'string', required: true, description: '检索标签，逗号分隔，至少 4 个（与日记标签一致；语义路会兜底相近内容）' },
+      query: { type: 'string', description: '可选：自由文本，增强语义一路（默认用 tags 拼接）' },
       workspace: ARG_WORKSPACE,
     },
     async execute(args) {
-      const tags = String(args.tags || '')
-      const count = tags.split(',').filter(t => t.trim()).length
-      if (count < 4) return `[错误] 检索需要至少 4 个标签（当前 ${count} 个）。`
-      const acc = ensureSystemAccount(cfg)
-      if (!acc) return ACCOUNT_UNAVAILABLE
-      // search 的解析器要求「给 -u 就必须给 --password」；免密账号 pwd 为空，
-      // 校验分支直接跳过，所以占位符只是满足语法，不会被当成真密码。
-      return runMemory(cfg, ['search', '--tags', tags, '-u', acc.user, '--password', PASSWORD_PLACEHOLDER, '--key', acc.key],
-        { workspace: args.workspace })
+      const tags = String(args.tags || '').split(',').map(t => t.trim()).filter(Boolean)
+      if (tags.length < 4) return `[错误] 检索需要至少 4 个标签（当前 ${tags.length} 个）。`
+      const scope = String(args.workspace || '').trim()
+      const query = String(args.query || '').trim() || tags.join(' ')
+      const vec = await queryEmbedding(cfg, query)
+      const ranked = await jointQuery(cfg, { workspace: scope, tags, vec, top: 50, full: false, mode: 'rank' })
+      if (!ranked || !ranked.ok) return `[错误] 检索失败：${ranked.error || '未知'}`
+      const seedTop = Math.max(1, Number(cfg.memorySeedTop) || 5)
+      const perSeed = Math.max(1, Number(cfg.memoryRelatedPerSeed) || 5)
+      const seeds = (ranked.results || []).slice(0, seedTop)
+      if (!seeds.length) return '[无命中] 没有检索到匹配的日记。'
+      // 第二跳：沿主线向量找关联（失败只退回主线）
+      const seen = new Set(seeds.map(r => `${r.ws}#${r.id}`))
+      const related = []
+      const rel = await jointQuery(cfg, {
+        workspace: scope, mode: 'related', top: perSeed, full: false,
+        seeds: seeds.map(r => `${r.ws}|${r.id}`),
+      })
+      if (rel && rel.ok && rel.related) {
+        for (const s of seeds) {
+          for (const r of (rel.related[`${s.ws}|${s.id}`] || [])) {
+            const k = `${r.ws}#${r.id}`
+            if (seen.has(k)) continue
+            seen.add(k)
+            related.push({ ws: r.ws, id: r.id, sem: Number(r.sem) || 0 })
+          }
+        }
+      }
+      const winners = [
+        ...seeds.map(r => ({ ...r, hop: '主线' })),
+        ...related.map(r => ({ ...r, hop: '关联' })),
+      ]
+      // 只回摘要（广度优先），全文按需 read
+      const detail = await jointQuery(cfg, {
+        workspace: scope, mode: 'ids', top: winners.length, full: true,
+        ids: winners.map(r => `${r.ws}|${r.id}`),
+      })
+      const got = new Map(((detail && detail.results) || []).map(r => [`${r.ws}#${r.id}`, r]))
+      const skillHits = await skillHitsFor(cfg, query)
+      const lines = winners.map((w, i) => {
+        const d = got.get(`${w.ws}#${w.id}`) || {}
+        const sum = clipText(String(d.summary || '').trim() || String(d.content || '').trim().slice(0, 120), 120) || '(无摘要)'
+        const tagTxt = w.hop === '主线' ? `综合${Number(w.score).toFixed(2)}` : `关联·语义${Number(w.sem || 0).toFixed(2)}`
+        return `${i + 1}. 【${w.hop}】${w.id}@${w.ws}（${tagTxt}）${sum}`
+      })
+      const skillLines = skillHits.length
+        ? ['', '[技能命中] ' + skillHits.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、')
+          + '——需要细节用 _dsh_external_dsh_liubian_update action=read_source。']
+        : []
+      return [
+        `[OK] 两级检索命中 ${winners.length} 篇（主线 ${seeds.length} + 关联 ${winners.length - seeds.length}），已按相关度排序返回摘要。`,
+        '看中哪篇用 _dsh_external_dsh_liubian_read Dxxxx@工作区 取全文。',
+        '',
+        ...lines,
+        ...skillLines,
+      ].join('\n')
     },
   })
 
@@ -672,44 +721,55 @@ export function registerTools(ctx, cfg) {
   /* - 全局通用教训 -------------------------------------------------------- */
   register(ctx, {
     name: 'lessons',
-    description: '全局共享的**通用教训**清单：每次会话开始自动注入（<liubian-lessons> 块）。只收跨领域通用的条目'
+    description: '**通用教训**清单（全局一份 + 当前工作区一份，每次会话开始自动注入 <liubian-lessons> 块）。只收跨领域通用的条目'
       + '（工程纪律 / 流程与协作 / 验证与诊断方法），不含特定领域内容。'
-      + 'action: list 查看｜add 新增（text=教训一句话）｜remove 移除（id=序号）｜generate 从记忆库蒸馏通用教训（LLM）。',
+      + 'action: list 查看｜add 新增（text=教训一句话）｜remove 移除（id=序号）｜generate 从记忆库蒸馏通用教训（LLM）。'
+      + 'scope=global｜workspace 选清单（默认 global）。',
     parameters: {
       action: { type: 'string', required: true, enum: ['list', 'add', 'remove', 'generate'], description: '操作' },
+      scope: { type: 'string', enum: ['global', 'workspace'], description: '清单范围：global=全局（默认）；workspace=当前工作区' },
       text: { type: 'string', description: 'add 时：教训内容（一句话，跨领域通用）' },
       id: { type: 'number', description: 'remove 时：序号（list 输出的编号，1 起）' },
       count: { type: 'number', description: 'generate 时：希望蒸馏几条（默认 8，最多 30）' },
     },
-    async execute(args) {
+    async execute(args, exec) {
       const action = String(args.action || 'list').toLowerCase()
+      const scope = String(args.scope || 'global').toLowerCase() === 'workspace' ? 'workspace' : 'global'
+      const ws = scope === 'workspace' ? resolveDiaryWorkspace(cfg, exec?.agent) : ''
+      if (scope === 'workspace' && !ws) {
+        return '[错误] 无法解析当前会话的工作区（scope=workspace 需要会话有工作目录）。先用 scope=global。'
+      }
       if (action === 'list') {
-        const list = loadLessons()
-        if (!list.length) return '（清单为空。用 action=add 添加，或 action=generate 从记忆库蒸馏通用教训。）'
+        const list = loadLessons(scope, ws)
+        if (!list.length) {
+          return scope === 'workspace'
+            ? `（工作区「${ws}」的清单为空。用 action=add scope=workspace 添加，或 action=generate scope=workspace 从该工作区日记蒸馏。）`
+            : '（全局清单为空。用 action=add 添加，或 action=generate 从记忆库蒸馏通用教训。）'
+        }
         return list.map((t, i) => `${i + 1}. ${t}`).join('\n')
       }
       if (action === 'add') {
         const text = String(args.text || '').trim()
         if (!text) return '[错误] add 需要 text（一句话教训，跨领域通用）'
-        const list = loadLessons()
+        const list = loadLessons(scope, ws)
         if (list.length >= 200) return '[错误] 清单已满（200 条），先 remove 再加'
         if (list.some(t => normLesson(t) === normLesson(text))) {
-          return `[重复] 这条教训已在清单里（现共 ${list.length} 条）。`
+          return `[重复] 这条教训已在${scope === 'workspace' ? '工作区' : '全局'}清单里（现共 ${list.length} 条）。`
         }
         list.push(text)
-        saveLessons(list)
-        return `[OK] 已添加（现共 ${list.length} 条），下次会话开始自动注入。`
+        saveLessons(list, scope, ws)
+        return `[OK] 已添加到${scope === 'workspace' ? '工作区' : '全局'}清单（现共 ${list.length} 条），下次会话开始自动注入。`
       }
       if (action === 'remove') {
         const id = Number(args.id)
-        const list = loadLessons()
+        const list = loadLessons(scope, ws)
         if (!Number.isFinite(id) || id < 1 || id > list.length) return `[错误] remove 需要 id（1~${list.length}）`
         const gone = list.splice(id - 1, 1)
-        saveLessons(list)
+        saveLessons(list, scope, ws)
         return `[OK] 已移除：${gone[0]}\n（现共 ${list.length} 条）`
       }
       if (action === 'generate') {
-        const r = await generateLessons(cfg, { count: args.count, log: ctx.logger })
+        const r = await generateLessons(cfg, { count: args.count, log: ctx.logger, scope, ws })
         if (!r.ok) return `[错误] ${r.error}`
         if (!r.added) return `[无新增] ${r.note || '没有产出新条目'}`
         return `[OK] 新增 ${r.added} 条通用教训（现共 ${r.total} 条），下次会话开始自动注入：\n`
@@ -1194,13 +1254,17 @@ function contextStateFor(session) {
  *  特定领域内容（某部小说、某个模型或比赛的专属结论）不收 —— 那是记忆检索的职责。
  */
 
-function lessonsFile() {
-  return join(DSH_HOME, 'liubian', 'lessons.json')
+/** scope='global'：全局一份（lessons.json）；scope='workspace'：每工作区一份
+ *  （lessons-<工作区>.json），两份互不影响、注入时都给。 */
+function lessonsFile(scope = 'global', ws = '') {
+  return scope === 'workspace' && ws
+    ? join(DSH_HOME, 'liubian', `lessons-${ws}.json`)
+    : join(DSH_HOME, 'liubian', 'lessons.json')
 }
 
-function loadLessons() {
+function loadLessons(scope = 'global', ws = '') {
   try {
-    const meta = JSON.parse(readFileSync(lessonsFile(), 'utf8').replace(/^\uFEFF/, ''))
+    const meta = JSON.parse(readFileSync(lessonsFile(scope, ws), 'utf8').replace(/^\uFEFF/, ''))
     const list = Array.isArray(meta && meta.lessons) ? meta.lessons : []
     return list.map(t => String(t || '').trim()).filter(Boolean)
   } catch {
@@ -1208,8 +1272,8 @@ function loadLessons() {
   }
 }
 
-function saveLessons(list) {
-  const file = lessonsFile()
+function saveLessons(list, scope = 'global', ws = '') {
+  const file = lessonsFile(scope, ws)
   mkdirSync(dirname(file), { recursive: true })
   writeFileSync(file, JSON.stringify({ updatedAt: new Date().toISOString(), lessons: list }, null, 2), 'utf8')
 }
@@ -1217,10 +1281,11 @@ function saveLessons(list) {
 const normLesson = t => String(t || '').replace(/\s+/g, '').trim()
 
 /** 注入块：条数与总长有上限；空清单返回 ''（不注入）。 */
-function buildLessonsBlock(cfg) {
+function buildLessonsBlock(cfg, scope = 'global', ws = '') {
   if (!cfg.lessonsInject) return ''
-  const lessons = loadLessons()
+  const lessons = loadLessons(scope, ws)
   if (!lessons.length) return ''
+  const label = scope === 'workspace' ? `工作区「${ws}」` : '全局'
   const maxN = Math.max(1, Number(cfg.lessonsMax) || 20)
   const budget = Math.max(400, Number(cfg.lessonsChars) || 2400)
   const shown = lessons.slice(0, maxN).map(t => clipText(String(t), 120))
@@ -1236,8 +1301,8 @@ function buildLessonsBlock(cfg) {
     used += seg.length
   }
   return [
-    `<liubian-lessons n="${shown.length}">`,
-    '说明：以下是全局共享的**通用教训**（跨领域、跨工作区沉淀，只含通用项）。处理任务前先对照，避免重蹈覆辙；不要在回答里复述这份清单。',
+    `<liubian-lessons scope="${label}" n="${shown.length}">`,
+    '说明：以下是**通用教训**（跨领域沉淀，只含通用项，不含特定领域细节）。处理任务前先对照，避免重蹈覆辙；不要在回答里复述这份清单。',
     ...items,
     '</liubian-lessons>',
   ].join('\n')
@@ -1245,8 +1310,9 @@ function buildLessonsBlock(cfg) {
 
 /** 从记忆库蒸馏**通用**教训（LLM）：检索教训/经验/规则类日记 → 模型提炼跨领域条目
  *  → 与现有清单去重后合并。检索或蒸馏失败只返回错误，绝不动现有清单。 */
-export async function generateLessons(cfg, { count = 8, log } = {}) {
+export async function generateLessons(cfg, { count = 8, log, scope = 'global', ws = '' } = {}) {
   const want = Math.max(1, Math.min(30, Number(count) || 8))
+  const qws = scope === 'workspace' ? ws : ''   // 工作区教训：候选只取该工作区的日记
   const dc = diaryConfig()
   const api = retrievalApiConfig(cfg, dc)
   if (!api.apiKey) return { ok: false, error: '未配置检索侧外部 API（memoryApiKey / 写日记 key）' }
@@ -1255,14 +1321,14 @@ export async function generateLessons(cfg, { count = 8, log } = {}) {
   const vec = await queryEmbedding(cfg, query)
   const ranked = await jointQuery(cfg, {
     tags: ['教训', '经验', '规则', '坑', '流程', '协作'],
-    vec, top: 24, full: false, mode: 'rank',
+    vec, top: 24, full: false, mode: 'rank', workspace: qws,
   })
   if (!ranked || !ranked.ok) return { ok: false, error: (ranked && ranked.error) || '记忆检索失败' }
   // rank 模式只回 id+分数（无正文）：按 id 精确取正文（与 memoryRetrieval 同款两段式）
   const picked = (ranked.results || []).slice(0, 24)
   if (!picked.length) return { ok: false, error: '没有检索到候选日记' }
   const detail = await jointQuery(cfg, {
-    workspace: '', mode: 'ids', top: picked.length, full: true,
+    workspace: qws, mode: 'ids', top: picked.length, full: true,
     ids: picked.map(r => `${r.ws}|${r.id}`),
   })
   const got = new Map(((detail && detail.results) || []).map(r => [`${r.ws}#${r.id}`, r]))
@@ -1286,7 +1352,7 @@ export async function generateLessons(cfg, { count = 8, log } = {}) {
     '5. 只输出 JSON，不要代码块围栏、不要解释：',
     '{"lessons":["教训1","教训2", ...]}',
   ].join('\n')
-  const existing = loadLessons()
+  const existing = loadLessons(scope, ws)
   const user = `[历史记忆候选]\n${material}\n\n[已有清单（查重用，不要重复）]\n${existing.length ? existing.map((t, i) => `${i + 1}. ${t}`).join('\n') : '（空）'}`
   const res = await callDiaryApi(cfg, api, { messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] })
   if (!res.ok) return { ok: false, error: res.error || 'LLM 调用失败' }
@@ -1304,7 +1370,7 @@ export async function generateLessons(cfg, { count = 8, log } = {}) {
   }
   if (!added.length) return { ok: true, added: 0, total: existing.length, note: '模型没有给出新条目（可能与现有清单全部重复）' }
   const next = existing.concat(added)
-  saveLessons(next)
+  saveLessons(next, scope, ws)
   return { ok: true, added: added.length, total: next.length, lessons: added }
 }
 
@@ -1313,10 +1379,14 @@ async function takeProfileMessage(cfg, agent) {
   if (state.profileDelivered) return null
   if (!state.profilePromise) state.profilePromise = profileBlockCached(cfg)
   const block = await state.profilePromise
-  const lessons = buildLessonsBlock(cfg)   // 全局通用教训：随接入卡一起在会话开始注入
-  if (!block && !lessons) return null
+  const ws = resolveDiaryWorkspace(cfg, agent)
+  const lessons = [
+    buildLessonsBlock(cfg, 'global'),
+    buildLessonsBlock(cfg, 'workspace', ws),   // 工作区局部教训：只发给对应会话
+  ].filter(Boolean)
+  if (!block && !lessons.length) return null
   state.profileDelivered = true
-  return pluginMessage([block, lessons].filter(Boolean).join('\n\n'), 'recall')
+  return pluginMessage([block, ...lessons].filter(Boolean).join('\n\n'), 'recall')
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
