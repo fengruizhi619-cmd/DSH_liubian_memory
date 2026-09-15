@@ -80,6 +80,7 @@ export const DEFAULTS = {
   lessonsInject: true,       // 关掉 = 会话开始不注入教训块
   lessonsMax: 20,            // 最多注入几条
   lessonsChars: 2400,        // 教训块总字符上限
+  lessonsEveryTurns: 10,     // 每 N 轮重注一次教训块（0 = 只在会话开始注一次）
   memoryTagTopN: 5,          // 让模型挑几个 tag
   memorySkillTopN: 3,        // 每轮注入几个**命中的技能**（只给名字+摘要，不给全文）
   memorySkillTimeoutMs: 30000,
@@ -456,7 +457,7 @@ export function registerTools(ctx, cfg) {
       })
       const skillLines = skillHits.length
         ? ['', '[技能命中] ' + skillHits.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、')
-          + '——需要细节用 _dsh_external_dsh_liubian_update action=read_source。']
+          + '——需要细节去 ~/.codex/skills 或 ~/.dsh/skills 读对应技能的 SKILL.md。']
         : []
       return [
         `[OK] 两级检索命中 ${winners.length} 篇（主线 ${seeds.length} + 关联 ${winners.length - seeds.length}），已按相关度排序返回摘要。`,
@@ -495,63 +496,6 @@ export function registerTools(ctx, cfg) {
     parameters: { workspace: ARG_WORKSPACE },
     async execute(args) {
       return runMemory(cfg, ['info'], { workspace: args.workspace })
-    },
-  })
-
-  /* ── 流变·更新（mcp-update） ───────────────────────────────────────────── */
-  register(ctx, {
-    name: 'update',
-    description: '流变·更新：技能独立装载 / 快照 / 广播。'
-      + 'action: check 比对装载与快照｜list 已装载清单｜install / uninstall（配 skill）｜'
-      + 'sync 同步哈希｜snapshot 维护者刷新快照（自动群发更新公告）｜agents 全局装载状态｜'
-      + 'subscribe 订阅开关（配 subscribe_action）｜broadcast 手动群发公告（配 content）｜'
-      + 'read_source 读技能 SKILL.md 原文｜list_skills 列出全部技能。'
-      + '铁则：sync 前必须先 read_source 通读该技能原文。',
-    parameters: {
-      action: {
-        type: 'string',
-        required: true,
-        enum: ['check', 'list', 'install', 'uninstall', 'sync', 'snapshot', 'agents', 'subscribe', 'broadcast', 'read_source', 'list_skills'],
-        description: '更新操作',
-      },
-      skill: { type: 'string', description: '技能文件夹名；install/uninstall/read_source 使用（install 可传 all）' },
-      subscribe_action: { type: 'string', enum: ['on', 'off'], description: 'subscribe 的开' },
-      content: { type: 'string', description: 'broadcast 的公告正' },
-      workspace: ARG_WORKSPACE,
-    },
-    async execute(args) {
-      const action = String(args.action || '').toLowerCase()
-      const skill = String(args.skill || '').trim()
-
-      if (action === 'read_source') {
-        if (!skill) return '[错误] read_source 需要 skill'
-        const file = join(cfg.codexSkills, skill, 'SKILL.md')
-        if (!existsSync(file)) return `[错误] 未找到技能原文: ${file}`
-        try {
-          return readFileSync(file, 'utf8')
-        } catch (err) {
-          return '[错误] 读取失败: ' + ((err && err.message) || String(err))
-        }
-      }
-      if (action === 'list_skills') {
-        const list = root => {
-          try {
-            return readdirSync(root, { withFileTypes: true })
-              .filter(d => d.isDirectory() && !d.name.startsWith('.'))
-              .map(d => d.name)
-              .sort()
-          } catch {
-            return []
-          }
-        }
-        const codex = list(cfg.codexSkills)
-        const dshRoot = join(DSH_HOME, 'skills')
-        const dsh = list(dshRoot)
-        return `[Codex 技能] 共 ${codex.length} 个：\n${codex.join('、')}`
-          + `\n\n[DSH 技能] 共 ${dsh.length} 个：\n${dsh.join('、')}`
-      }
-
-      return '[错误] 该 action 需要花名账号体系（已在 DSH 侧解耦移除）。可用：read_source / list_skills'
     },
   })
 
@@ -1123,7 +1067,7 @@ function contextStateFor(session) {
   const id = String(session?.id ?? 'default')
   let state = contextStates.get(id)
   if (!state) {
-    state = { profileDelivered: false, profilePromise: null, lastRecallKey: '', recallCount: 0 }
+    state = { profileDelivered: false, profilePromise: null, lastRecallKey: '', recallCount: 0, lessonsCounter: 0, lessonsLastKey: '' }
     contextStates.set(id, state)
   }
   return state
@@ -1185,6 +1129,9 @@ function buildLessonsBlock(cfg, scope = 'global', ws = '') {
     `<liubian-lessons scope="${label}" n="${shown.length}">`,
     '说明：以下是**通用教训**（跨领域沉淀，只含通用项，不含特定领域细节）。处理任务前先对照，避免重蹈覆辙；不要在回答里复述这份清单。',
     ...items,
+    '──',
+    `主动检索入口：需要跨会话查历史结论时，用 _dsh_external_dsh_liubian_search（tags 至少 4 个，返回两级摘要列表，看中哪篇用 _dsh_external_dsh_liubian_read 取全文）——自动注入只覆盖当前话题，主动搜索才能拉到检索块没命中的记忆。`,
+    `教训沉淀入口：发现跨领域通用的新教训时，用 _dsh_external_dsh_liubian_lessons action=add（scope=global 全局 / workspace 当前工作区，text=一句话教训）写入清单；也可以 action=generate 让 LLM 从记忆库自动蒸馏。`,
     '</liubian-lessons>',
   ].join('\n')
 }
@@ -1267,6 +1214,7 @@ async function takeProfileMessage(cfg, agent) {
   ].filter(Boolean)
   if (!block && !lessons.length) return null
   state.profileDelivered = true
+  state.lessonsCounter = 0   // 首次注入后开始计轮，每 N 轮重注一次
   return pluginMessage([block, ...lessons].filter(Boolean).join('\n\n'), 'recall')
 }
 
@@ -1425,7 +1373,7 @@ function formatSkillBlock(hits, cfg) {
   if (!list.length) return ''
   const lines = [
     `<liubian-skills hits="${list.length}">`,
-    '说明：以下技能与本轮主题相关（本地技能库语义命中）。需要细节时用 _dsh_external_dsh_liubian_update action=read_source skill=<名字> 读原文 —— 这里只给名字与摘要，不给全文。',
+    '说明：以下技能与本轮主题相关（本地技能库语义命中）。需要细节时去 ~/.codex/skills 或 ~/.dsh/skills 读对应技能的 SKILL.md 原文 —— 这里只给名字与摘要，不给全文。',
   ]
   for (const h of list) {
     const sum = clipText(String(h.summary || '').trim(), 200) || '(无摘要)'
@@ -1638,11 +1586,30 @@ export function mountContextInjection(ctx, cfg) {
     // 上下文插入只是附带功能，绝不能拖垮用户这一轮 —— 所以整段兜住，出错就当没插入。
     try {
       if (!decision || decision.kind !== 'enter' || signal?.aborted) return decision
+      const state = contextStateFor(agent?.session)
       const additions = []
       const profile = await takeProfileMessage(cfg, agent)
       if (profile) additions.push(profile)
       const mem = await memoryMessageFor(ctx, cfg, agent, decision.messages, signal)
       if (mem) additions.push(mem)
+      // 教训周期重注：每 N 轮新人类输入后重发教训块（接入卡只在会话开始注一次，教训需要定期提醒）
+      const lessonPrompt = currentPrompt(decision.messages)
+      if (lessonPrompt && lessonPrompt !== state.lessonsLastKey && state.profileDelivered) {
+        state.lessonsLastKey = lessonPrompt
+        const every = Math.max(0, Number(cfg.lessonsEveryTurns) || 0)
+        if (every > 0) {
+          state.lessonsCounter += 1
+          if (state.lessonsCounter >= every) {
+            state.lessonsCounter = 0
+            const ws = resolveDiaryWorkspace(cfg, agent)
+            const lessonsAgain = [
+              buildLessonsBlock(cfg, 'global'),
+              buildLessonsBlock(cfg, 'workspace', ws),
+            ].filter(Boolean).join('\n\n')
+            if (lessonsAgain) additions.push(pluginMessage(lessonsAgain, 'recall'))
+          }
+        }
+      }
       // 自动日记：**只在"新一轮的第一步"**触发（同一轮内的后续步 currentPrompt 为空），
       // 写的是上一轮，且 fire-and-forget —— API 调用耗时几秒，绝不能卡住本轮。
       if (currentPrompt(decision.messages)) scheduleDiaryFlush(ctx, cfg, agent)
