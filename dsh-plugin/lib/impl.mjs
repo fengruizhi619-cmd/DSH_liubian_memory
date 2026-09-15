@@ -51,9 +51,7 @@ export const DEFAULTS = {
   installSkills: true,
   // ── DSH 侧身份策略：不需要用户管密码/KEY ──
   // 写日记走匿名（memory.py 的 write 在无 -u 时完全不鉴权，也不受工作区归属限制）。
-  // 检索 / 更新 要一个账号，由插件自动注册一个免密花朵账号（密码根本不存在）。
-  systemUser: '玉兰',
-  autoProvision: true,
+  // 检索走 helper 的直连 DB 读取（无需身份）。
   // 向量服务的配置与生命周期已拆到独立插件 dsh-liubian-embed
   timeoutMs: 180000,
   // ── 上下文插入（对照 @openviking/dsh-memory-plugin） ──
@@ -356,76 +354,8 @@ const OUT = {
 
 const ARG_WORKSPACE = { type: 'string', description: '工作区名，如 工作组 / 银砂纪年（默认取插件配置）' }
 
-/** 系统账号不可用时的统一提示（search 强制要求 username 属于 FLOWER_NAMES）。 */
-const ACCOUNT_UNAVAILABLE = '[错误] 系统账号不可用：把 systemUser 设成一个未被占用的花朵中文名，'
-  + '或打开 autoProvision 让插件自动注册一个免密账号。'
-
-/**
- * DSH 侧的身份策略（用户明确要求：DSH 侧不再有身份/密钥/密码这些东西）。
- *
- * 后端 memory.py 的鉴权分布是：
- *   - `write`  整段被 `if username:` 包着 → 不带 -u 就完全不鉴权，也没有工作区归属限制；
- *   - `search` 带 -u 时校验密码与 KEY；不带 -u 的匿名分支要求工作区 index 里有
- *              legacy `last_key`，库里那 13 个工作区的该字段全是空串 → 匿名分支已死；
- *   - `update` / `skill-index` 等要一个存在的账号。
- *
- * 所以本插件：写日记**匿名**（零身份）；要账号的能力统一用**自动注册的免密账号**
- * （`register --free`：库里 `pwd` 为空 → `verify_user_pwd` 直接放行，密码根本不存在）。
- * 账号名是花朵名（`search` 强制要求 username 属于 FLOWER_NAMES），KEY 由插件自动取回并缓存，
- * 用户从头到尾不需要输入任何密码或 KEY。
- */
-function accountFile() {
-  return join(DSH_HOME, 'liubian', 'account.json')
-}
-
-export function loadAccount() {
-  return readJson(accountFile())
-}
-
-function saveAccount(patch) {
-  const next = { ...loadAccount(), ...patch, updatedAt: new Date().toISOString() }
-  mkdirSync(dirname(accountFile()), { recursive: true })
-  writeFileSync(accountFile(), JSON.stringify(next, null, 2), 'utf8')
-  return next
-}
-
 /** 插件日志器（apply 时注入），让自动注册这类副作用在日志里可见。 */
 let activeLogger = null
-
-/**
- * 保证系统账号可用：已缓存的 KEY 仍与注册表一致就直接用；否则（首次 / 被 rename / 被删）
- * 自动注册一个免密花朵账号并取回 KEY。返回 { user, key } 或 null。
- */
-export function ensureSystemAccount(cfg) {
-  const cached = loadAccount()
-  const user = String(cfg.systemUser || cached.user || '').trim()
-  if (!user) return null
-
-  // 已存在且 KEY 未变 ?直接。
-  if (cached.user === user && cached.key) {
-    const live = runHelper(cfg, 'user_key', [user], { timeoutMs: 30000 }).trim()
-    if (live === cached.key) return { user, key: cached.key }
-  }
-
-  if (!cfg.autoProvision) {
-    const live = runHelper(cfg, 'user_key', [user], { timeoutMs: 30000 }).trim()
-    return /^[0-9a-fA-F]{8,}$/.test(live) ? { user, key: live } : null
-  }
-
-  // 注册（免密：不传 --password，加 --free）。已存在会报"已存在"，此时直接取 KEY。
-  const created = !loadAccount().createdAt
-  runMemory(cfg, ['register', '--name', user, '--free'], { timeoutMs: 60000 })
-  const key = runHelper(cfg, 'user_key', [user], { timeoutMs: 30000 }).trim()
-  if (!/^[0-9a-fA-F]{8,}$/.test(key)) return null
-  saveAccount({ user, key, createdAt: loadAccount().createdAt || new Date().toISOString() })
-  if (created) {
-    activeLogger?.info?.(`[dsh-liubian] 已自动注册免密系统账号}${user}」（DSH 侧不要你输入任何密码/KEY）`)
-  }
-  return { user, key }
-}
-
-/** 免密账号在 post 这类解析器里要求 --password 非空，给个占位符（免密账号会忽略它）。 */
-const PASSWORD_PLACEHOLDER = 'dsh-noauth'
 
 function register(ctx, def) {
   // 注意：name / output 必须放在展开之后 —— def 自身带 name 字段，
@@ -438,38 +368,6 @@ function register(ctx, def) {
 }
 
 export function registerTools(ctx, cfg) {
-  /* - 流变·接入账号（DSH 侧不要你管身份） ------------------------------------------------------------ */
-  register(ctx, {
-    name: 'account',
-    description: '查看 DSH 侧流变接入状态。写日记走匿名（无身份 / 无密码 / 无 KEY）；'
-      + '检索 / 更新 用一个插件自动注册的免密花朵账号（密码根本不存在，你不需要输入任何东西）。'
-      + 'action: show 查看状态｜ensure 立即补齐账号与 KEY。',
-    parameters: {
-      action: { type: 'string', enum: ['show', 'ensure'], required: true, description: '查看或补齐' },
-      workspace: ARG_WORKSPACE,
-    },
-    async execute(args) {
-      const action = String(args.action || 'show').toLowerCase()
-      const cached = loadAccount()
-      const lines = [
-        '[写日记] 匿名模式：不带身份、无鉴权、无工作区归属限制，直接落盘',
-        `[检索/更新] 系统账号：${cfg.systemUser || '(未配置)'}（免密）`,
-      ]
-      if (action === 'ensure') {
-        const acc = ensureSystemAccount(cfg)
-        lines.push(acc
-          ? `[OK] 账号就绪：${acc.user}　KEY ${acc.key.slice(0, 8)}…`
-          : ACCOUNT_UNAVAILABLE)
-      } else {
-        lines.push(`[KEY 缓存] ${cached.key ? cached.key.slice(0, 8) + '…' : '(未缓存，首次用到时自动注册)'}`)
-        lines.push(`[注册时间] ${cached.createdAt || '(尚未注册)'}`)
-      }
-      lines.push(`[账号文件] ${accountFile()}${existsSync(accountFile()) ? '' : '（尚未创建）'}`)
-      lines.push(`[配置文件] ${configFile()}${existsSync(configFile()) ? '' : '（尚未创建，用默认）'}`)
-      return lines.join('\n')
-    },
-  })
-
   /* - 流变·记忆：写日记（mcp-memory-write?------------------------------------------------------------ */
   register(ctx, {
     name: 'write',
@@ -653,21 +551,7 @@ export function registerTools(ctx, cfg) {
           + `\n\n[DSH 技能] 共 ${dsh.length} 个：\n${dsh.join('、')}`
       }
 
-      const acc = ensureSystemAccount(cfg)
-      if (!acc) return ACCOUNT_UNAVAILABLE
-
-      if (action === 'subscribe') {
-        const on = String(args.subscribe_action || 'on').toLowerCase() === 'on' ? 'on' : 'off'
-        return runMemory(cfg, ['subscribe', '-u', acc.user, '--password', PASSWORD_PLACEHOLDER, on], { workspace: args.workspace })
-      }
-      if (action === 'broadcast') {
-        if (!args.content) return '[错误] broadcast 需要 content'
-        return runMemory(cfg, ['broadcast', '-u', acc.user, '--password', PASSWORD_PLACEHOLDER, '--content', String(args.content)],
-          { workspace: args.workspace })
-      }
-      const argv = ['update', '-u', acc.user, '--password', PASSWORD_PLACEHOLDER, action]
-      if (skill && (action === 'install' || action === 'uninstall')) argv.push('--skill', skill)
-      return runMemory(cfg, argv, { workspace: args.workspace })
+      return '[错误] 该 action 需要花名账号体系（已在 DSH 侧解耦移除）。可用：read_source / list_skills'
     },
   })
 
@@ -785,13 +669,11 @@ export function registerTools(ctx, cfg) {
     description: '流变系统总览：DSH 侧接入状态（写入模式 / 系统账号）+ 注册表统计 + 统一 CLI status。',
     parameters: { workspace: ARG_WORKSPACE },
     async execute(args) {
-      const stats = runHelper(cfg, 'registry_stats', [cfg.systemUser || ''], { timeoutMs: 60000 })
+      const stats = runHelper(cfg, 'registry_stats', [], { timeoutMs: 60000 })
       const cli = runLiubianCli(cfg, ['status'], { workspace: args.workspace })
-      const cached = loadAccount()
       return [
         '[DSH 侧接入]',
         '  写日记：匿名写入（无身份 / 无密码 / 无 KEY）',
-        `  系统账号：${cfg.systemUser || '(未配置)'}　KEY ${cached.key ? cached.key.slice(0, 8) + '…' : '(未注册，首次用到时自动建)'}`,
         '  向量服务：由独立插件 dsh-liubian-embed 负责（用 _dsh_external_dsh_liubian_embed action=status 查看）',
         '',
         '[注册表统计]',
@@ -1185,10 +1067,9 @@ function profileBlockCached(cfg) {
 }
 
 async function buildProfileBlock(cfg) {
-  const systemUser = String(cfg.systemUser || '').trim()
   let data = null
   try {
-    const raw = await runHelperAsync(cfg, 'registry_stats', [systemUser], { timeoutMs: 60000 })
+    const raw = await runHelperAsync(cfg, 'registry_stats', [], { timeoutMs: 60000 })
     data = JSON.parse(raw)
   } catch {
     return ''
@@ -1198,7 +1079,7 @@ async function buildProfileBlock(cfg) {
   const lines = []
   const card = data.card
 
-  lines.push(`[流变·记忆] 写日记走匿名（无身份）；检索/更新用系统账号 ${systemUser || '(未配置)'}`
+  lines.push('[流变·记忆] 写日记走匿名（无身份）'
     + `｜默认工作区：${cfg.workspace}`)
 
   const dc = diaryConfig()
@@ -1805,8 +1686,6 @@ export const __test = {
   formatSkillBlock,
   skillHitsFor,
   buildProfileBlock,
-  ensureSystemAccount,
-  accountFile,
   // - 全局通用教训 -
   loadLessons,
   buildLessonsBlock,
