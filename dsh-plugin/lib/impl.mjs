@@ -86,6 +86,9 @@ export const DEFAULTS = {
   skillAutoLoadThreshold: 0.6,  // 语义相似度阈值（skillHitsFor 返回的 score）
   skillAutoLoadMax: 1,       // 每轮最多自动注入几个技能（防上下文膨胀）
   skillAutoLoadChars: 8000,  // 单个技能正文注入上限（超长截断）
+  // ── 能力卡：已装插件/MCP 的"什么时候用什么"清单，会话开始 + 每 N 轮提醒 ──
+  capabilitiesInject: true,  // 总开关
+  profileDir: 'C:/Users/Feng/.dsh/profiles/desktop',  // profile 目录（自动发现已装插件/MCP 用）
   memoryTagTopN: 5,          // 让模型挑几个 tag
   memorySkillTopN: 3,        // 每轮注入几个**命中的技能**（只给名字+摘要，不给全文）
   memorySkillTimeoutMs: 30000,
@@ -1141,6 +1144,69 @@ function buildLessonsBlock(cfg, scope = 'global', ws = '') {
   ].join('\n')
 }
 
+/* ── 能力卡：已装插件 / MCP 的"什么时候用什么"清单 ────────────────────────
+ *  模型看不见"我有哪些扩展能力"——工具表里有 mcp__* 但注意力顾不上。
+ *  清单 = 手工维护的 capabilities.json（含使用指引）∪ 自动发现（profile 的
+ *  patch.yml 扫 MCP serverName、package.json 扫插件名），会话开始 + 每 N 轮提醒。
+ */
+
+function capabilitiesFile() {
+  return join(DSH_HOME, 'liubian', 'capabilities.json')
+}
+
+function loadCapabilities() {
+  try {
+    const meta = JSON.parse(readFileSync(capabilitiesFile(), 'utf8').replace(/^\uFEFF/, ''))
+    return Array.isArray(meta && meta.capabilities) ? meta.capabilities : []
+  } catch {
+    return []
+  }
+}
+
+/** 从 profile 配置自动发现：patch.yml 扫 MCP serverName，package.json 扫插件名。 */
+function discoverInstalled(cfg) {
+  const mcps = new Set()
+  const plugins = new Set()
+  const dir = String(cfg.profileDir || '').trim()
+  if (dir) {
+    try {
+      const patch = readFileSync(join(dir, 'cordis.patch.yml'), 'utf8')
+      for (const m of patch.matchAll(/^\s*serverName:\s*(\S+)/gm)) mcps.add(m[1])
+    } catch { /* patch 读不到就跳过 */ }
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+      for (const name of Object.keys(pkg.dependencies || {})) {
+        if (/dsh-|liubian|mcp/i.test(name)) plugins.add(name)
+      }
+    } catch { /* package.json 读不到就跳过 */ }
+  }
+  return { mcps: [...mcps], plugins: [...plugins] }
+}
+
+function buildCapabilitiesBlock(cfg) {
+  if (!cfg.capabilitiesInject) return ''
+  const curated = loadCapabilities()
+  const known = new Set(curated.map(c => String(c.name || '').toLowerCase()))
+  const disc = discoverInstalled(cfg)
+  const extraMcp = disc.mcps.filter(n => ![...known].some(k => k.includes(n.toLowerCase())))
+  const extraPlugins = disc.plugins.filter(n => !known.has(n.toLowerCase()))
+  if (!curated.length && !extraMcp.length && !extraPlugins.length) return ''
+  const lines = [
+    '<liubian-capabilities>',
+    '说明：以下是本会话可用的扩展能力（插件工具与 MCP 服务器）。它们已在你的工具表里，遇到匹配场景时**主动调用**，不要等用户点名。',
+    ...curated.map((c, i) => {
+      const head = `${i + 1}. ${c.name}${c.tools ? `｜工具：${c.tools}` : ''}`
+      const when = c.when ? `\n   何时用：${c.when}` : ''
+      const how = c.how ? `\n   怎么用：${c.how}` : ''
+      return head + when + how
+    }),
+  ]
+  if (extraMcp.length) lines.push(`其他已接 MCP 服务器：${extraMcp.join('、')}（工具名形如 mcp__<服务器>__<工具>，详见工具表）`)
+  if (extraPlugins.length) lines.push(`其他已装插件：${extraPlugins.join('、')}`)
+  lines.push('</liubian-capabilities>')
+  return lines.join('\n')
+}
+
 /** 从记忆库蒸馏**通用**教训（LLM）：检索教训/经验/规则类日记 → 模型提炼跨领域条目
  *  → 与现有清单去重后合并。检索或蒸馏失败只返回错误，绝不动现有清单。 */
 export async function generateLessons(cfg, { count = 8, log, scope = 'global', ws = '' } = {}) {
@@ -1216,6 +1282,7 @@ async function takeProfileMessage(cfg, agent) {
   const lessons = [
     buildLessonsBlock(cfg, 'global'),
     buildLessonsBlock(cfg, 'workspace', ws),   // 工作区局部教训：只发给对应会话
+    buildCapabilitiesBlock(cfg),               // 能力卡：会话开始提醒有哪些扩展能力
   ].filter(Boolean)
   if (!block && !lessons.length) return null
   state.profileDelivered = true
@@ -1650,6 +1717,7 @@ export function mountContextInjection(ctx, cfg) {
             const lessonsAgain = [
               buildLessonsBlock(cfg, 'global'),
               buildLessonsBlock(cfg, 'workspace', ws),
+              buildCapabilitiesBlock(cfg),   // 能力卡：周期提醒，模型才想得起主动调
             ].filter(Boolean).join('\n\n')
             if (lessonsAgain) additions.push(pluginMessage(lessonsAgain, 'recall'))
           }
@@ -1703,6 +1771,10 @@ export const __test = {
   loadLessons,
   buildLessonsBlock,
   generateLessons,
+  // - 能力卡 -
+  buildCapabilitiesBlock,
+  loadCapabilities,
+  discoverInstalled,
   // - 自动日记（纯函数，自用）-
   diaryConfig,
   normalizeDiaryUrl,
