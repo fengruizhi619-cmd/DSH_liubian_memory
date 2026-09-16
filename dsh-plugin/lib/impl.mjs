@@ -89,6 +89,9 @@ export const DEFAULTS = {
   // ── 能力卡：已装插件/MCP 的"什么时候用什么"清单，会话开始 + 每 N 轮提醒 ──
   capabilitiesInject: true,  // 总开关
   profileDir: 'C:/Users/Feng/.dsh/profiles/desktop',  // profile 目录（自动发现已装插件/MCP 用）
+  // ── 反反驳自查提醒：每一轮对话都注入（一次一轮，不做内容去重）──
+  turnReminderInject: true,
+  turnReminderText: '如果你打算反驳用户，那就先看看你自己的结论有没有证据支持、证据充不充分，不要为了反驳而反驳。',
   memoryTagTopN: 5,          // 让模型挑几个 tag
   memorySkillTopN: 3,        // 每轮注入几个**命中的技能**（只给名字+摘要，不给全文）
   memorySkillTimeoutMs: 30000,
@@ -1075,7 +1078,7 @@ function contextStateFor(session) {
   const id = String(session?.id ?? 'default')
   let state = contextStates.get(id)
   if (!state) {
-    state = { profileDelivered: false, profilePromise: null, lastRecallKey: '', recallCount: 0, lessonsCounter: 0, lessonsLastKey: '', autoLoadedSkills: [] }
+    state = { profileDelivered: false, profilePromise: null, lastRecallKey: '', recallCount: 0, lessonsCounter: 0, lessonsLastKey: '', autoLoadedSkills: [], turnReminderCount: 0 }
     contextStates.set(id, state)
   }
   return state
@@ -1205,6 +1208,14 @@ function buildCapabilitiesBlock(cfg) {
   if (extraPlugins.length) lines.push(`其他已装插件：${extraPlugins.join('、')}`)
   lines.push('</liubian-capabilities>')
   return lines.join('\n')
+}
+
+/** 每轮注入的反反驳自查提醒（一次一轮，按人类消息条数计轮，不做内容去重）。 */
+function buildTurnReminder(cfg) {
+  if (!cfg.turnReminderInject) return ''
+  const text = String(cfg.turnReminderText || '').trim()
+  if (!text) return ''
+  return ['<liubian-turn-check>', text, '</liubian-turn-check>'].join('\n')
 }
 
 /** 从记忆库蒸馏**通用**教训（LLM）：检索教训/经验/规则类日记 → 模型提炼跨领域条目
@@ -1723,6 +1734,15 @@ export function mountContextInjection(ctx, cfg) {
           }
         }
       }
+      // 反反驳自查提醒：**每一轮对话都注入**（一次一轮）。
+      // 用「人类消息条数」计轮而非内容比对——用户连发两遍同样的话也各算一轮、各注一次；
+      // 同一步重试时条数不变，天然防重复。注在 additions 末尾（离生成点最近）。
+      const humanCount = (decision.messages || []).filter(m => isHumanMessage(m)).length
+      if (humanCount > 0 && humanCount !== state.turnReminderCount) {
+        state.turnReminderCount = humanCount
+        const reminder = buildTurnReminder(cfg)
+        if (reminder) additions.push(pluginMessage(reminder, 'recall'))
+      }
       // 自动日记：**只在"新一轮的第一步"**触发（同一轮内的后续步 currentPrompt 为空），
       // 写的是上一轮，且 fire-and-forget —— API 调用耗时几秒，绝不能卡住本轮。
       if (currentPrompt(decision.messages)) scheduleDiaryFlush(ctx, cfg, agent)
@@ -1775,6 +1795,8 @@ export const __test = {
   buildCapabilitiesBlock,
   loadCapabilities,
   discoverInstalled,
+  // - 逐轮提醒 -
+  buildTurnReminder,
   // - 自动日记（纯函数，自用）-
   diaryConfig,
   normalizeDiaryUrl,
