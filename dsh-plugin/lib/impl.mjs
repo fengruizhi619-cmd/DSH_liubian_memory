@@ -81,6 +81,11 @@ export const DEFAULTS = {
   lessonsMax: 20,            // 最多注入几条
   lessonsChars: 2400,        // 教训块总字符上限
   lessonsEveryTurns: 10,     // 每 N 轮重注一次教训块（0 = 只在会话开始注一次）
+  // ── 技能自动装载：语义命中超阈值 → 直接注入 SKILL.md 全文并建议使用 ──
+  skillAutoLoad: true,       // 总开关
+  skillAutoLoadThreshold: 0.6,  // 语义相似度阈值（skillHitsFor 返回的 score）
+  skillAutoLoadMax: 1,       // 每轮最多自动注入几个技能（防上下文膨胀）
+  skillAutoLoadChars: 8000,  // 单个技能正文注入上限（超长截断）
   memoryTagTopN: 5,          // 让模型挑几个 tag
   memorySkillTopN: 3,        // 每轮注入几个**命中的技能**（只给名字+摘要，不给全文）
   memorySkillTimeoutMs: 30000,
@@ -1067,7 +1072,7 @@ function contextStateFor(session) {
   const id = String(session?.id ?? 'default')
   let state = contextStates.get(id)
   if (!state) {
-    state = { profileDelivered: false, profilePromise: null, lastRecallKey: '', recallCount: 0, lessonsCounter: 0, lessonsLastKey: '' }
+    state = { profileDelivered: false, profilePromise: null, lastRecallKey: '', recallCount: 0, lessonsCounter: 0, lessonsLastKey: '', autoLoadedSkills: [] }
     contextStates.set(id, state)
   }
   return state
@@ -1367,6 +1372,25 @@ function formatMemoryBlock(results, cfg) {
 
 /** 技能注入块：每轮只注入**命中的前 N 个技能的摘要行**（不给全文，控 token）。
  *  用户规格（2026-09-12）：每次输出命中的前 3 个技能。 */
+/** 读技能 SKILL.md 正文（去 frontmatter、截断）。Codex 根优先、DSH 根兜底，再试平铺 .md。 */
+export function readSkillBody(cfg, name) {
+  const clean = String(name || '').replace(/[^\w-]/g, '')
+  if (!clean) return ''
+  const max = Math.max(2000, Number(cfg.skillAutoLoadChars) || 8000)
+  for (const root of [cfg.codexSkills, join(DSH_HOME, 'skills')]) {
+    if (!root) continue
+    for (const p of [join(root, clean, 'SKILL.md'), join(root, `${clean}.md`)]) {
+      try {
+        if (!existsSync(p)) continue
+        const raw = readFileSync(p, 'utf8')
+        const body = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').trim()
+        if (body) return body.slice(0, max)
+      } catch { /* 读不了换下一个候选 */ }
+    }
+  }
+  return ''
+}
+
 function formatSkillBlock(hits, cfg) {
   const top = Math.max(1, Number(cfg.memorySkillTopN) || 3)
   const list = (hits || []).slice(0, top)
@@ -1502,6 +1526,27 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
   const block = formatMemoryBlock(final, cfg)
   // 技能命中作为**独立块**附加（只给名字 + 摘要，不给全文）
   const skillBlock = formatSkillBlock(skillHits, cfg)
+  // 技能自动装载：语义分超阈值 → 读 SKILL.md 全文随本轮注入并建议使用（每技能每会话只注一次）
+  let autoSkill = ''
+  if (cfg.skillAutoLoad && skillHits.length && agent) {
+    const st = contextStateFor(agent?.session)
+    if (!Array.isArray(st.autoLoadedSkills)) st.autoLoadedSkills = []
+    const threshold = Number(cfg.skillAutoLoadThreshold) || 0.6
+    const maxN = Math.max(1, Number(cfg.skillAutoLoadMax) || 1)
+    const pickedSkills = skillHits
+      .filter(h => h.score >= threshold && !st.autoLoadedSkills.includes(h.skill))
+      .slice(0, maxN)
+    for (const hit of pickedSkills) {
+      const body = readSkillBody(cfg, hit.skill)
+      if (!body) continue
+      st.autoLoadedSkills.push(hit.skill)
+      autoSkill += (autoSkill ? '\n\n' : '')
+        + `<skill_content name="${hit.skill}">\n<skill_resources>\n</skill_resources>\n\n<skill_instructions>\n${body}\n</skill_instructions>\n</skill_content>\n`
+        + `【自动装载】当前话题与 ${hit.skill} 技能高度匹配（语义 ${hit.score.toFixed(2)}），全文已注入上文——请按该技能的指令处理本任务，无需再调 skill 工具加载。`
+    }
+    if (autoSkill) log?.info?.(`[dsh-liubian] 技能自动装载：${pickedSkills.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、')}，阈值 ${threshold}，已装载 ${st.autoLoadedSkills.length} 个`)
+  }
+  const tail = [skillBlock, autoSkill].filter(Boolean).join('\n\n')
   log?.info?.(
     `[dsh-liubian] 两级检索命中 ${final.length} 篇（主线 ${seeds.length} + 关联 ${relatedRows.length}）注入 ${block.length} 字`
     + `（模型挑 tag：${tagSide.tags.join('|') || '无'}｜候选 ${picked.tags.length} 个/${picked.mode}`
@@ -1511,7 +1556,7 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     + `｜${Date.now() - t0}ms）`,
   )
   return {
-    block: skillBlock ? `${block}\n\n${skillBlock}` : block,
+    block: tail ? `${block}\n\n${tail}` : block,
     results: final,
     skills: skillHits,
     tags: tagSide.tags,
@@ -1652,6 +1697,7 @@ export const __test = {
   formatMemoryBlock,
   formatSkillBlock,
   skillHitsFor,
+  readSkillBody,
   buildProfileBlock,
   // - 全局通用教训 -
   loadLessons,
