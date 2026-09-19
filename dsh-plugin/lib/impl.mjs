@@ -76,11 +76,11 @@ export const DEFAULTS = {
   memoryQueryChars: 6000,    // 查询文本上限（用户问题 + 上一轮回答）
   memoryContentChars: 3000,  // 单篇注入正文上限（超长截断）
   memoryTotalChars: 60000,   // 整块注入上限（30 篇全文，防一次吃掉太多上下文）
-  // ── 全局通用教训（每次会话开始注入；跨领域通用，不含特定领域内容）──
-  lessonsInject: true,       // 关掉 = 会话开始不注入教训块
-  lessonsMax: 20,            // 最多注入几条
-  lessonsChars: 2400,        // 教训块总字符上限
-  lessonsEveryTurns: 10,     // 每 N 轮重注一次教训块（0 = 只在会话开始注一次）
+  // ── 全局通用教训（【2026-09-19 注入已移交流变·孪生】数据与 CLI 留在本插件）──
+  lessonsInject: true,       // 此键现仅影响 buildLessonsBlock 的工具侧输出，不再注入
+  lessonsMax: 20,            // 最多注入几条（同上，仅工具侧输出用）
+  lessonsChars: 2400,        // 教训块总字符上限（同上）
+  lessonsEveryTurns: 10,     // 能力卡周期重注节奏（教训重注已移交孪生；0 = 只在会话开始注一次）
   // ── 技能自动装载：语义命中超阈值 → 直接注入 SKILL.md 全文并建议使用 ──
   skillAutoLoad: true,       // 总开关
   skillAutoLoadThreshold: 0.6,  // 语义相似度阈值（skillHitsFor 返回的 score）
@@ -1289,16 +1289,13 @@ async function takeProfileMessage(cfg, agent) {
   if (state.profileDelivered) return null
   if (!state.profilePromise) state.profilePromise = profileBlockCached(cfg)
   const block = await state.profilePromise
-  const ws = resolveDiaryWorkspace(cfg, agent)
-  const lessons = [
-    buildLessonsBlock(cfg, 'global'),
-    buildLessonsBlock(cfg, 'workspace', ws),   // 工作区局部教训：只发给对应会话
-    buildCapabilitiesBlock(cfg),               // 能力卡：会话开始提醒有哪些扩展能力
-  ].filter(Boolean)
-  if (!block && !lessons.length) return null
+  // 教训块的注入已于 2026-09-19 移交流变·孪生（lessons*.json 数据与本插件的
+  // lessons CLI / generate 不动）；这里只剩 身份卡 + 能力卡。
+  const capabilities = buildCapabilitiesBlock(cfg)   // 能力卡：会话开始提醒有哪些扩展能力
+  if (!block && !capabilities) return null
   state.profileDelivered = true
-  state.lessonsCounter = 0   // 首次注入后开始计轮，每 N 轮重注一次
-  return pluginMessage([block, ...lessons].filter(Boolean).join('\n\n'), 'recall')
+  state.lessonsCounter = 0   // 首次注入后开始计轮（该计数器现服务于能力卡周期重注）
+  return pluginMessage([block, capabilities].filter(Boolean).join('\n\n'), 'recall')
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -1715,22 +1712,17 @@ export function mountContextInjection(ctx, cfg) {
       if (profile) additions.push(profile)
       const mem = await memoryMessageFor(ctx, cfg, agent, decision.messages, signal)
       if (mem) additions.push(mem)
-      // 教训周期重注：每 N 轮新人类输入后重发教训块（接入卡只在会话开始注一次，教训需要定期提醒）
-      const lessonPrompt = currentPrompt(decision.messages)
-      if (lessonPrompt && lessonPrompt !== state.lessonsLastKey && state.profileDelivered) {
-        state.lessonsLastKey = lessonPrompt
+      // 能力卡周期重注（教训周期重注已于 2026-09-19 移交流变·孪生）：每 N 轮新人类输入后重发
+      const capPrompt = currentPrompt(decision.messages)
+      if (capPrompt && capPrompt !== state.lessonsLastKey && state.profileDelivered) {
+        state.lessonsLastKey = capPrompt
         const every = Math.max(0, Number(cfg.lessonsEveryTurns) || 0)
         if (every > 0) {
           state.lessonsCounter += 1
           if (state.lessonsCounter >= every) {
             state.lessonsCounter = 0
-            const ws = resolveDiaryWorkspace(cfg, agent)
-            const lessonsAgain = [
-              buildLessonsBlock(cfg, 'global'),
-              buildLessonsBlock(cfg, 'workspace', ws),
-              buildCapabilitiesBlock(cfg),   // 能力卡：周期提醒，模型才想得起主动调
-            ].filter(Boolean).join('\n\n')
-            if (lessonsAgain) additions.push(pluginMessage(lessonsAgain, 'recall'))
+            const capAgain = buildCapabilitiesBlock(cfg)   // 能力卡：周期提醒，模型才想得起主动调
+            if (capAgain) additions.push(pluginMessage(capAgain, 'recall'))
           }
         }
       }
