@@ -72,6 +72,7 @@ export const DEFAULTS = {
   memoryTopN: 30,            // 总注入篇数上限（主线 + 关联）
   memorySeedTop: 5,          // 第一跳取前几篇作主线
   memoryRelatedPerSeed: 5,   // 每条主线找回几篇关联（第二跳）
+  memoryRelatedDigest: true, // P1（2026-09-26 用户选定形态A）：关联只注一行摘要，主线保全文；要全文让模型自己 read
   memoryWTags: 0.5,          // 融合权重：tag 一路占多少（其余给语义）
   memoryQueryChars: 6000,    // 查询文本上限（用户问题 + 上一轮回答）
   memoryContentChars: 3000,  // 单篇注入正文上限（超长截断）
@@ -1049,7 +1050,7 @@ async function buildProfileBlock(cfg) {
   lines.push(`[记忆规模] ${data.user_count} 用户 / ${data.workspace_count} 工作区 / `
     + `${data.tag_entries} 条 tag 索引 / ${data.tag_names} 个标签`)
   lines.push('[检索] ' + (cfg.memoryInject
-    ? `每轮已自动注入 ${cfg.memoryTopN} 篇相关日记全文（前 ${cfg.memorySeedTop} 篇主线 + 各 ${cfg.memoryRelatedPerSeed} 篇关联）——不用再重复搜；`
+    ? `每轮已自动注入 ${cfg.memoryTopN} 篇相关日记（前 ${cfg.memorySeedTop} 篇主线全文 + 关联摘要行${cfg.memoryRelatedDigest === false ? '（当前配置：关联也是全文）' : '，要全文用 read 工具取'}）——不用再重复搜；`
       + '只有第一轮 / 无命中 / 想换角度时才用 _dsh_external_dsh_liubian_search（至少 4 个标签）。'
     : '本轮无自动注入，需要时用 _dsh_external_dsh_liubian_search（至少 4 个标签）。'))
 
@@ -1416,20 +1417,24 @@ export function fuseScores(cfg, semResults, pickedTags, tagMap) {
 function formatMemoryBlock(results, cfg) {
   const perEntry = Math.max(500, Number(cfg.memoryContentChars) || 3000)
   const total = Math.max(2000, Number(cfg.memoryTotalChars) || 30000)
+  const digest = cfg.memoryRelatedDigest !== false
+  const seeds = results.filter(r => r.source !== 'related')
+  const related = results.filter(r => r.source === 'related')
   const head = [
     `<liubian-memory hits="${results.length}" score="cos+tag">`,
-    '说明：以下是本地记忆库里与本轮最相关的日记（前几篇为**主线**=联合检索命中，其余为**关联**=沿主线语义邻域扩展的第二跳），',
-    '已给出**正文全文**供你直接参考，不要逐条复述。',
+    digest
+      ? '说明：前几篇为**主线**（联合检索命中，附全文）；其余为**关联**（沿主线邻域扩展后按与本轮问题的相关度重排，只列一行摘要）。'
+        + `需要某篇关联的全文时用 _dsh_external_dsh_liubian_read 读（如 read "D0434@研究"）。不要逐条复述。`
+      : '说明：以下是本地记忆库里与本轮最相关的日记（前几篇为**主线**=联合检索命中，其余为**关联**=沿主线语义邻域扩展的第二跳），'
+        + '已给出**正文全文**供你直接参考，不要逐条复述。',
   ]
   const parts = []
   let used = head.join('\n').length
-  for (const r of results) {
+  for (const r of seeds) {
     const meta = `【${r.id}@${r.ws}】${r.date ? r.date + ' ' : ''}`
-      + (r.source === 'related'
-        ? `关联（语义 ${Number(r.sem).toFixed(2)}）`
-        : `综合${Number(r.score).toFixed(2)}（语义 ${Number(r.sem).toFixed(2)}${Number(r.tag) > 0
-          ? ` + 标签${Number(r.tag).toFixed(2)}：${(r.matchedTags || []).join('/')}`
-          : '，无标签命中'}）`)
+      + `综合${Number(r.score).toFixed(2)}（语义 ${Number(r.sem).toFixed(2)}${Number(r.tag) > 0
+        ? ` + 标签${Number(r.tag).toFixed(2)}：${(r.matchedTags || []).join('/')}`
+        : '，无标签命中'}）`
     const body = String(r.content || '').trim()
     const text = body
       ? (body.length > perEntry ? body.slice(0, perEntry) + '……（正文截断）' : body)
@@ -1441,6 +1446,18 @@ function formatMemoryBlock(results, cfg) {
     }
     parts.push(seg)
     used += seg.length
+  }
+  if (related.length) {
+    parts.push(digest ? '\n── 关联（按相关度降序，一行摘要；要全文自己 read）──' : '\n── 关联 ──')
+    for (const r of related) {
+      const sum = clipText(String(r.summary || '').trim(), 120) || '(无摘要)'
+      const line = digest
+        ? `【${r.id}@${r.ws}】${r.date ? r.date + ' ' : ''}语义${Number(r.sem).toFixed(2)}｜${sum}`
+        : `【${r.id}@${r.ws}】${r.date ? r.date + ' ' : ''}关联（语义 ${Number(r.sem).toFixed(2)}）｜${sum}`
+      if (used + line.length + 1 > total) break
+      parts.push(line)
+      used += line.length + 1
+    }
   }
   return head.join('\n') + parts.join('\n') + '\n</liubian-memory>'
 }
