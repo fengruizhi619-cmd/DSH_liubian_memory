@@ -357,6 +357,14 @@ def main():
             out({"ok": True, "mode": "related", "count": 0, "related": {}})
             return
         related = {}
+        # 查询向量（可选）：带进来时，种子近邻只当**候选池**，最终按"与查询的余弦"重排
+        # —— 关联跳不再只与主线相似，而是同时与用户问题相关（P0，2026-09-26）。
+        qv = None
+        if vec:
+            qv = [float(x) for x in vec]
+            qn = norm(qv)
+            qv = [x / qn for x in qv] if qn > 0 else None
+        pool = max(per * 4, per + 8)
         for seed in seed_keys:
             sv = vecs_all.get(seed)
             if sv is None:
@@ -372,11 +380,29 @@ def main():
                     dot += a * b
                 scored.append((key, dot))
             scored.sort(key=lambda kv: (-kv[1], kv[0][0], kv[0][1]))
-            related["%s|%s" % seed] = [
-                {"ws": k[0], "id": k[1], "sem": round(s, 4)}
-                for k, s in scored[:per]
-            ]
-        out({"ok": True, "mode": "related", "count": len(seed_keys), "related": related})
+            cands = scored[:pool]
+            if qv is not None:
+                rescored = []
+                for k, seed_sem in cands:
+                    v = vecs_all.get(k)
+                    if v is None or len(v) != len(qv):
+                        continue
+                    qdot = 0.0
+                    for a, b in zip(v, qv):
+                        qdot += a * b
+                    rescored.append((k, qdot, seed_sem))
+                rescored.sort(key=lambda kv: (-kv[1], kv[0][0], kv[0][1]))
+                related["%s|%s" % seed] = [
+                    {"ws": k[0], "id": k[1], "sem": round(s, 4), "seedSem": round(ss, 4)}
+                    for k, s, ss in rescored[:per]
+                ]
+            else:
+                related["%s|%s" % seed] = [
+                    {"ws": k[0], "id": k[1], "sem": round(s, 4)}
+                    for k, s in cands[:per]
+                ]
+        out({"ok": True, "mode": "related", "count": len(seed_keys),
+             "queryReranked": qv is not None, "related": related})
         return
 
     keys = set(tag_hits) | set(sem_scores)

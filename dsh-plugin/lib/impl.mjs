@@ -1564,12 +1564,12 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     log?.info?.(`[dsh-liubian] 联合检索无命中（tags=${tagSide.tags.join('|') || '无'}，语义候选 ${ranked.semCandidates || 0}）`)
     return null
   }
-  // 第二跳：用每条主线的向量找回关联日记（纯语义近邻，跨全部工作区）。
-  // 失败只退回主线（少一路，绝不抛）。
+  // 第二跳：种子（主线）的语义近邻作**候选池**，再按**查询向量**重排取关联（P0，2026-09-26：
+  // 旧版只按"与主线相似"扩，与用户问题无关，是离题注入的主源）。失败只退回主线（少一路，绝不抛）。
   const seedKeys = seeds.map(r => `${r.ws}|${r.id}`)
   const relatedRows = []
   const rel = await jointQuery(cfg, {
-    workspace: '', mode: 'related', top: perSeed, full: false, seeds: seedKeys,
+    workspace: '', mode: 'related', top: perSeed, full: false, seeds: seedKeys, vec,
   })
   if (rel && rel.ok && rel.related) {
     const seen = new Set(seeds.map(r => `${r.ws}#${r.id}`))
@@ -1587,6 +1587,8 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
   } else {
     log?.warn?.(`[dsh-liubian] 关联跳失败（已退回仅主线）：${(rel && rel.error) || '未知'}`)
   }
+  // 关联按查询相关度降序排（离题种子的残留弱项沉底，先把最相关的注进来）
+  relatedRows.sort((a, b) => b.sem - a.sem)
   const winners = [...seeds.map(r => ({ ...r, source: 'seed' })), ...relatedRows].slice(0, topN)
   // 按 id 精确取正文（主线 + 关联一起）
   const detail = await jointQuery(cfg, {
