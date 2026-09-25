@@ -824,7 +824,11 @@ try {
 }
 
 function pluginMessage(content, form) {
-  const source = { kind: 'plugin', plugin: PLUGIN_SOURCE, form }
+  // DSH v4 会话格式（2026-09-26）：source.kind === 'plugin' 是已废弃的包装，写它会被
+  // "format v4 message requires a producer-owned source kind" 直接拒收。
+  // 外部插件必须用 producer-owned kind：'plugin:<包名>'（v3→v4 迁移器也是这么改写旧日志的，
+  // 且会丢掉 plugin 字段——这里直接写迁移后的规范形态）。
+  const source = { kind: 'plugin:' + PLUGIN_SOURCE, form }
   if (createUserMessageFn) {
     return createUserMessageFn({ content: [{ type: 'text', text: content }], source })
   }
@@ -845,14 +849,19 @@ function messageText(message) {
   return parts.join('\n')
 }
 
-/** 自己注入的块要认出来，否则会拿自己的召回结果当查询、越滚越多。 */
+/** 自己注入的块要认出来，否则会拿自己的召回结果当查询、越滚越多。
+ *  兼容两种形态：v4 直写的 'plugin:dsh-liubian' 与旧日志/旧代码的 {kind:'plugin', plugin}。 */
 function isOurMessage(message) {
-  return message?.source?.kind === 'plugin' && message.source.plugin === PLUGIN_SOURCE
+  const k = message?.source?.kind
+  return k === 'plugin:' + PLUGIN_SOURCE
+    || (k === 'plugin' && message.source.plugin === PLUGIN_SOURCE)
 }
 
-/** 任何插件注入的块（本插件的、OpenViking 的、别的插件的）都是合成内容，不是人说的话。 */
+/** 任何插件注入的块（本插件的、OpenViking 的、别的插件的）都是合成内容，不是人说的话。
+ *  v4 起插件消息 kind 形如 'plugin:<包名>'；旧形态 kind='plugin' 保留兼容。 */
 function isPluginMessage(message) {
-  return message?.source?.kind === 'plugin'
+  const k = message?.source?.kind
+  return k === 'plugin' || (typeof k === 'string' && k.startsWith('plugin:'))
 }
 
 /**
