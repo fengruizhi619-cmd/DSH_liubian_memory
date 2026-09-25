@@ -84,6 +84,7 @@ export const DEFAULTS = {
   lessonsEveryTurns: 10,     // 能力卡周期重注节奏（教训重注已移交孪生；0 = 只在会话开始注一次）
   // ── 技能自动装载：语义命中超阈值 → 直接注入 SKILL.md 全文并建议使用 ──
   skillAutoLoad: true,       // 总开关
+  skillAutoLoadMode: 'hint', // P6（2026-09-26）：'hint'=只注一行提示（默认）｜'full'=注 SKIL.md 全文（旧行为）
   skillAutoLoadThreshold: 0.6,  // 语义相似度阈值（skillHitsFor 返回的 score）
   skillAutoLoadMax: 1,       // 每轮最多自动注入几个技能（防上下文膨胀）
   skillAutoLoadChars: 8000,  // 单个技能正文注入上限（超长截断）
@@ -1187,14 +1188,18 @@ function discoverInstalled(cfg) {
   return { mcps: [...mcps], plugins: [...plugins] }
 }
 
-function buildCapabilitiesBlock(cfg) {
+function buildCapabilitiesBlock(cfg, opts = {}) {
   if (!cfg.capabilitiesInject) return ''
   const curated = loadCapabilities()
   const known = new Set(curated.map(c => String(c.name || '').toLowerCase()))
   const disc = discoverInstalled(cfg)
   const extraMcp = disc.mcps.filter(n => ![...known].some(k => k.includes(n.toLowerCase())))
-  const extraPlugins = disc.plugins.filter(n => !known.has(n.toLowerCase()))
-  if (!curated.length && !extraMcp.length && !extraPlugins.length) return ''
+  if (!curated.length && !extraMcp.length) return ''
+  // P6 周期重注摘要版：一行，不再重发全量（全文在会话开头注入过）
+  if (opts.digest) {
+    const names = curated.map(c => String(c.name || '')).filter(Boolean).join('、')
+    return ['<liubian-capabilities>', `能力卡（全文见会话开头）：${names || '（见工具表）'}——遇到匹配场景主动调用，不等用户点名。`, '</liubian-capabilities>'].join('\n')
+  }
   const lines = [
     '<liubian-capabilities>',
     '说明：以下是本会话可用的扩展能力（插件工具与 MCP 服务器）。它们已在你的工具表里，遇到匹配场景时**主动调用**，不要等用户点名。',
@@ -1206,7 +1211,6 @@ function buildCapabilitiesBlock(cfg) {
     }),
   ]
   if (extraMcp.length) lines.push(`其他已接 MCP 服务器：${extraMcp.join('、')}（工具名形如 mcp__<服务器>__<工具>，详见工具表）`)
-  if (extraPlugins.length) lines.push(`其他已装插件：${extraPlugins.join('、')}`)
   lines.push('</liubian-capabilities>')
   return lines.join('\n')
 }
@@ -1414,6 +1418,15 @@ export function fuseScores(cfg, semResults, pickedTags, tagMap) {
 }
 
 /** 把命中条目拼成注入块（全文优先，超预算就降级为摘要）。 */
+/** P6：注入渲染时清掉日记模板头的冗余——标题行（meta 已有 ID）与"- 日期"行（"- 时间"已含日期）。 */
+function cleanDiaryBody(text) {
+  return String(text || '')
+    .replace(/^#\s*Diary\s+\S+\s*$/m, '')
+    .replace(/^-\s*\*{0,2}日期\*{0,2}\s*[:：][^\n]*$/m, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 function formatMemoryBlock(results, cfg) {
   const perEntry = Math.max(500, Number(cfg.memoryContentChars) || 3000)
   const total = Math.max(2000, Number(cfg.memoryTotalChars) || 30000)
@@ -1435,7 +1448,7 @@ function formatMemoryBlock(results, cfg) {
       + `综合${Number(r.score).toFixed(2)}（语义 ${Number(r.sem).toFixed(2)}${Number(r.tag) > 0
         ? ` + 标签${Number(r.tag).toFixed(2)}：${(r.matchedTags || []).join('/')}`
         : '，无标签命中'}）`
-    const body = String(r.content || '').trim()
+    const body = cleanDiaryBody(r.content)
     const text = body
       ? (body.length > perEntry ? body.slice(0, perEntry) + '……（正文截断）' : body)
       : String(r.summary || '').trim()
@@ -1627,10 +1640,19 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     if (!Array.isArray(st.autoLoadedSkills)) st.autoLoadedSkills = []
     const threshold = Number(cfg.skillAutoLoadThreshold) || 0.6
     const maxN = Math.max(1, Number(cfg.skillAutoLoadMax) || 1)
+    const fullMode = String(cfg.skillAutoLoadMode || 'hint') === 'full'
     const pickedSkills = skillHits
       .filter(h => h.score >= threshold && !st.autoLoadedSkills.includes(h.skill))
       .slice(0, maxN)
     for (const hit of pickedSkills) {
+      if (!fullMode) {
+        // P6 提示模式：只注一行，全文按需用 skill 工具加载——
+        // 消灭"讨论系统本身→整篇使用手册灌进来"的元递归噪声
+        st.autoLoadedSkills.push(hit.skill)
+        autoSkill += (autoSkill ? '\n' : '')
+          + `【技能提示】${hit.skill}（语义 ${hit.score.toFixed(2)}）与本轮话题高度相关——需要其完整指令时先用 skill 工具加载原文再执行。`
+        continue
+      }
       const body = readSkillBody(cfg, hit.skill)
       if (!body) continue
       st.autoLoadedSkills.push(hit.skill)
@@ -1638,7 +1660,7 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
         + `<skill_content name="${hit.skill}">\n<skill_resources>\n</skill_resources>\n\n<skill_instructions>\n${body}\n</skill_instructions>\n</skill_content>\n`
         + `【自动装载】当前话题与 ${hit.skill} 技能高度匹配（语义 ${hit.score.toFixed(2)}），全文已注入上文——请按该技能的指令处理本任务，无需再调 skill 工具加载。`
     }
-    if (autoSkill) log?.info?.(`[dsh-liubian] 技能自动装载：${pickedSkills.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、')}，阈值 ${threshold}，已装载 ${st.autoLoadedSkills.length} 个`)
+    if (autoSkill) log?.info?.(`[dsh-liubian] 技能${fullMode ? '自动装载(全文)' : '提示'}：${pickedSkills.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、')}，阈值 ${threshold}，本会话已提示/装载 ${st.autoLoadedSkills.length} 个`)
   }
   const tail = [skillBlock, autoSkill].filter(Boolean).join('\n\n')
   log?.info?.(
@@ -1740,7 +1762,7 @@ export function mountContextInjection(ctx, cfg) {
           state.lessonsCounter += 1
           if (state.lessonsCounter >= every) {
             state.lessonsCounter = 0
-            const capAgain = buildCapabilitiesBlock(cfg)   // 能力卡：周期提醒，模型才想得起主动调
+            const capAgain = buildCapabilitiesBlock(cfg, { digest: true })   // P6：周期重注只发一行摘要
             if (capAgain) additions.push(pluginMessage(capAgain, 'recall'))
           }
         }
