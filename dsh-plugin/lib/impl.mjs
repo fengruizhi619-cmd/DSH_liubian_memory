@@ -88,6 +88,16 @@ export const DEFAULTS = {
   skillAutoLoadThreshold: 0.6,  // 语义相似度阈值（skillHitsFor 返回的 score）
   skillAutoLoadMax: 1,       // 每轮最多自动注入几个技能（防上下文膨胀）
   skillAutoLoadChars: 8000,  // 单个技能正文注入上限（超长截断）
+  // ── P7 任务技能注入器（2026-09-26，A 意图路由 + B 硬规则叠加）──
+  skillTaskInject: true,     // 总开关：本轮任务真正需要的技能自动注入全文
+  skillTaskMax: 2,           // 每轮最多注入几个任务技能
+  skillTaskBlacklist: [],    // 永不自动注入的技能名
+  skillTaskRules: [          // B 硬规则：[正则, 技能名]，命中当前问题即选（优先于意图路由）
+    ['xlsx|excel|电子表|\\.csv|tsv', 'univer-sheet'],
+    ['docx|word ?文档', 'univer-doc'],
+    ['pptx|幻灯片|演示文稿|slides?\\b', 'univer-slide'],
+    ['截图|识图|看(一)?下?(这|那)?(张|幅)?图|图片(里|中|上)|视频内容|音频转写', 'deepseek-eye'],
+  ],
   // ── 能力卡：已装插件/MCP 的"什么时候用什么"清单，会话开始 + 每 N 轮提醒 ──
   capabilitiesInject: true,  // 总开关
   profileDir: 'C:/Users/Feng/.dsh/profiles/desktop',  // profile 目录（自动发现已装插件/MCP 用）
@@ -1317,16 +1327,18 @@ async function takeProfileMessage(cfg, agent) {
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** 外部 API：从标签候选里挑出与本轮最相关的 N 个（与写日记同一个端点/key/模型）。 */
-export async function screenQueryTags(cfg, text, hints, log) {
+export async function screenQueryTags(cfg, text, hints, log, skillList = []) {
   // 检索侧用**独立的外部 API**（memoryApiKey），与写日记的 key 分开。
   // 没配 memoryApiKey 时回退到写日记那把 key（dc），保证单独部署也能用。
   const dc = diaryConfig()
   const api = retrievalApiConfig(cfg, dc)
   if (!api.apiKey) {
-    return { tags: [], why: '检索侧外部 API 未配置（memoryApiKey 与写日记 key 都为空）' }
+    return { tags: [], skills: [], why: '检索侧外部 API 未配置（memoryApiKey 与写日记 key 都为空）' }
   }
-  if (!hints.length) return { tags: [], why: '标签候选为空' }
+  if (!hints.length) return { tags: [], skills: [], why: '标签候选为空' }
   const n = Math.max(1, Number(cfg.memoryTagTopN) || 5)
+  const maxSkills = Math.max(1, Number(cfg.skillTaskMax) || 2)
+  const withSkills = Array.isArray(skillList) && skillList.length > 0
   const sys = [
     `你是记忆检索的查询标签生成器。从给定的候选标签里挑出**恰好 ${n} 个**最能代表下面这段对话内容的标签，用于在记忆库里做字面检索。`,
     '',
@@ -1336,13 +1348,25 @@ export async function screenQueryTags(cfg, text, hints, log) {
     '   **避开跨领域同名的泛词**——例如"联合""融合""候选""方案""整合""确认""检索"这类，',
     '   它们在别的领域（模型训练/音画匹配/写作）的日记里也到处出现，挑它们等于没筛。',
     '3. 不要挑"标签""规则""技能""经验"这类在库里命中成百上千篇的词。',
-    '4. 只输出 JSON，不要代码块围栏、不要解释：',
-    `{"tags":["标签1", ..., "标签${n}"]}`,
+    ...(withSkills ? [
+      `4. 同时从[技能目录]里挑 **0~${maxSkills} 个**"执行本轮任务真正需要"的技能（skills 字段）：`,
+      '   - 判断标准：接下来要动手做的事，靠这个技能的方法论/工具才能做好（如要处理表格→univer-sheet，要看图→deepseek-eye）。',
+      '   - 只是在**谈论/维护/评价**技能或系统本身时，一个都不选（skills 给空数组）。',
+      '   - 候选目录里没有合适的就给空数组，**不要硬凑**。',
+      `5. 只输出 JSON，不要代码块围栏、不要解释：`,
+      `{"tags":["标签1", ..., "标签${n}"], "skills":["技能名1", ...]}`,
+    ] : [
+      '4. 只输出 JSON，不要代码块围栏、不要解释：',
+      `{"tags":["标签1", ..., "标签${n}"]}`,
+    ]),
   ].join('\n')
-  const user = `[候选标签（按相似度降序）]\n${hints.join('、')}\n\n[本轮内容]\n${String(text).slice(0, Number(cfg.memoryQueryChars) || 6000)}`
+  const user = (withSkills
+    ? `[技能目录（name：描述）]\n${skillList.map(s => `${s.name}：${s.desc}`).join('\n')}\n\n`
+    : '')
+    + `[候选标签（按相似度降序）]\n${hints.join('、')}\n\n[本轮内容]\n${String(text).slice(0, Number(cfg.memoryQueryChars) || 6000)}`
   const payload = { messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }
   const res = await callDiaryApi(cfg, api, payload)
-  if (!res.ok) return { tags: [], why: `挑标签失败：${res.error}` }
+  if (!res.ok) return { tags: [], skills: [], why: `挑标签失败：${res.error}` }
   // ⚠️ 这里不能用 res.entries：callDiaryApi 只认写日记的 {"diaries":[...]} 形状，
   // 而本接口返回的是 {"tags":[...]} —— 之前就是因为这个被当成"未返回预期 JSON"。
   let list = []
@@ -1354,10 +1378,16 @@ export async function screenQueryTags(cfg, text, hints, log) {
   // 那种标签在检索时会被二次模糊扩展，反而比它替代掉的真标签更差。
   const valid = [...new Set(list.filter(t => cand.has(t)))]
   const rejected = list.filter(t => !cand.has(t))
-  if (!valid.length) {
-    return { tags: [], why: `模型给的都不在候选表里（${list.slice(0, 6).join('/')}）`, rejected }
+  // P7：技能同样只认目录里真有的
+  let skills = []
+  if (withSkills && Array.isArray(res.skills)) {
+    const names = new Set(skillList.map(s => s.name))
+    skills = [...new Set(res.skills.map(s => String(s || '').trim()).filter(s => names.has(s)))].slice(0, maxSkills)
   }
-  return { tags: valid.slice(0, n), rejected, usage: res.usage || null }
+  if (!valid.length && !skills.length) {
+    return { tags: [], skills, why: `模型给的都不在候选表里（${list.slice(0, 6).join('/')}）`, rejected }
+  }
+  return { tags: valid.slice(0, n), skills, rejected, usage: res.usage || null }
 }
 
 /** 联合检索（helper/memory_query.py，只读 liubian.db）。
@@ -1496,6 +1526,40 @@ export function readSkillBody(cfg, name) {
   return ''
 }
 
+/** P7：技能目录（name+描述，双根扫描 frontmatter），10 分钟缓存——给意图路由当候选表。 */
+let skillCatalogCache = { at: 0, list: [] }
+function skillCatalog(cfg) {
+  if (skillCatalogCache.list.length && Date.now() - skillCatalogCache.at < 10 * 60 * 1000) return skillCatalogCache.list
+  const list = []
+  const seen = new Set()
+  for (const root of [cfg.codexSkills, join(DSH_HOME, 'skills')]) {
+    if (!root) continue
+    let ents = []
+    try { ents = readdirSync(root, { withFileTypes: true }) } catch { continue }
+    for (const e of ents) {
+      if (!e.isDirectory() || seen.has(e.name)) continue
+      const p = join(root, e.name, 'SKILL.md')
+      try {
+        const raw = readFileSync(p, 'utf8')
+        let name = e.name
+        let desc = ''
+        const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+        if (fm) {
+          const nm = fm[1].match(/^name:\s*(.+)$/m)
+          if (nm) name = nm[1].trim()
+          const dm = fm[1].match(/^description:\s*([\s\S]*?)(?=\r?\n[a-zA-Z_-]+:|$)/)
+          if (dm) desc = dm[1].replace(/\s+/g, ' ').trim()
+        }
+        if (!desc) desc = raw.replace(/^---[\s\S]*?---/, '').replace(/[#>*\s]+/g, ' ').trim()
+        seen.add(name)
+        list.push({ name, desc: desc.slice(0, 110) })
+      } catch { /* 单个技能读不了就跳过 */ }
+    }
+  }
+  skillCatalogCache = { at: Date.now(), list }
+  return list
+}
+
 function formatSkillBlock(hits, cfg) {
   const top = Math.max(1, Number(cfg.memorySkillTopN) || 3)
   const list = (hits || []).slice(0, top)
@@ -1574,11 +1638,13 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
   ])
   if (!vec.length && !picked.tags.length && !skillHits.length) return null
   // 让模型从候选里挑 N 个 tag（与语义路**并行**：语义-元数据顺手一起取）。
+  // P7：技能目录捎进同一次调用——模型按**任务意图**挑 0~N 个技能，不再依赖模型自觉调 skill 工具。
+  const catalog = cfg.skillTaskInject ? skillCatalog(cfg) : []
   const [cand, tagSide] = await Promise.all([
     vec.length
       ? jointQuery(cfg, { workspace, vec, top: Math.max(200, topN * 20), full: false, mode: 'semantic' })
       : Promise.resolve({ ok: true, results: [], semCandidates: 0 }),
-    screenQueryTags(cfg, query, picked.tags, log),
+    screenQueryTags(cfg, query, picked.tags, log, catalog),
   ])
   if (!cand || !cand.ok) log?.warn?.(`[dsh-liubian] 语义路失败：${(cand && cand.error) || '未知'}`)
   // ?融合排序（helper 里算，公式与 full 模式同源。
@@ -1662,7 +1728,44 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     }
     if (autoSkill) log?.info?.(`[dsh-liubian] 技能${fullMode ? '自动装载(全文)' : '提示'}：${pickedSkills.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、')}，阈值 ${threshold}，本会话已提示/装载 ${st.autoLoadedSkills.length} 个`)
   }
-  const tail = [skillBlock, autoSkill].filter(Boolean).join('\n\n')
+  // ── P7 任务技能注入：硬规则（B）优先 + 意图路由（A，模型在挑 tag 时顺手挑的）──
+  // 与语义命中的 hint/full 通道共用 st.autoLoadedSkills 去重；注入全文，上限 skillTaskMax。
+  let taskSkillBlock = ''
+  if (cfg.skillTaskInject && agent) {
+    const st = contextStateFor(agent?.session)
+    if (!Array.isArray(st.autoLoadedSkills)) st.autoLoadedSkills = []
+    const blacklist = new Set((cfg.skillTaskBlacklist || []).map(s => String(s).trim()).filter(Boolean))
+    const maxN = Math.max(1, Number(cfg.skillTaskMax) || 2)
+    const chosen = []
+    const why = []
+    const q = String(question || '')
+    for (const rule of (cfg.skillTaskRules || [])) {
+      if (chosen.length >= maxN) break
+      if (!Array.isArray(rule) || rule.length < 2) continue
+      try {
+        if (new RegExp(String(rule[0]), 'i').test(q) && !chosen.includes(rule[1])) {
+          chosen.push(String(rule[1]))
+          why.push(`规则:${rule[1]}`)
+        }
+      } catch { /* 坏正则跳过 */ }
+    }
+    for (const s of (tagSide.skills || [])) {
+      if (chosen.length >= maxN) break
+      if (!chosen.includes(s)) { chosen.push(s); why.push(`意图:${s}`) }
+    }
+    for (const name of chosen.slice(0, maxN)) {
+      if (blacklist.has(name) || st.autoLoadedSkills.includes(name)) continue
+      const body = readSkillBody(cfg, name)
+      if (!body) continue
+      st.autoLoadedSkills.push(name)
+      taskSkillBlock += (taskSkillBlock ? '\n\n' : '')
+        + `<skill_content name="${name}">\n<skill_resources>\n</skill_resources>\n\n<skill_instructions>\n${body}\n</skill_instructions>\n</skill_content>\n`
+        + `【任务装载】本轮任务需要 ${name} 技能，全文已注入上文——直接按该技能的指令执行本任务，无需再调 skill 工具加载。`
+    }
+    if (taskSkillBlock) log?.info?.(`[dsh-liubian] 任务技能注入：${why.join('、')}（本会话累计 ${st.autoLoadedSkills.length} 个）`)
+    else if ((tagSide.skills || []).length) log?.info?.(`[dsh-liubian] 意图路由挑了 ${tagSide.skills.join('、')} 但均已注入过/黑名单，本轮跳过`)
+  }
+  const tail = [skillBlock, taskSkillBlock, autoSkill].filter(Boolean).join('\n\n')
   log?.info?.(
     `[dsh-liubian] 两级检索命中 ${final.length} 篇（主线 ${seeds.length} + 关联 ${relatedRows.length}）注入 ${block.length} 字`
     + `（模型挑 tag：${tagSide.tags.join('|') || '无'}｜候选 ${picked.tags.length} 个/${picked.mode}`
@@ -2433,6 +2536,7 @@ async function postDiaryApi(dc, payload, useJsonMode) {
       ok: true,
       entries: parsed.diaries,
       tags: parsed.tags,
+      skills: parsed.skills,      // P7：意图路由挑的任务技能（与 tags 同一次调用返回）
       lessons: parsed.lessons,
       workspace: parsed.workspace,
       usage: data.usage,
