@@ -138,7 +138,7 @@ def main():
     #   —— 这样每轮只需要起一次 python 进程（起进程 ~0.3s，比再查一遍库便宜）。
     mode = str(req.get("mode") or "full")
     # ids 模式只按 id 取正文，不需要 tags/vec（别被下面这行守卫挡掉）
-    if not query_tags and not vec and mode != "ids":
+    if not query_tags and not vec and mode not in ("ids", "related"):
         out({"ok": False, "error": "需要 tags 或 vec 至少一路"})
         return
 
@@ -151,6 +151,7 @@ def main():
     try:
         items = load_index(conn, workspace)
         vecs = load_vecs(conn, workspace) if vec else {}
+        vecs_all = load_vecs(conn, "") if mode == "related" else {}   # 关联跳可能跨工作区：全库向量
         contents = load_contents(conn, workspace) if want_full else {}
     finally:
         conn.close()
@@ -224,7 +225,7 @@ def main():
         rec = {
             "ws": key[0],
             "id": key[1],
-            "tag": round(tag_score, 4),
+            "tag": round(tag_score_val, 4),
             "sem": round(sem, 4),
             "score": round(score, 4),
             "matchedTags": sorted(matched)[:MAX_TAGS_PER_ENTRY],
@@ -328,6 +329,54 @@ def main():
                 "content": body,
             })
         out({"ok": True, "mode": "ids", "count": len(rows), "results": rows})
+        return
+
+    # mode=related：按种子日记的向量做**第二跳**语义扩展（关联日记）。
+    #   输入 seeds=["ws|id",...]（通常是联合检索前几篇），对每个种子在全库向量里
+    #   找 top 个余弦近邻（排除种子本身与 exclude 列表），返回 {"ws|id": [近邻...]}。
+    #   用途：联合检索前 N 篇作主线，各再找回 K 篇关联日记，一起注入 —— 让上下文
+    #   不只停留在"和查询文本最像的几篇"，还能沿日记自身的语义邻域扩展。
+    #   只回 id + 分数（不正文），调用方再按 id 精确取正文，传输量很小。
+    if mode == "related":
+        def _to_key(a):
+            if isinstance(a, str) and "|" in a:
+                p = a.split("|", 1)
+                return (p[0].strip(), p[1].strip())
+            if isinstance(a, (list, tuple)) and len(a) == 2:
+                return (str(a[0]).strip(), str(a[1]).strip())
+            return None
+
+        seed_keys = [k for k in (_to_key(a) for a in (req.get("seeds") or [])) if k]
+        per = max(1, int(req.get("top") or 5))
+        excluded = set(seed_keys)
+        for a in (req.get("exclude") or []):
+            k = _to_key(a)
+            if k:
+                excluded.add(k)
+        if not seed_keys:
+            out({"ok": True, "mode": "related", "count": 0, "related": {}})
+            return
+        related = {}
+        for seed in seed_keys:
+            sv = vecs_all.get(seed)
+            if sv is None:
+                continue
+            scored = []
+            for key, v in vecs_all.items():
+                if key in excluded or key == seed:
+                    continue
+                if len(v) != len(sv):
+                    continue
+                dot = 0.0
+                for a, b in zip(v, sv):
+                    dot += a * b
+                scored.append((key, dot))
+            scored.sort(key=lambda kv: (-kv[1], kv[0][0], kv[0][1]))
+            related["%s|%s" % seed] = [
+                {"ws": k[0], "id": k[1], "sem": round(s, 4)}
+                for k, s in scored[:per]
+            ]
+        out({"ok": True, "mode": "related", "count": len(seed_keys), "related": related})
         return
 
     keys = set(tag_hits) | set(sem_scores)
