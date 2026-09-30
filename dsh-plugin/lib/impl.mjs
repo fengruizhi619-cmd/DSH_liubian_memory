@@ -401,15 +401,16 @@ export function registerTools(ctx, cfg) {
       + '｜tree 森林视图｜move 改挂家族（子树批量跟随）｜rollback 回滚到指定检查点槽位。'
       + '贡献者自动取当前会话身份；家族路径形如「平台/DSH/会话」。',
     parameters: {
-      action: { type: 'string', enum: ['create', 'update', 'get', 'tree', 'move', 'rollback'], required: true, description: '操作' },
-      slug: { type: 'string', description: '条目 slug（全局唯一，不含 /）' },
-      familyPath: { type: 'string', description: '家族路径（如「水果/梨果」）；create 必填；move 传新路径' },
+      action: { type: 'string', enum: ['create', 'update', 'get', 'tree', 'list', 'move', 'rollback'], required: true, description: '操作' },
+      slug: { type: 'string', description: '条目 slug（全局唯一，不含 /，不可变）' },
+      familyPath: { type: 'string', description: '家族路径（如「水果/梨果」）；create 时 =slug 即根条目；move 传新路径（须已存在，防孤儿）' },
       title: { type: 'string', description: '标题（create 必填）' },
       intro: { type: 'string', description: '内容介绍（检索消歧用）' },
       content: { type: 'string', description: '正文' },
+      status: { type: 'string', enum: ['draft', 'stable', 'obsolete'], description: '条目状态（默认 draft/stable 按操作）' },
       contributor: { type: 'string', description: '贡献者（独特名；缺省取会话工作区身份）' },
       summary: { type: 'string', description: '修订摘要' },
-      slot: { type: 'number', description: 'rollback：目标检查点槽位（0=最细）' },
+      time: { type: 'number', description: 'rollback：目标检查点的时间戳' },
     },
     async execute(args) {
       // 贡献者 v0：会话工作区身份（与被炉发言人推导同源）；独特名注册上线后切换

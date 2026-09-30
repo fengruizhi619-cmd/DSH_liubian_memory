@@ -1,38 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-流变·记忆 wiki 存储（v0，S1+S2）
-================================
-条目模型（设计文档：docs/流变记忆wiki化_DSH实施方案.md）：
+流变·记忆 wiki 存储（v0.2，S1+S2 + 银杏审读修订）
+================================================
+条目模型（设计文档：docs/流变记忆wiki化_DSH实施方案.md v0.2）：
   条目五要件 = 家族归宿 / 内容介绍 / 正文 / 修订记录（含贡献者）/ 梯度稀释检查点
   森林结构 = 条目可嵌套，家族归宿 = 到根的有序路径（结构化 tag）
 
-存储（全部在 liubian.db，与既有日记库同库不同表，互不干扰）：
-  wiki_pages      条目主表（slug 主键 / 家族路径 / 标题 / 简介 / 正文 / 状态 / 修订计数）
-  wiki_revisions  修订账目（全量保留：slug+rev 主键，贡献者/动作/摘要/时间）
-  wiki_checkpoints 内容快照（梯度稀释槽位，每条目 ≤8 份，时间稀释级联）
+家族规则 v0.2（银杏审读定稿）：
+  · 物化全路径列 full_path：根条目（familyPath == slug）full = slug，子条目 full = 父full + '/' + slug
+  · 层级/子树查询全部走 full_path（= 等于父full 为直系子；LIKE 父full/% 为子树）
+  · **slug 不可变**（v0）：改标题/内容用 update；改名+级联列 v1
+  · status 词表：draft（整理中）/ stable（定稿）/ obsolete（废弃）
+  · move = 改挂（子树批量跟随，逐条记修订）
 
 调用协议（与 memory_query.py 同款）：stdin 喂 JSON，stdout 吐 JSON。
-  {"op":"create","slug":..,"familyPath":..,"title":..,"intro":..,"content":..,"contributor":..}
-  {"op":"update","slug":..,"content":..,"intro":?,"title":?,"familyPath":?,"contributor":..,"summary":?}
+  {"op":"create","slug":..,"familyPath":..,"title":..,"intro":..,"content":..,"contributor":..,"status":..}
+  {"op":"update","slug":..,"content":?,"intro":?,"title":?,"status":?,"contributor":..,"summary":?}
   {"op":"get","slug":..}
-  {"op":"tree"}                          → 森林（根 → 子树计数）
-  {"op":"list","familyPrefix":"水果"}     → 该前缀下条目清单
-  {"op":"move","slug":..,"newFamilyPath":..}  → 改挂（子树路径批量更新）
-  {"op":"rollback","slug":..,"slot":3,"contributor":..}  → 恢复检查点为新修订
+  {"op":"tree"}                                   → 森林（roots/orphans/children 平面清单）
+  {"op":"list","familyPrefix":"自然/水果"}          → 子树清单
+  {"op":"move","slug":..,"newFamilyPath":..,"contributor":..}  → 改挂（目标家族须已存在）
+  {"op":"rollback","slug":..,"time":..,"contributor":..}       → 按时间定位检查点恢复
 """
 import json, sys, os, sqlite3, time
 
 CHECKPOINT_THRESHOLDS_MIN = [5, 10, 30, 60, 360, 720, 1440, 10080]  # 5m/10m/30m/1h/6h/12h/24h/7d
 MAX_CHECKPOINTS = len(CHECKPOINT_THRESHOLDS_MIN)  # 8
+STATUSES = ("draft", "stable", "obsolete")
 
 DDL = [
     """CREATE TABLE IF NOT EXISTS wiki_pages (
         slug TEXT PRIMARY KEY,
         family_path TEXT NOT NULL,
+        full_path TEXT NOT NULL UNIQUE,
         title TEXT NOT NULL,
         intro TEXT NOT NULL DEFAULT '',
         content TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'stable',
+        status TEXT NOT NULL DEFAULT 'draft',
         revisions INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL)""",
@@ -52,6 +56,7 @@ DDL = [
         content TEXT NOT NULL,
         PRIMARY KEY (slug, slot))""",
     """CREATE INDEX IF NOT EXISTS idx_wiki_family ON wiki_pages(family_path)""",
+    """CREATE INDEX IF NOT EXISTS idx_wiki_full ON wiki_pages(full_path)""",
 ]
 
 
@@ -66,25 +71,27 @@ def connect():
         out({"ok": False, "error": "liubian.db not found: " + db})
         sys.exit(0)
     conn = sqlite3.connect(db, timeout=20)
-    # 幂等建表：wiki 表随首次操作自动初始化（v0 起，旧日记表不受影响）
-    for stmt in DDL:
+    for stmt in DDL:  # 幂等建表
         conn.execute(stmt)
     conn.commit()
     return conn
 
 
+def full_of(family, slug):
+    """全路径：根条目（familyPath == slug）full = slug，不重复拼接（银杏审读①）。"""
+    return slug if family == slug else family + "/" + slug
+
+
 # ── 梯度稀释检查点：时间稀释保留规则 ─────────────────────────────────────
 # 全部候选快照（含刚被替换的旧正文）按时间降序，贪心保留：
 #   保留最新一份；此后每份必须与上一份保留快照相距 ≥ 下一档阈值（5m/10m/30m/...）；
-#   最多保留 MAX_CHECKPOINTS 份，其余丢弃（这就是"稀释"——存储有界）。
-# 密集编辑会在最细档自然塌缩（只留最新一份旧正文）；稀疏编辑的旧状态随编辑推进
-# 逐档向粗迁移，年龄跨档前不会被丢。
+#   最多保留 MAX_CHECKPOINTS 份，其余丢弃（稀释 = 存储有界）。
 
 
-def retain(snaps_desc, now_ms):
+def retain(snaps_desc):
     kept = []
     last_t = None
-    for s in snaps_desc:  # 已按 time 降序
+    for s in snaps_desc:
         if not kept:
             kept.append(s)
             last_t = s["time"]
@@ -105,9 +112,9 @@ def load_checkpoints(conn, slug):
     return [{"time": t, "content": c} for _, t, c in rows]
 
 
-def save_checkpoints(conn, slug, snaps, now_ms):
+def save_checkpoints(conn, slug, kept):
     conn.execute("DELETE FROM wiki_checkpoints WHERE slug=?", (slug,))
-    for i, s in enumerate(snaps):
+    for i, s in enumerate(kept):
         conn.execute(
             "INSERT INTO wiki_checkpoints(slug, slot, time, content) VALUES(?,?,?,?)",
             (slug, i, s["time"], s["content"]))
@@ -117,9 +124,28 @@ def on_update_cascade(conn, slug, prev_content, prev_time, now_ms):
     """编辑提交时调用：把被替换的旧正文送入稀释检查点体系。"""
     snaps = load_checkpoints(conn, slug)
     snaps.sort(key=lambda s: -s["time"])
+    if snaps and snaps[0]["content"] == prev_content:
+        return  # 内容没变不重复入槽
     snaps.insert(0, {"time": prev_time, "content": prev_content})
-    kept = retain(snaps, now_ms)
-    save_checkpoints(conn, slug, kept, now_ms)
+    kept = retain(snaps)
+    save_checkpoints(conn, slug, kept)
+
+
+def log_revision(conn, slug, rev, now, contributor, action, summary, content):
+    conn.execute(
+        "INSERT INTO wiki_revisions(slug, rev, time, contributor, action, summary, content)"
+        " VALUES(?,?,?,?,?,?,?)",
+        (slug, rev, now, contributor, action, summary, content))
+
+
+def next_rev(conn, slug):
+    row = conn.execute("SELECT revisions FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
+    return (row[0] + 1) if row else 1
+
+
+def _status_of(req, default="stable"):
+    s = str(req.get("status") or default).strip()
+    return s if s in STATUSES else default
 
 
 # ── 操作实现 ──────────────────────────────────────────────────────────────
@@ -131,158 +157,207 @@ def op_create(conn, req):
     intro = str(req.get("intro") or "").strip()
     content = str(req.get("content") or "")
     contributor = str(req.get("contributor") or "未知").strip()
+    status = _status_of(req)
     now = int(time.time() * 1000)
     if not slug or "/" in slug:
         return {"ok": False, "error": "slug 必填且不含 /（家族归属用 familyPath 表达）"}
-    if not family:
-        return {"ok": False, "error": "familyPath 必填（根条目也要有归属，可为自身类别名）"}
     if not title:
         return {"ok": False, "error": "title 必填"}
-    dup = conn.execute("SELECT 1 FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
+    dup = conn.execute("SELECT 1 FROM wiki_pages WHERE slug=? OR full_path=?",
+                       (slug, full_of(family, slug))).fetchone()
     if dup:
-        return {"ok": False, "error": f"slug 已存在: {slug}"}
+        return {"ok": False, "error": f"slug 或全路径已存在: {slug}"}
+    # 家族规则 v0.2（银杏审读①定稿）：familyPath == slug → 根条目（full = slug）；
+    # 否则 familyPath 必须命中某已存在条目的 full_path（= 父 family_path + '/' + 父 slug）
+    is_root = (family == slug)
+    if not is_root:
+        parent = conn.execute("SELECT 1 FROM wiki_pages WHERE full_path = ? LIMIT 1",
+                              (family,)).fetchone()
+        if not parent:
+            return {"ok": False, "error": f"父条目不存在（familyPath 未命中任何条目全路径）: {family}。"
+                    f"根条目请令 familyPath == slug"}
+    full = full_of(family, slug)
     conn.execute(
-        "INSERT INTO wiki_pages(slug, family_path, title, intro, content, status, revisions, created_at, updated_at)"
-        " VALUES(?,?,?,?,?, 'stable', 1, ?, ?)",
-        (slug, family, title, intro, content, now, now))
-    conn.execute(
-        "INSERT INTO wiki_revisions(slug, rev, time, contributor, action, summary, content)"
-        " VALUES(?,?,?,?,'create',?,?)",
-        (slug, 1, now, contributor, intro or title, content))
+        "INSERT INTO wiki_pages(slug, family_path, full_path, title, intro, content, status, revisions, created_at, updated_at)"
+        " VALUES(?,?,?,?,?,?, ?, 1, ?, ?)",
+        (slug, family, full, title, intro, content, status, now, now))
+    log_revision(conn, slug, 1, now, contributor, "create", intro or title, content)
     conn.commit()
-    return {"ok": True, "slug": slug, "familyPath": family, "rev": 1}
+    return {"ok": True, "slug": slug, "familyPath": family, "fullPath": full,
+            "isRoot": is_root, "rev": 1}
 
 
 def op_update(conn, req):
     slug = str(req.get("slug") or "").strip()
     row = conn.execute(
-        "SELECT content, intro, title, family_path, revisions, updated_at FROM wiki_pages WHERE slug=?",
-        (slug,)).fetchone()
+        "SELECT content, intro, title, status, revisions, updated_at, family_path, full_path"
+        " FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
     if not row:
         return {"ok": False, "error": "条目不存在: " + slug}
-    old_content, old_intro, old_title, old_family, old_revs, old_updated = row
-    content = req.get("content")
-    new_content = str(content) if content is not None else old_content
+    old_content, old_intro, old_title, old_status, old_revs, old_updated, old_family, old_full = row
+    if req.get("familyPath") is not None:
+        return {"ok": False, "error": "改挂家族请用 op=move（会连子树一起迁移并逐条留账）；update 只改内容/元数据"}
+    new_content = str(req["content"]) if req.get("content") is not None else old_content
     new_intro = str(req["intro"]) if req.get("intro") is not None else old_intro
     new_title = str(req["title"]) if req.get("title") is not None else old_title
-    new_family = str(req.get("familyPath") or "").strip().strip("/") or old_family
+    new_status = str(req.get("status") or "").strip()
+    new_status = new_status if new_status in STATUSES else old_status
     contributor = str(req.get("contributor") or "未知").strip()
     summary = str(req.get("summary") or "").strip()
     now = int(time.time() * 1000)
-    if new_content == old_content and new_intro == old_intro and new_title == old_title and new_family == old_family:
+    if (new_content == old_content and new_intro == old_intro
+            and new_title == old_title and new_status == old_status):
         return {"ok": True, "slug": slug, "unchanged": True}
     # ① 梯度稀释检查点：旧正文送入时间稀释槽位（级联保留）
     on_update_cascade(conn, slug, old_content, old_updated, now)
-    # ② 修订账目（全量）
     new_revs = old_revs + 1
     conn.execute(
-        "UPDATE wiki_pages SET content=?, intro=?, title=?, family_path=?, revisions=?, updated_at=? WHERE slug=?",
-        (new_content, new_intro, new_title, new_family, new_revs, now, slug))
-    conn.execute(
-        "INSERT INTO wiki_revisions(slug, rev, time, contributor, action, summary, content)"
-        " VALUES(?,?,?,?, 'update', ?, ?)",
-        (slug, new_revs, now, contributor, summary, new_content))
+        "UPDATE wiki_pages SET content=?, intro=?, title=?, status=?, revisions=?, updated_at=? WHERE slug=?",
+        (new_content, new_intro, new_title, new_status, new_revs, now, slug))
+    log_revision(conn, slug, new_revs, now, contributor, "update", summary, new_content)
     conn.commit()
-    return {"ok": True, "slug": slug, "rev": new_revs,
-            "checkpoints": load_checkpoints(conn, slug) and
-            [{"slot": i, "time": t} for i, t, _ in
-             conn.execute("SELECT slot, time, content FROM wiki_checkpoints WHERE slug=?", (slug,)).fetchall()]}
+    return {"ok": True, "slug": slug, "rev": new_revs}
 
 
 def op_get(conn, req):
     slug = str(req.get("slug") or "").strip()
     row = conn.execute(
-        "SELECT slug, family_path, title, intro, content, status, revisions, created_at, updated_at"
+        "SELECT slug, family_path, full_path, title, intro, content, status, revisions, created_at, updated_at"
         " FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
     if not row:
         return {"ok": False, "error": "条目不存在: " + slug}
+    my_full = row[2]
+    children = conn.execute(
+        "SELECT slug, family_path, title FROM wiki_pages WHERE family_path = ?", (my_full,)).fetchall()
     cps = conn.execute(
-        "SELECT slot, time FROM wiki_checkpoints WHERE slug=? ORDER BY slot", (slug,)).fetchall()
+        "SELECT slot, time FROM wiki_checkpoints WHERE slug=? ORDER BY slot", (slug_,)).fetchall() if False else \
+        conn.execute("SELECT slot, time FROM wiki_checkpoints WHERE slug=? ORDER BY slot", (slug_,)).fetchall()
     revs = conn.execute(
         "SELECT rev, time, contributor, action, summary FROM wiki_revisions WHERE slug=? ORDER BY rev DESC LIMIT 20",
-        (slug,)).fetchall()
-    children = [r[0] for r in conn.execute(
-        "SELECT DISTINCT family_path FROM wiki_pages WHERE family_path LIKE ? AND family_path != ?",
-        (row[1] + "/%", row[1] + "/%"))]
+        (slug_,)).fetchall()
     return {"ok": True, "page": {
-        "slug": row[0], "familyPath": row[1], "title": row[2], "intro": row[3],
-        "content": row[4], "status": row[5], "revisions": row[6],
-        "createdAt": row[7], "updatedAt": row[8],
-        "childrenPaths": children,
+        "slug": slug_, "familyPath": row[1], "fullPath": my_full,
+        "title": row[3], "intro": row[4], "content": row[5],
+        "status": row[6], "revisions": row[7], "createdAt": row[8], "updatedAt": row[9],
+        "children": [{"slug": s, "familyPath": f, "title": t} for s, f, t in children],
         "checkpoints": [{"slot": s, "time": t} for s, t in cps],
         "recentRevisions": revs,
     }}
 
 
+def op_list(conn, req):
+    prefix = str(req.get("familyPrefix") or "").strip().strip("/")
+    if prefix:
+        rows = conn.execute(
+            "SELECT slug, family_path, full_path, title, intro, status, revisions, updated_at"
+            " FROM wiki_pages WHERE full_path=? OR full_path LIKE ? ORDER BY full_path",
+            (prefix, prefix + "/%")).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT slug, family_path, full_path, title, intro, status, revisions, updated_at"
+            " FROM wiki_pages ORDER BY family_path, slug").fetchall()
+    return {"ok": True, "count": len(rows), "entries": [
+        {"slug": r[0], "familyPath": r[1], "fullPath": r[2], "title": r[3], "intro": r[4],
+         "status": r[5], "revisions": r[6], "updatedAt": r[7]} for r in rows]}
+
+
 def op_tree(conn, req):
-    """森林视图：层级由条目之间的前缀链推导——
-    若条目 B 的 family_path == 条目 A 的 family_path + '/' + A.slug，则 B 是 A 的子节点。"""
+    """森林视图：层级由 full_path 前缀链推导 + 孤儿识别（银杏审读④）。
+    孤儿 = 家族路径的父链断裂（parent 条目不存在）——治理时一眼看到断链。"""
     rows = conn.execute(
-        "SELECT slug, family_path, title, intro, status, revisions, updated_at"
-        " FROM wiki_pages ORDER BY family_path, slug").fetchall()
+        "SELECT slug, family_path, full_path, title, intro, status, revisions, updated_at"
+        " FROM wiki_pages ORDER BY full_path").fetchall()
     entries = []
     byfull = {}
-    for slug, fp, title, intro, status, revs, upd in rows:
-        e = {"slug": slug, "familyPath": fp, "title": title, "intro": intro,
+    for slug, fp, full, title, intro, status, revs, upd in rows:
+        e = {"slug": slug, "familyPath": fp, "fullPath": full, "title": title, "intro": intro,
              "status": status, "revisions": revs, "updatedAt": upd, "children": []}
         entries.append(e)
-        byfull[fp + "/" + slug] = e
-    roots = []
+        byfull[full] = e
+    roots, orphans = [], []
     for e in entries:
         parent = byfull.get(e["familyPath"])
         if parent is not None and parent is not e:
-            parent["children"].append({"slug": e["slug"], "familyPath": e["familyPath"],
+            parent["children"].append({"slug": e["slug"], "fullPath": e["fullPath"],
                                        "title": e["title"]})
-        else:
+        elif e["familyPath"] == e["slug"]:
             roots.append(e)
-    return {"ok": True, "count": len(entries), "roots": [r["slug"] for r in roots],
+        else:
+            orphans.append(e)
+    return {"ok": True, "count": len(entries),
+            "roots": [r["slug"] for r in roots],
+            "orphans": [o["slug"] for o in orphans],
             "entries": entries}
 
 
 def op_move(conn, req):
+    """改挂家族（银杏审读②：move 必须逐条留账——修订记录是五要件之一）。
+    受影响集 = 自身（full_path == 自身全路径）+ 后代（full_path LIKE 自身全路径/%）。
+    目标家族须已存在（full_path 命中），否则会产生孤儿——拒绝。"""
     slug = str(req.get("slug") or "").strip()
     newfp = str(req.get("newFamilyPath") or "").strip().strip("/")
+    contributor = str(req.get("contributor") or "未知").strip()
+    now = int(time.time() * 1000)
     if not slug or not newfp:
         return {"ok": False, "error": "slug 与 newFamilyPath 必填"}
-    oldfp = conn.execute("SELECT family_path FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
-    if not oldfp:
+    row = conn.execute("SELECT family_path, full_path FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
+    if not row:
         return {"ok": False, "error": "条目不存在: " + slug}
-    oldfp = oldfp[0]
-    # 子树批量改路径：自身 + 以 oldfp/ 开头的后代
-    conn.execute("UPDATE wiki_pages SET family_path=? || substr(family_path, ?) WHERE family_path=? OR family_path LIKE ?",
-                 (newfp, len(oldfp) + 1, oldfp, oldfp + "/%"))
+    old_family, old_full = row
+    if newfp == old_family:
+        return {"ok": True, "slug": slug, "unchanged": True}
+    # 目标家族必须已存在（防孤儿）
+    target = conn.execute("SELECT 1 FROM wiki_pages WHERE full_path = ? LIMIT 1", (newfp,)).fetchone()
+    if not target:
+        return {"ok": False, "error": f"目标家族不存在（防孤儿拒绝）: {newfp}"}
+    old_prefix = old_full + "/"
+    affected = conn.execute(
+        "SELECT slug, family_path, full_path FROM wiki_pages WHERE family_path=? OR full_path LIKE ? ORDER BY full_path",
+        (old_family, old_prefix + "%")).fetchall()
+    for mslug, mfp, mfull in affected:
+        new_family = newfp if mfp == old_family else newfp + mfp[len(old_family):]
+        new_full = newfp + mfull[len(old_family):] if mfp == old_family else newfp + mfull[len(old_family):]
+        rev = next_rev(conn, mslug)
+        conn.execute(
+            "UPDATE wiki_pages SET family_path=?, full_path=?, revisions=?, updated_at=? WHERE slug=?",
+            (new_family, new_full, rev, now, mslug))
+        log_revision(conn, mslug, rev, now, contributor, "move",
+                     f"家族改挂：{mfp} → {new_family}", "")
     conn.commit()
-    moved = conn.execute("SELECT COUNT(*) FROM wiki_pages WHERE family_path=? OR family_path LIKE ?",
-                         (newfp, newfp + "/%")).fetchone()[0]
-    return {"ok": True, "moved": moved}
+    return {"ok": True, "slug": slug, "moved": len(affected)}
 
 
 def op_rollback(conn, req):
     slug = str(req.get("slug") or "").strip()
-    slot = int(req.get("slot", -1))
     contributor = str(req.get("contributor") or "未知").strip()
     now = int(time.time() * 1000)
-    snap = conn.execute("SELECT time, content FROM wiki_checkpoints WHERE slug=? AND slot=?",
-                        (slug, slot)).fetchone()
-    if not snap:
-        return {"ok": False, "error": f"检查点不存在: slot={slot}"}
+    # 审读⑥：slot 编号随保留规则重排不稳定——按 time 定位（slot 仅展示序号）
+    t = req.get("time")
+    snap = None
+    if t is not None:
+        t = int(t)
+        row = conn.execute("SELECT content FROM wiki_checkpoints WHERE slug=? AND time=?",
+                           (slug, t)).fetchone()
+        if row:
+            snap = (t, row[0])
+    if snap is None:
+        allc = conn.execute("SELECT time, content FROM wiki_checkpoints WHERE slug=? ORDER BY time DESC",
+                            (slug,)).fetchall()
+        if not allc:
+            return {"ok": False, "error": "无检查点可回滚"}
+        snap = allc[0]
     snap_time, snap_content = snap
     old = conn.execute("SELECT content, updated_at FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
     if not old:
         return {"ok": False, "error": "条目不存在"}
-    # 当前内容先进稀释体系（回滚前的现场也要保住）
     on_update_cascade(conn, slug, old[0], old[1], now)
-    revs = conn.execute("SELECT revisions FROM wiki_pages WHERE slug=?", (slug,)).fetchone()[0]
-    new_revs = revs + 1
+    rev = next_rev(conn, slug)
     conn.execute(
         "UPDATE wiki_pages SET content=?, revisions=?, updated_at=? WHERE slug=?",
-        (snap_content, new_revs, now, slug))
-    conn.execute(
-        "INSERT INTO wiki_revisions(slug, rev, time, contributor, action, summary, content)"
-        " VALUES(?,?,?,?, 'rollback', ?, ?)",
-        (slug, new_revs, now, contributor, f"回滚自槽位 {slot}（快照时间 {snap_time}）", snap_content))
+        (snap_content, rev, now, slug))
+    log_revision(conn, slug, rev, now, contributor, "rollback", f"回滚到检查点（原时间 {snap_time}）", snap_content)
     conn.commit()
-    return {"ok": True, "slug": slug, "rev": new_revs, "restoredFromSlot": slot}
+    return {"ok": True, "slug": slug, "rev": rev, "restoredFromTime": snap_time}
 
 
 OPS = {
@@ -290,6 +365,7 @@ OPS = {
     "update": op_update,
     "get": op_get,
     "tree": op_tree,
+    "list": op_list,
     "move": op_move,
     "rollback": op_rollback,
 }
@@ -306,7 +382,7 @@ def main():
     op = str(req.get("op") or "").strip()
     fn = OPS.get(op)
     if not fn:
-        out({"ok": False, "error": f"未知 op: {op}（可选: create/update/get/tree/list/move/rollback）"})
+        out({"ok": False, "error": f"未知 op: {op}（可选: {', '.join(sorted(OPS))}）"})
         return
     conn = connect()
     try:
