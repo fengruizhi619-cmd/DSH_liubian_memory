@@ -228,15 +228,15 @@ def op_get(conn, req):
         return {"ok": False, "error": "条目不存在: " + slug}
     my_full = row[2]
     children = conn.execute(
-        "SELECT slug, family_path, title FROM wiki_pages WHERE family_path = ?", (my_full,)).fetchall()
+        "SELECT slug, family_path, title FROM wiki_pages WHERE family_path = ? AND slug != ?",
+        (my_full, slug)).fetchall()
     cps = conn.execute(
-        "SELECT slot, time FROM wiki_checkpoints WHERE slug=? ORDER BY slot", (slug_,)).fetchall() if False else \
-        conn.execute("SELECT slot, time FROM wiki_checkpoints WHERE slug=? ORDER BY slot", (slug_,)).fetchall()
+        "SELECT slot, time FROM wiki_checkpoints WHERE slug=? ORDER BY slot", (slug,)).fetchall()
     revs = conn.execute(
         "SELECT rev, time, contributor, action, summary FROM wiki_revisions WHERE slug=? ORDER BY rev DESC LIMIT 20",
-        (slug_,)).fetchall()
+        (slug,)).fetchall()
     return {"ok": True, "page": {
-        "slug": slug_, "familyPath": row[1], "fullPath": my_full,
+        "slug": slug, "familyPath": row[1], "fullPath": my_full,
         "title": row[3], "intro": row[4], "content": row[5],
         "status": row[6], "revisions": row[7], "createdAt": row[8], "updatedAt": row[9],
         "children": [{"slug": s, "familyPath": f, "title": t} for s, f, t in children],
