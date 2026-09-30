@@ -392,6 +392,40 @@ function register(ctx, def) {
 }
 
 export function registerTools(ctx, cfg) {
+  /* - 流变·记忆：wiki 条目（S1/S2，2026-10-01）——条目五要件 + 森林结构 + 梯度稀释检查点。
+     设计文档：docs/流变记忆wiki化_DSH实施方案.md；存储 helper/wiki_store.py（stdin JSON 协议）。 */
+  register(ctx, {
+    name: 'wiki',
+    description: '流变·记忆 wiki 条目操作（长期记忆新形态）。action: create 创建条目（slug+家族路径+标题+简介+正文）'
+      + '｜update 修订正文/简介/家族（自动落梯度稀释检查点+修订账目）｜get 读条目（全文+修订史+检查点清单）'
+      + '｜tree 森林视图｜move 改挂家族（子树批量跟随）｜rollback 回滚到指定检查点槽位。'
+      + '贡献者自动取当前会话身份；家族路径形如「平台/DSH/会话」。',
+    parameters: {
+      action: { type: 'string', enum: ['create', 'update', 'get', 'tree', 'move', 'rollback'], required: true, description: '操作' },
+      slug: { type: 'string', description: '条目 slug（全局唯一，不含 /）' },
+      familyPath: { type: 'string', description: '家族路径（如「水果/梨果」）；create 必填；move 传新路径' },
+      title: { type: 'string', description: '标题（create 必填）' },
+      intro: { type: 'string', description: '内容介绍（检索消歧用）' },
+      content: { type: 'string', description: '正文' },
+      contributor: { type: 'string', description: '贡献者（独特名；缺省取会话工作区身份）' },
+      summary: { type: 'string', description: '修订摘要' },
+      slot: { type: 'number', description: 'rollback：目标检查点槽位（0=最细）' },
+    },
+    async execute(args) {
+      // 贡献者 v0：会话工作区身份（与被炉发言人推导同源）；独特名注册上线后切换
+      const req = { ...args, op: String(args.action || ''), contributor: String(args.contributor || cfg.workspace || '未知') }
+      const raw = await runHelperAsync(cfg, 'wiki_store', [], {
+        timeoutMs: Math.max(15000, Number(cfg.memoryTimeoutMs) || 60000),
+        stdin: JSON.stringify(req),
+      })
+      try {
+        return JSON.parse(String(raw || '').trim())
+      } catch {
+        return String(raw || '').slice(0, 800) || '[错误] wiki_store 无输出'
+      }
+    },
+  })
+
   /* - 流变·记忆：写日记（mcp-memory-write?------------------------------------------------------------ */
   register(ctx, {
     name: 'write',
