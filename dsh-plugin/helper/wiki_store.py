@@ -22,11 +22,31 @@
   {"op":"move","slug":..,"newFamilyPath":..,"contributor":..}  → 改挂（目标家族须已存在）
   {"op":"rollback","slug":..,"time":..,"contributor":..}       → 按时间定位检查点恢复
 """
-import json, sys, os, sqlite3, time
+import json, sys, os, sqlite3, time, unicodedata, hashlib
 
 CHECKPOINT_THRESHOLDS_MIN = [5, 10, 30, 60, 360, 720, 1440, 10080]  # 5m/10m/30m/1h/6h/12h/24h/7d
 MAX_CHECKPOINTS = len(CHECKPOINT_THRESHOLDS_MIN)  # 8
 STATUSES = ("draft", "stable", "obsolete")
+REGISTRY_DB = os.path.expanduser("~/.dsh/liubian-infra/registry.db")
+
+_registry_cache = None
+
+def resolve_contributor(name):
+    """独特名解析：查注册中心拿短ID，格式「名字 #短ID」。注册中心离线或查不到 → 原样返回。"""
+    global _registry_cache
+    if _registry_cache is None:
+        _registry_cache = {}
+        try:
+            rc = sqlite3.connect(f"file:{REGISTRY_DB}?mode=ro", uri=True, timeout=5)
+            for row in rc.execute("SELECT name, short_id FROM identities"):
+                _registry_cache[row[0]] = row[1]
+            rc.close()
+        except Exception:
+            pass  # 注册中心离线 → 空缓存，降级原样返回
+    sid = _registry_cache.get(name)
+    if sid:
+        return f"{name} #{sid}"
+    return name
 
 DDL = [
     """CREATE TABLE IF NOT EXISTS wiki_pages (
@@ -156,7 +176,7 @@ def op_create(conn, req):
     title = str(req.get("title") or "").strip()
     intro = str(req.get("intro") or "").strip()
     content = str(req.get("content") or "")
-    contributor = str(req.get("contributor") or "未知").strip()
+    contributor = resolve_contributor(str(req.get("contributor") or "未知").strip())
     status = _status_of(req)
     now = int(time.time() * 1000)
     if not slug or "/" in slug:
@@ -202,7 +222,7 @@ def op_update(conn, req):
     new_title = str(req["title"]) if req.get("title") is not None else old_title
     new_status = str(req.get("status") or "").strip()
     new_status = new_status if new_status in STATUSES else old_status
-    contributor = str(req.get("contributor") or "未知").strip()
+    contributor = resolve_contributor(str(req.get("contributor") or "未知").strip())
     summary = str(req.get("summary") or "").strip()
     now = int(time.time() * 1000)
     if (new_content == old_content and new_intro == old_intro
@@ -296,7 +316,7 @@ def op_move(conn, req):
     目标家族须已存在（full_path 命中），否则会产生孤儿——拒绝。"""
     slug = str(req.get("slug") or "").strip()
     newfp = str(req.get("newFamilyPath") or "").strip().strip("/")
-    contributor = str(req.get("contributor") or "未知").strip()
+    contributor = resolve_contributor(str(req.get("contributor") or "未知").strip())
     now = int(time.time() * 1000)
     if not slug or not newfp:
         return {"ok": False, "error": "slug 与 newFamilyPath 必填"}
@@ -329,7 +349,7 @@ def op_move(conn, req):
 
 def op_rollback(conn, req):
     slug = str(req.get("slug") or "").strip()
-    contributor = str(req.get("contributor") or "未知").strip()
+    contributor = resolve_contributor(str(req.get("contributor") or "未知").strip())
     now = int(time.time() * 1000)
     # 审读⑥：slot 编号随保留规则重排不稳定——按 time 定位（slot 仅展示序号）
     t = req.get("time")
