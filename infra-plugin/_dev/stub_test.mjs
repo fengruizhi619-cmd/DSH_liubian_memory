@@ -12,6 +12,7 @@ import {
   openDb, registerIdentity, verifyName, lookupIdentity, listIdentities, retireIdentity, renameIdentity,
   resolveIdentityRef, buildInfraService,
   bindSession, unbindSession, bindingFor, listBindings,
+  isForgotten, forgetSession, liftTombstone, changesSince,
   attributeWorkspace, noteSession, seenWorkspaceFor,
   callerSessionOf,
   resolveConfig,
@@ -359,6 +360,70 @@ await ta('服务改回原名（收尾复原）', async () => {
   const r = await svc.rename({ hash: deriveHash('基石'), newName: '基石', actor: '基石' })
   eq(r.ok, true)
   eq(resolveIdentityRef(db, deriveHash('基石')).name, '基石')
+})
+
+console.log('== 删除与跨系统同步（v0.4.0：墓碑 + forgetSession + changes 游标） ==')
+registerIdentity(db, '删除测试员', '删除用例')
+bindSession(db, 'aaaa1111', '删除测试员', '删除用例')
+noteSession(db, 'aaaa1111', '中枢')
+
+await ta('forgetSession 默认只解绑不烧名字：绑没、登记清、墓碑在、名字仍 active', () => {
+  const r = forgetSession(db, { sessionHash: 'aaaa1111', actor: '验收', reason: '用例' })
+  eq(r.ok, true); eq(r.unbound, 1); eq(r.retired, false)
+  eq(bindingFor(db, 'aaaa1111'), null, '绑定应已删')
+  eq(db.prepare('SELECT COUNT(*) AS c FROM session_seen WHERE session_hash=?').get('aaaa1111').c, 0, '登记应已清')
+  eq(isForgotten(db, 'aaaa1111'), true, '墓碑应在')
+  eq(listIdentities(db).find(x => x.name === '删除测试员').status, 'active', '默认不得烧名字')
+})
+await ta('幂等：二次 forget → unbound 0 且不新增墓碑事件', () => {
+  const n0 = db.prepare('SELECT COUNT(*) AS c FROM tombstones').get().c
+  const r = forgetSession(db, { sessionHash: 'aaaa1111', actor: '验收' })
+  eq(r.unbound, 0); eq(r.alreadyForgotten, true)
+  eq(db.prepare('SELECT COUNT(*) AS c FROM tombstones').get().c, n0, '墓碑事件数不得增加')
+})
+await ta('验收第 11 条：热路径连调 noteSession 后墓碑仍在（不被擦掉）', () => {
+  noteSession(db, 'aaaa1111', '中枢'); noteSession(db, 'aaaa1111', '中枢'); noteSession(db, 'aaaa1111', '中枢')
+  eq(isForgotten(db, 'aaaa1111'), true)
+  return '3 次 noteSession 后墓碑未丢'
+})
+await ta('changes 游标：能看见 forget 事件（按 id 增量）', () => {
+  const c = changesSince(db, 0)
+  const mine = c.tombstones.filter(t => t.session_hash === 'aaaa1111')
+  eq(mine.length >= 1, true); eq(mine[0].op, 'forget')
+  return `seq=${c.seq}｜identities=${c.identities.length}｜bindings=${c.bindings.length}`
+})
+await ta('liftTombstone：复活后 isForgotten=false，且 lift 事件按 id 增量可见（水位不漏）', () => {
+  const before = changesSince(db, 0).seq
+  const r = liftTombstone(db, { sessionHash: 'aaaa1111', actor: '验收' })
+  eq(r.lifted, true)
+  eq(isForgotten(db, 'aaaa1111'), false)
+  const delta = changesSince(db, before).tombstones
+  eq(delta.length, 1, '复活的 lift 事件必须能被 since=before 看见（一行一状态的写法会在这里漏）')
+  eq(delta[0].op, 'lift')
+  return `seq ${before} → ${changesSince(db, 0).seq}`
+})
+await ta('复活幂等：再 lift → lifted:false', () => {
+  eq(liftTombstone(db, { sessionHash: 'aaaa1111' }).lifted, false)
+})
+await ta('retireName=true：显式烧名字（可读状态 + 不可再注册）', () => {
+  bindSession(db, 'bbbb2222', '删除测试员', '再绑一次')
+  const r = forgetSession(db, { sessionHash: 'bbbb2222', retireName: true, reason: '注销' })
+  eq(r.retired, 'retired')
+  eq(listIdentities(db).find(x => x.name === '删除测试员').status, 'retired')
+  throws(() => registerIdentity(db, '删除测试员'), '已被注册')
+})
+await ta('反向对照：非法会话哈希 → 抛错且零写入', () => {
+  const snap = () => db.prepare('SELECT COUNT(*) AS c FROM tombstones').get().c + '|' + listBindings(db).length
+  const before = snap()
+  throws(() => forgetSession(db, { sessionHash: 'zzz' }), '8 位十六进制')
+  eq(snap(), before, '拒绝路径必须零写入')
+})
+await ta('服务面：svc.forgetSession + svc.changes（消费方调用形态）', async () => {
+  const r = await svc.forgetSession({ sessionHash: 'cccc3333', actor: '被炉 account delete', retireName: false })
+  eq(r.ok, true)
+  const c = await svc.changes({ since: 0 })
+  eq(c.ok, true); eq(Array.isArray(c.tombstones), true)
+  return `changes: identities=${c.identities.length}｜tombstones=${c.tombstones.length}`
 })
 
 db.close()

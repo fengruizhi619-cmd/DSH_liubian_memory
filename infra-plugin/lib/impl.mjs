@@ -24,7 +24,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const PLUGIN_NAME = 'dsh-liubian-infra'
-export const PLUGIN_VERSION = '0.3.2'
+export const PLUGIN_VERSION = '0.4.0'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
@@ -200,6 +200,19 @@ CREATE TABLE IF NOT EXISTS renames (
   note     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_renames_hash ON renames(hash);
+/* v0.4.0 删除与同步（管理员 2026-10-01 裁定：删除用户 = L1 退房 + L2 删运行身份 + L3 注销名字）。
+   墓碑**只增不改**（与 renames 同纪律）：忘记一条'forget'事件、复活一条'lift'事件，
+   当前状态 = 该会话 id 最大的那行。这样消费方按 id 水位轮询时，**复活事件不会漏水**
+   （若用「一行一状态 + 更新列」的写法，复活只改列不改 id，水位轮询永远看不到它）。 */
+CREATE TABLE IF NOT EXISTS tombstones (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_hash TEXT NOT NULL,
+  op           TEXT NOT NULL,        -- 'forget' | 'lift'
+  at           TEXT NOT NULL,
+  actor        TEXT,
+  reason       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tombstones_session ON tombstones(session_hash, id);
 `
 
 export function openDb(dbPath) {
@@ -227,7 +240,7 @@ export function registerIdentity(db, rawName, note, workspace) {
   const { name, key } = norm
   const hash = deriveHash(name)
   const ws = String(workspace ?? '').trim() || null
-  const dup = db.prepare('SELECT name, status, short_id, created_at FROM identities WHERE name_key = ?').get(key)
+  const dup = db.prepare('SELECT name, status, short_id, created_at, retired_at FROM identities WHERE name_key = ?').get(key)
   if (dup) {
     const st = dup.status === 'retired' ? `已停用于 ${dup.retired_at || '?'}（独热保留，不回收）` : '在册'
     throw new Error(`[拒绝] 名字「${name}」已被注册：${st}｜短ID ${dup.short_id}｜注册于 ${dup.created_at}。全局独热，同一名字不可二次注册。`)
@@ -457,6 +470,37 @@ export function buildInfraService(state) {
         return { ok: false, error: (e && e.message) || String(e) }
       }
     },
+    /**
+     * L2（＋可选 L3）删除会话运行身份：解绑 + 清登记 + 写墓碑 +（可选）注销名字。
+     * 单事务、幂等。`retireName` **默认 false**——名字不回收，烧名字必须显式点；
+     * 管理员裁定的产品语义（删除账号 ⇒ 一并 retire）由消费方显式传 `retireName: true`。
+     */
+    forgetSession: async ({ sessionHash, actor, reason, retireName = false } = {}) => {
+      try {
+        const db = state.getDb()
+        return forgetSession(db, { sessionHash, actor, reason, retireName })
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || String(e) }
+      }
+    },
+    /** 复活：写 'lift' 事件。显式再注册前**必须先调**，否则消费方轮询会把刚建的本-地记录清掉。 */
+    liftTombstone: async ({ sessionHash, actor, reason } = {}) => {
+      try {
+        const db = state.getDb()
+        return liftTombstone(db, { sessionHash, actor, reason })
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || String(e) }
+      }
+    },
+    /** 同步游标：{ seq, identities（全量）, bindings（全量）, tombstones（id > since 增量） }。 */
+    changes: async ({ since = 0 } = {}) => {
+      try {
+        const db = state.getDb()
+        return { ok: true, ...changesSince(db, since) }
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || String(e) }
+      }
+    },
   }
 }
 
@@ -509,6 +553,83 @@ export function unbindSession(db, { session, name } = {}) {
     return { ok: true, released: { session_hash: row.session_hash, name: row.name } }
   }
   throw new Error('[错误] unbind 需要 session 或 name 之一')
+}
+
+/* ── 删除与跨系统同步（v0.4.0，管理员 2026-10-01 裁定：删除 = L1 退房 + L2 删运行身份 + L3 注销名字） ── */
+
+/** 该会话当前是否处于「已忘记」态。墓碑**只增不改**：当前状态 = 该会话 id 最大的那行。 */
+export function isForgotten(db, rawSessionHash) {
+  const sh = normSessionHash(rawSessionHash)
+  const row = db.prepare('SELECT op FROM tombstones WHERE session_hash = ? ORDER BY id DESC LIMIT 1').get(sh)
+  return !!row && row.op === 'forget'
+}
+
+/**
+ * L2（＋可选 L3）：删除一个会话的运行身份。单事务完成：
+ * 解绑 `bindings` → 清 `session_seen` 登记 → 写 'forget' 墓碑 →（可选）retire 持久名。
+ * 幂等：重复调用不新增墓碑事件，`unbound` 返回 0。
+ * ⚠ `retireName` 默认 **false**：名字独热不回收 ⇒ retire 等于**永久烧掉一个名字**，必须显式点。
+ *   管理员裁定的产品语义是「删除账号 ⇒ 一并 retire」，由消费方（被炉 account delete）显式传 true——
+ *   「接口默认」与「产品语义」分开写，避免两处真相。
+ * ⚠ 事务内任一步失败即整单回滚（不做"删了一半"），错误原样抛出由工具/服务折成显式失败。
+ */
+export function forgetSession(db, { sessionHash, actor, reason, retireName = false } = {}) {
+  const sh = normSessionHash(sessionHash)
+  const now = new Date().toISOString()
+  const already = isForgotten(db, sh)
+  const bound = db.prepare('SELECT name FROM bindings WHERE session_hash = ?').get(sh)
+  let retired = false
+  db.exec('BEGIN')
+  let removed = 0
+  try {
+    removed = db.prepare('DELETE FROM bindings WHERE session_hash = ?').run(sh).changes ?? 0
+    db.prepare('DELETE FROM session_seen WHERE session_hash = ?').run(sh)
+    if (!already) {
+      db.prepare('INSERT INTO tombstones (session_hash, op, at, actor, reason) VALUES (?,?,?,?,?)')
+        .run(sh, 'forget', now, actor ? String(actor) : null, reason ? String(reason) : null)
+    }
+    if (retireName && bound && bound.name) {
+      const r = retireIdentity(db, bound.name, reason ? String(reason) : null)
+      retired = r.alreadyRetired ? 'already-retired' : 'retired'
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 回滚失败也要把原错抛出 */ }
+    throw e
+  }
+  return { ok: true, sessionHash: sh, tombstone: true, alreadyForgotten: already, unbound: removed, name: bound ? bound.name : null, retired, at: now }
+}
+
+/**
+ * 复活：写一条 'lift' 事件（**不删历史**，与 renames 同纪律）。
+ * ⚠ 顺序：显式再注册路径必须**先调它、再建自己的本地记录**——否则消费方下一轮轮询看到
+ * 仍是 'forget'，会把刚建好的本地记录当成墓碑清掉（自删除环）。
+ */
+export function liftTombstone(db, { sessionHash, actor, reason } = {}) {
+  const sh = normSessionHash(sessionHash)
+  if (!isForgotten(db, sh)) return { ok: true, sessionHash: sh, lifted: false, alreadyActive: true }
+  db.prepare('INSERT INTO tombstones (session_hash, op, at, actor, reason) VALUES (?,?,?,?,?)')
+    .run(sh, 'lift', new Date().toISOString(), actor ? String(actor) : null, reason ? String(reason) : null)
+  return { ok: true, sessionHash: sh, lifted: true }
+}
+
+/**
+ * 同步游标：**小表全量快照 + 墓碑流按 id 增量**。
+ * 为什么不给每个写路径都记一笔事件：现有 6 个写身份的动作 + bind/unbind 都要记得 append，
+ * **漏一个就是静默漏事件**；而 identities/bindings 只有十几行，全量重读成本≈0。
+ * 于是「只有一处需要写对」——墓碑表由 forgetSession / liftTombstone 独占写入。
+ * 改名/别名**不进事件流**：读取时按 hash 解析已覆盖（C1 口径）。
+ */
+export function changesSince(db, since = 0) {
+  const from = Number.isFinite(Number(since)) ? Number(since) : 0
+  const tombstones = db.prepare('SELECT id, session_hash, op, at, actor, reason FROM tombstones WHERE id > ? ORDER BY id').all(from)
+  const maxRow = db.prepare('SELECT MAX(id) AS m FROM tombstones').get()
+  return {
+    seq: maxRow && maxRow.m ? maxRow.m : 0,
+    identities: listIdentities(db),
+    bindings: listBindings(db),
+    tombstones,
+  }
 }
 
 /** 查绑定（带身份短 ID 与归属工作区）。 */
@@ -801,7 +922,7 @@ function fmtRow(r) {
   ].filter(Boolean).join('\n')
 }
 
-const REGISTRY_ACTIONS = 'register / verify / lookup / list / rename / retire / attribute / bind / unbind / binding / bindings / status'
+const REGISTRY_ACTIONS = 'register / verify / lookup / list / rename / retire / attribute / bind / unbind / binding / bindings / forget / revive / status'
 const EMBED_ACTIONS = 'embed-status / embed-ensure / embed-stop / embed-restart'
 
 function fmtBindingRow(r) {
@@ -822,11 +943,12 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       },
       name: { type: 'string', description: 'register/verify/lookup/rename/retire/attribute/bind/unbind/binding 用：独特名（rename 时为旧名）' },
       new: { type: 'string', description: 'rename 用：新名（全局独热；hash 不变，只换展示名）' },
-      actor: { type: 'string', description: 'rename 用：发起者（独特名，可选，落改名账目）' },
+      actor: { type: 'string', description: 'rename/forget/revive 用：发起者（独特名，可选，落账目）' },
       id: { type: 'string', description: 'lookup 用：短或全 hash（8~64 位十六进制）' },
-      session: { type: 'string', description: 'bind/unbind/binding 用：会话哈希（8 位十六进制，注入提示里给的）' },
+      session: { type: 'string', description: 'bind/unbind/binding/forget/revive 用：会话哈希（8 位十六进制，注入提示里给的）' },
+      retire: { type: 'string', description: "forget 用：传 'true' 才同时注销持久名（默认只解绑不烧名字；名字独热不回收，烧了不可逆）" },
       workspace: { type: 'string', description: 'register/attribute 用：归属工作区名（名字按工作区归属）' },
-      note: { type: 'string', description: 'register/retire/bind 用：备注（归属、用途等）' },
+      note: { type: 'string', description: 'register/retire/bind/forget/revive 用：备注（归属、用途、删除原因等）' },
     },
     output: OUT,
     async execute(args, exec) {
@@ -891,6 +1013,22 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
         const row = retireIdentity(db, args.name, args.note)
         if (row.alreadyRetired) return `[OK] 「${row.name}」此前已停用（${row.retired_at}）。独热保留不回收。`
         return `[OK] 已停用「${row.name}」（${row.retired_at}）。名字独热保留，不可被再次注册。`
+      }
+      if (action === 'forget') {
+        const db = state.getDb()
+        const retireName = String(args.retire || '').toLowerCase() === 'true'
+        const r = forgetSession(db, { sessionHash: args.session, actor: args.actor || null, reason: args.note || null, retireName })
+        return `[OK] 已删除会话运行身份：${r.sessionHash}`
+          + `\n  └─ 解绑 ${r.unbound} 条｜墓碑已写${r.alreadyForgotten ? '（此前已在墓碑中，幂等未重复记账）' : ''}`
+          + `｜名字「${r.name || '(无绑定)'}」${r.retired === 'retired' ? '**已注销**（独热保留、不回收）' : r.retired === 'already-retired' ? '此前已注销' : '保持 active（未烧名字）'}`
+          + `\n  └─ 消费方（被炉/便签）按服务 changes(since) 游标各自清理自己的库`
+      }
+      if (action === 'revive') {
+        const db = state.getDb()
+        const r = liftTombstone(db, { sessionHash: args.session, actor: args.actor || null, reason: args.note || null })
+        return r.lifted
+          ? `[OK] 已复活会话 ${r.sessionHash}（墓碑留痕 'lift'，历史不删）。`
+          : `[OK] 会话 ${r.sessionHash} 无墓碑（本就活跃），无需复活。`
       }
       if (action === 'rename') {
         const db = state.getDb()
@@ -1083,6 +1221,10 @@ export const __test = {
   retireIdentity,
   bindSession,
   unbindSession,
+  isForgotten,
+  forgetSession,
+  liftTombstone,
+  changesSince,
   bindingFor,
   listBindings,
   attributeWorkspace,
