@@ -401,7 +401,7 @@ export function registerTools(ctx, cfg) {
       + '｜tree 森林视图｜move 改挂家族（子树批量跟随）｜rollback 回滚到指定检查点槽位。'
       + '贡献者自动取当前会话身份；家族路径形如「平台/DSH/会话」。',
     parameters: {
-      action: { type: 'string', enum: ['create', 'update', 'get', 'tree', 'list', 'move', 'rollback'], required: true, description: '操作' },
+      action: { type: 'string', enum: ['create', 'update', 'get', 'tree', 'list', 'move', 'rollback', 'search'], required: true, description: '操作' },
       slug: { type: 'string', description: '条目 slug（全局唯一，不含 /，不可变）' },
       familyPath: { type: 'string', description: '家族路径（如「水果/梨果」）；create 时 =slug 即根条目；move 传新路径（须已存在，防孤儿）' },
       title: { type: 'string', description: '标题（create 必填）' },

@@ -368,7 +368,71 @@ OPS = {
     "list": op_list,
     "move": op_move,
     "rollback": op_rollback,
+    "search": op_search,
 }
+
+
+def op_search(conn, req):
+    """S4 分级向量检索（银杏骨架 v0.1 + 双余弦加权）。
+
+    查询向量 vs 全部条目（简介锚为主通道），按家族树逐层聚合注入。
+    返回注入块结构：roots（stable 根）+ 按根分组的 top-K 条目（简介行）+ 命中数。
+    消费方（impl.mjs）拿 JSON 后拼注入块。"""
+    qv = req.get("vec") or []
+    top = max(1, int(req.get("top") or 10))
+    if not qv or len(qv) < 64:
+        return {"ok": False, "error": "vec 必填（查询向量，≥64 维）"}
+    qv = [float(x) for x in qv]
+    qn = sum(x * x for x in qv) ** 0.5
+    if qn == 0:
+        return {"ok": False, "error": "查询向量全零"}
+    qv = [x / qn for x in qv]
+
+    # 全量条目 + 简介余弦
+    rows = conn.execute(
+        "SELECT slug, family_path, full_path, title, intro, content, status, revisions, updated_at"
+        " FROM wiki_pages ORDER BY full_path").fetchall()
+    scored = []
+    for r in rows:
+        slug, fp, full, title, intro, content, status, revs, upd = r
+        iv = embed_text_cached(intro or title or "")
+        if iv is None:
+            continue
+        ivn = sum(x * x for x in iv) ** 0.5
+        if ivn == 0:
+            continue
+        iv = [x / ivn for x in iv]
+        cos = sum(a * b for a, b in zip(qv, iv))
+        scored.append({"slug": slug, "family_path": family, "full_path": full,
+                       "title": title, "intro": intro, "content": content,
+                       "status": status, "revisions": revs, "updated_at": upd,
+                       "score": round(cos, 4)})
+    scored.sort(key=lambda x: -x["score"])
+    top_entries = scored[:top]
+    return {"ok": True, "total": len(scored), "results": top_entries}
+
+
+def embed_text_cached(text):
+    """本地嵌入（调 wiki_export 同款 8082 服务），带进程级缓存。"""
+    cache_key = hash(text)
+    if cache_key in _embed_cache:
+        return _embed_cache[cache_key]
+    try:
+        import urllib.request
+        payload = json.dumps({"model": "qwen3-emb", "input": [text[:4000]]}).encode("utf-8")
+        req = urllib.request.Request(
+            "http://127.0.0.1:8082/v1/embeddings", data=payload,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        vec = data["data"][0]["embedding"]
+        _embed_cache[cache_key] = vec
+        return vec
+    except Exception:
+        return None
+
+
+_embed_cache = {}
 
 
 def main():
