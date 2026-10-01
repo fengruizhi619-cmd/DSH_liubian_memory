@@ -14,13 +14,20 @@
   · move = 改挂（子树批量跟随，逐条记修订）
 
 调用协议（与 memory_query.py 同款）：stdin 喂 JSON，stdout 吐 JSON。
-  {"op":"create","slug":..,"familyPath":..,"title":..,"intro":..,"content":..,"contributor":..,"status":..}
-  {"op":"update","slug":..,"content":?,"intro":?,"title":?,"status":?,"contributor":..,"summary":?}
+  {"op":"create","slug":..,"familyPath":..,"title":..,"intro":..,"content":..,"status":..,
+   "sessionHash":..,"workspace":..,"sourceContributor":?}
+  {"op":"update","slug":..,"content":?,"intro":?,"title":?,"status":?,"summary":?,同上三键}
   {"op":"get","slug":..}
   {"op":"tree"}                                   → 森林（roots/orphans/children 平面清单）
   {"op":"list","familyPrefix":"自然/水果"}          → 子树清单
-  {"op":"move","slug":..,"newFamilyPath":..,"contributor":..}  → 改挂（目标家族须已存在）
-  {"op":"rollback","slug":..,"time":..,"contributor":..}       → 按时间定位检查点恢复
+  {"op":"move","slug":..,"newFamilyPath":..,同上三键}  → 改挂（目标家族须已存在）
+  {"op":"rollback","slug":..,"time":..,同上三键}       → 按时间定位检查点恢复
+
+归因（〈升格流落树约定〉规则 7，2026-10-01 定稿）：
+  · 执行者 executor 由 `sessionHash` 查注册中心 bindings 派生，**不可由传参覆盖**；
+    未命中 / 无会话 / 注册中心离线 → 回退 `workspace` 并标 workspace-fallback（summary 自动标注）；
+  · 内容来源者 sourceContributor 显式可选（旧键 `contributor` 保留为别名）；
+  · 两者落库为独立列；legacy `contributor` 列老行冻结、新行写执行者作兼容镜像。
 """
 import json, sys, os, sqlite3, time, unicodedata, hashlib
 
@@ -47,6 +54,63 @@ def resolve_contributor(name):
     if sid:
         return f"{name} #{sid}"
     return name
+
+
+_binding_cache = None
+
+
+def _bindings():
+    """只读注册中心 bindings 表：session_hash → name。
+    与基建 v0.2 的 bindings 表同源（契约 v1 §3 只读 URI、§5.1 会话哈希派生同源）。
+    注册中心离线/表不存在 → 空缓存，调用方走工作区兜底。"""
+    global _binding_cache
+    if _binding_cache is None:
+        _binding_cache = {}
+        try:
+            rc = sqlite3.connect(f"file:{REGISTRY_DB}?mode=ro", uri=True, timeout=5)
+            for row in rc.execute("SELECT session_hash, name FROM bindings"):
+                _binding_cache[row[0]] = row[1]
+            rc.close()
+        except Exception:
+            pass
+    return _binding_cache
+
+
+def resolve_executor(session_hash, workspace):
+    """执行者两级解析（〈升格流落树约定〉规则 7 定稿，2026-10-01）：
+      ① 会话哈希命中注册中心绑定 → 用该名字，标记 binding；
+      ② 未命中 / 无会话上下文 / 注册中心离线 → 回退工作区名，标记 workspace-fallback。
+    **执行者不可由显式传参覆盖**——冒名在结构上不可能（银杏 #12 加固）。
+    返回 (格式化执行者, 三态标记)。"""
+    sh = str(session_hash or "").strip()
+    if sh:
+        name = _bindings().get(sh)
+        if name:
+            return resolve_contributor(name), "binding"
+    return resolve_contributor(str(workspace or "").strip() or "未知"), "workspace-fallback"
+
+
+FALLBACK_NOTE = "贡献者按工作区兜底"
+
+
+def annotate_fallback(summary, resolved):
+    """兜底归因要在账目上自己标出来（玉簪提的：可疑归因不能长得像正常归因）。
+    只在 workspace-fallback 时追加，且幂等——不重复叠加。"""
+    s = str(summary or "").strip()
+    if resolved != "workspace-fallback":
+        return s
+    if FALLBACK_NOTE in s:
+        return s
+    return (s + "｜" + FALLBACK_NOTE) if s else FALLBACK_NOTE
+
+
+def attribution(req):
+    """归因三件套：执行者（会话派生，不可覆盖）/ 三态标记 / 内容来源者（显式可选）。
+    工具参数 `contributor` 保留为 source_contributor 的**别名**（不破坏既有调用形态）。"""
+    executor, marker = resolve_executor(req.get("sessionHash"), req.get("workspace"))
+    raw_source = str(req.get("sourceContributor") or req.get("contributor") or "").strip()
+    source = resolve_contributor(raw_source) if raw_source else ""
+    return executor, marker, source
 
 DDL = [
     """CREATE TABLE IF NOT EXISTS wiki_pages (
@@ -79,6 +143,30 @@ DDL = [
     """CREATE INDEX IF NOT EXISTS idx_wiki_full ON wiki_pages(full_path)""",
 ]
 
+# 归因二分（规则 7）：贡献者/执行者拆列，**加法式迁移**——老行原样冻结、不重写不删。
+# legacy `contributor` 列保持 NOT NULL：新行写执行者作兼容镜像（未升级的读取方仍能读到人）。
+REVISION_OPT_COLUMNS = (("executor", "TEXT"), ("source_contributor", "TEXT"), ("executor_resolved", "TEXT"))
+_REV_COLS = None
+
+
+def revision_columns(conn):
+    """wiki_revisions 的实际列集合（进程内缓存；迁移失败也能安全降级到老列写入）。"""
+    global _REV_COLS
+    if _REV_COLS is None:
+        _REV_COLS = {r[1] for r in conn.execute("PRAGMA table_info(wiki_revisions)")}
+    return _REV_COLS
+
+
+def ensure_revision_columns(conn):
+    """幂等加法迁移：缺列就补。失败只警告不阻断（写入侧会按实际列自适应）。"""
+    for name, typ in REVISION_OPT_COLUMNS:
+        if name not in revision_columns(conn):
+            try:
+                conn.execute(f"ALTER TABLE wiki_revisions ADD COLUMN {name} {typ}")
+                _REV_COLS.add(name)
+            except Exception as e:
+                sys.stderr.write(f"[wiki_store] 列迁移失败 {name}: {e}\n")
+
 
 def out(obj):
     # default=str：任何漏网的非序列化对象（如 Row）降级为字符串，不让整个工具调用炸掉
@@ -95,6 +183,7 @@ def connect():
     conn.row_factory = sqlite3.Row  # 命名访问——杜绝列序错位（v0.2.2 注入块字段错位教训）
     for stmt in DDL:  # 幂等建表
         conn.execute(stmt)
+    ensure_revision_columns(conn)  # 幂等加法迁移（归因二分）
     conn.commit()
     return conn
 
@@ -153,11 +242,28 @@ def on_update_cascade(conn, slug, prev_content, prev_time, now_ms):
     save_checkpoints(conn, slug, kept)
 
 
-def log_revision(conn, slug, rev, now, contributor, action, summary, content):
+def log_revision(conn, slug, rev, now, executor, action, summary, content,
+                 executor_resolved="", source_contributor=""):
+    """写修订账目。归因二分（〈升格流落树约定〉规则 7）：
+      · executor —— 永远由调用会话绑定派生（resolve_executor），**不可覆盖**；
+      · source_contributor —— 显式可选（升格流原作者/被引用者），可空；
+      · legacy `contributor` 列 —— 老行原样冻结；**新行写执行者作兼容镜像**，
+        免得未升级的读取方读到空白（语义边界见规则 7，逐行判读、不做自动回填）。
+    按实际列自适应：迁移失败或旧库也能写入（少写可选列，不报错）。"""
+    fields = {
+        "slug": slug, "rev": rev, "time": now,
+        "contributor": executor,                      # legacy 兼容镜像
+        "executor": executor,
+        "source_contributor": source_contributor or None,
+        "executor_resolved": executor_resolved or None,
+        "action": action, "summary": summary, "content": content,
+    }
+    base = ("slug", "rev", "time", "contributor", "action", "summary", "content")
+    have = revision_columns(conn)
+    names = list(base) + [c for c, _ in REVISION_OPT_COLUMNS if c in have]
     conn.execute(
-        "INSERT INTO wiki_revisions(slug, rev, time, contributor, action, summary, content)"
-        " VALUES(?,?,?,?,?,?,?)",
-        (slug, rev, now, contributor, action, summary, content))
+        "INSERT INTO wiki_revisions(%s) VALUES(%s)" % (",".join(names), ",".join("?" * len(names))),
+        tuple(fields[n] for n in names))
 
 
 def next_rev(conn, slug):
@@ -178,7 +284,7 @@ def op_create(conn, req):
     title = str(req.get("title") or "").strip()
     intro = str(req.get("intro") or "").strip()
     content = str(req.get("content") or "")
-    contributor = resolve_contributor(str(req.get("contributor") or "未知").strip())
+    executor, resolved, source = attribution(req)
     status = _status_of(req)
     now = int(time.time() * 1000)
     if not slug or "/" in slug:
@@ -203,10 +309,12 @@ def op_create(conn, req):
         "INSERT INTO wiki_pages(slug, family_path, full_path, title, intro, content, status, revisions, created_at, updated_at)"
         " VALUES(?,?,?,?,?,?, ?, 1, ?, ?)",
         (slug, family, full, title, intro, content, status, now, now))
-    log_revision(conn, slug, 1, now, contributor, "create", intro or title, content)
+    log_revision(conn, slug, 1, now, executor, "create", annotate_fallback(intro or title, resolved), content,
+                 executor_resolved=resolved, source_contributor=source)
     conn.commit()
     return {"ok": True, "slug": slug, "familyPath": family, "fullPath": full,
-            "isRoot": is_root, "rev": 1}
+            "isRoot": is_root, "rev": 1,
+            "executor": executor, "executorResolved": resolved, "sourceContributor": source or None}
 
 
 def op_update(conn, req):
@@ -224,21 +332,24 @@ def op_update(conn, req):
     new_title = str(req["title"]) if req.get("title") is not None else old_title
     new_status = str(req.get("status") or "").strip()
     new_status = new_status if new_status in STATUSES else old_status
-    contributor = resolve_contributor(str(req.get("contributor") or "未知").strip())
-    summary = str(req.get("summary") or "").strip()
+    executor, resolved, source = attribution(req)
+    summary = annotate_fallback(str(req.get("summary") or "").strip(), resolved)
     now = int(time.time() * 1000)
     if (new_content == old_content and new_intro == old_intro
             and new_title == old_title and new_status == old_status):
-        return {"ok": True, "slug": slug, "unchanged": True}
+        return {"ok": True, "slug": slug, "unchanged": True,
+                "executor": executor, "executorResolved": resolved, "sourceContributor": source or None}
     # ① 梯度稀释检查点：旧正文送入时间稀释槽位（级联保留）
     on_update_cascade(conn, slug, old_content, old_updated, now)
     new_revs = old_revs + 1
     conn.execute(
         "UPDATE wiki_pages SET content=?, intro=?, title=?, status=?, revisions=?, updated_at=? WHERE slug=?",
         (new_content, new_intro, new_title, new_status, new_revs, now, slug))
-    log_revision(conn, slug, new_revs, now, contributor, "update", summary, new_content)
+    log_revision(conn, slug, new_revs, now, executor, "update", summary, new_content,
+                 executor_resolved=resolved, source_contributor=source)
     conn.commit()
-    return {"ok": True, "slug": slug, "rev": new_revs}
+    return {"ok": True, "slug": slug, "rev": new_revs,
+            "executor": executor, "executorResolved": resolved, "sourceContributor": source or None}
 
 
 def op_get(conn, req):
@@ -254,8 +365,10 @@ def op_get(conn, req):
         (my_full, slug)).fetchall()
     cps = conn.execute(
         "SELECT slot, time FROM wiki_checkpoints WHERE slug=? ORDER BY slot", (slug,)).fetchall()
+    rev_opt = [c for c, _ in REVISION_OPT_COLUMNS if c in revision_columns(conn)]
+    rev_names = ["rev", "time", "contributor", "action", "summary"] + rev_opt
     revs = conn.execute(
-        "SELECT rev, time, contributor, action, summary FROM wiki_revisions WHERE slug=? ORDER BY rev DESC LIMIT 20",
+        "SELECT " + ", ".join(rev_names) + " FROM wiki_revisions WHERE slug=? ORDER BY rev DESC LIMIT 20",
         (slug,)).fetchall()
     return {"ok": True, "page": {
         "slug": slug, "familyPath": row[1], "fullPath": my_full,
@@ -263,8 +376,7 @@ def op_get(conn, req):
         "status": row[6], "revisions": row[7], "createdAt": row[8], "updatedAt": row[9],
         "children": [{"slug": s, "familyPath": f, "title": t} for s, f, t in children],
         "checkpoints": [{"slot": s, "time": t} for s, t in cps],
-        "recentRevisions": [{"rev": v, "time": t, "contributor": c, "action": a, "summary": s}
-                            for v, t, c, a, s in revs],
+        "recentRevisions": [dict(zip(rev_names, r)) for r in revs],
     }}
 
 
@@ -319,7 +431,7 @@ def op_move(conn, req):
     目标家族须已存在（full_path 命中），否则会产生孤儿——拒绝。"""
     slug = str(req.get("slug") or "").strip()
     newfp = str(req.get("newFamilyPath") or "").strip().strip("/")
-    contributor = resolve_contributor(str(req.get("contributor") or "未知").strip())
+    executor, resolved, source = attribution(req)
     now = int(time.time() * 1000)
     if not slug or not newfp:
         return {"ok": False, "error": "slug 与 newFamilyPath 必填"}
@@ -334,25 +446,42 @@ def op_move(conn, req):
     if not target:
         return {"ok": False, "error": f"目标家族不存在（防孤儿拒绝）: {newfp}"}
     old_prefix = old_full + "/"
+    if newfp == old_full:
+        return {"ok": False, "error": "不能把条目挂到它自己下面: " + newfp}
+    # 受影响集严格按**本函数文档**的口径：自身（full_path == 自身全路径）+ 后代（前缀匹配）。
+    # 2026-10-01 守夜人修：原谓词用的是 `family_path=? OR full_path LIKE ?`，与文档不符，后果是
+    #   ① 把「父条目」与「兄弟」一并卷进来（改挂子条目会连坐）；
+    #   ② 自身那条的全路径被算成 newfp，撞 wiki_pages.full_path 唯一约束 → 任何 move 都必然抛
+    #      IntegrityError、工具只回「无输出」。取证见 _tmp 证据（改动前备份与本文件同样复现）。
     affected = conn.execute(
-        "SELECT slug, family_path, full_path FROM wiki_pages WHERE family_path=? OR full_path LIKE ? ORDER BY full_path",
-        (old_family, old_prefix + "%")).fetchall()
-    for mslug, mfp, mfull in affected:
-        new_family = newfp if mfp == old_family else newfp + mfp[len(old_family):]
-        new_full = newfp + mfull[len(old_family):] if mfp == old_family else newfp + mfull[len(old_family):]
-        rev = next_rev(conn, mslug)
-        conn.execute(
-            "UPDATE wiki_pages SET family_path=?, full_path=?, revisions=?, updated_at=? WHERE slug=?",
-            (new_family, new_full, rev, now, mslug))
-        log_revision(conn, mslug, rev, now, contributor, "move",
-                     f"家族改挂：{mfp} → {new_family}", "")
-    conn.commit()
-    return {"ok": True, "slug": slug, "moved": len(affected)}
+        "SELECT slug, family_path, full_path FROM wiki_pages WHERE full_path = ? OR full_path LIKE ? ORDER BY full_path",
+        (old_full, old_prefix + "%")).fetchall()
+    # 平移基线：老全路径 old_full ↔ 新全路径 base_new（= 新父 + '/' + 自己）。
+    # ⚠ 后代必须相对 base_new 平移，不能相对 newfp——否则「子条目带着孙条目改挂」时
+    #   孙会被压到新父下面、与子平级（守夜人第一版修法就栽在这，被自建用例抓出）。
+    base_new = full_of(newfp, slug)
+    try:
+        for mslug, mfp, mfull in affected:
+            new_full = base_new + mfull[len(old_full):]
+            new_family = newfp if mfull == old_full else new_full.rsplit("/", 1)[0]
+            rev = next_rev(conn, mslug)
+            conn.execute(
+                "UPDATE wiki_pages SET family_path=?, full_path=?, revisions=?, updated_at=? WHERE slug=?",
+                (new_family, new_full, rev, now, mslug))
+            log_revision(conn, mslug, rev, now, executor, "move",
+                         annotate_fallback(f"家族改挂：{mfp} → {new_family}", resolved), "",
+                         executor_resolved=resolved, source_contributor=source)
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        conn.rollback()                    # 不留半截改挂（父/子路径不一致会造孤儿）
+        return {"ok": False, "error": "改挂失败（全路径冲突，已回滚）: %s" % e}
+    return {"ok": True, "slug": slug, "moved": len(affected),
+            "executor": executor, "executorResolved": resolved, "sourceContributor": source or None}
 
 
 def op_rollback(conn, req):
     slug = str(req.get("slug") or "").strip()
-    contributor = resolve_contributor(str(req.get("contributor") or "未知").strip())
+    executor, resolved, source = attribution(req)
     now = int(time.time() * 1000)
     # 审读⑥：slot 编号随保留规则重排不稳定——按 time 定位（slot 仅展示序号）
     t = req.get("time")
@@ -378,9 +507,12 @@ def op_rollback(conn, req):
     conn.execute(
         "UPDATE wiki_pages SET content=?, revisions=?, updated_at=? WHERE slug=?",
         (snap_content, rev, now, slug))
-    log_revision(conn, slug, rev, now, contributor, "rollback", f"回滚到检查点（原时间 {snap_time}）", snap_content)
+    log_revision(conn, slug, rev, now, executor, "rollback",
+                 annotate_fallback(f"回滚到检查点（原时间 {snap_time}）", resolved), snap_content,
+                 executor_resolved=resolved, source_contributor=source)
     conn.commit()
-    return {"ok": True, "slug": slug, "rev": rev, "restoredFromTime": snap_time}
+    return {"ok": True, "slug": slug, "rev": rev, "restoredFromTime": snap_time,
+            "executor": executor, "executorResolved": resolved, "sourceContributor": source or None}
 
 
 

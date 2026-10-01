@@ -9,7 +9,7 @@
  * 不是常驻服务，所以不需要 MCP 代理这一跳。
  */
 import { execFile, execFileSync, spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -24,7 +24,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
 
 /** 版本号（同时写进挂载日志，方便确认热注入拿到的是新代码而不是 ESM 缓存里的旧模块）。 */
-export const PLUGIN_VERSION = '1.0.0'
+export const PLUGIN_VERSION = '1.0.1'
 
 /** DSH 家目录（身份文件落在这里，与 Codex 侧凭据互不干扰）。 */
 export const DSH_HOME = process.env.DSH_HOME || join(HOME, '.dsh')
@@ -409,13 +409,14 @@ export function registerTools(ctx, cfg) {
       intro: { type: 'string', description: '内容介绍（检索消歧用）' },
       content: { type: 'string', description: '正文' },
       status: { type: 'string', enum: ['draft', 'stable', 'obsolete'], description: '条目状态（默认 draft/stable 按操作）' },
-      contributor: { type: 'string', description: '贡献者（独特名；缺省取会话工作区身份）' },
+      contributor: { type: 'string', description: '内容来源者（升格流的原作者/被引用贡献者）。注意：**执行者**永远由调用会话的绑定身份派生、不可覆盖（规则 7）' },
       summary: { type: 'string', description: '修订摘要' },
       time: { type: 'number', description: 'rollback：目标检查点的时间戳' },
     },
-    async execute(args) {
-      // 贡献者 v0：会话工作区身份（与被炉发言人推导同源）；独特名注册上线后切换
-      const req = { ...args, op: String(args.action || ''), contributor: String(args.contributor || cfg.workspace || '未知') }
+    async execute(args, exec) {
+      // 归因 v1（规则 7，2026-10-01）：执行者 = 调用会话绑定派生、**不可覆盖**；
+      // 工具参数 contributor 只作「内容来源者」别名。见 buildWikiRequest。
+      const req = buildWikiRequest(cfg, args, exec && exec.agent)
       const raw = await runHelperAsync(cfg, 'wiki_store', [], {
         timeoutMs: Math.max(15000, Number(cfg.memoryTimeoutMs) || 60000),
         stdin: JSON.stringify(req),
@@ -1806,6 +1807,9 @@ export const __test = {
   embedTexts,
   tagSignature,
   takeUnwrittenTurn,
+  // - 归因二分（规则 7）-
+  sessionHashFor,
+  buildWikiRequest,
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -2087,28 +2091,49 @@ function tagSignature(names) {
 let tagVecMemo = null   // { sig, names, dim, vecs: Float32Array, at }
 let tagVecBuilding = false
 
-/** 调本地嵌入服务（llama.cpp /v1/embeddings，qwen3-emb，1024 维）。 */
+/** 调本地嵌入服务（llama.cpp /v1/embeddings，qwen3-emb，1024 维）。
+ *  契约 v1.2 §2.2 / §3 对齐（2026-10-01 守夜人）：
+ *   ① **按 index 排序**再取向量，不依赖服务端保序。调用方按返回顺序把向量写进
+ *      Float32Array（buildTagVecCache / appendTagVecCache），顺序错位 = 标签与向量
+ *      **静默错配**，比报错难查得多；且两处调用方只校验 out.length === chunk.length，
+ *      长度对得上就照收，错序不会自己暴露。
+ *   ② 断连/重启窗口**带一次重试**再降级（此前一次失败即放弃本轮）。只对网络异常、
+ *      超时与 5xx 重试；**4xx 是确定性客户端错误（超预算/格式），不重试**。
+ *   失败仍返回 null，调用方的降级链（纯 tag / 跳过本轮）不变。 */
 async function embedTexts(cfg, texts, timeoutMs = 120000) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    const res = await fetch(cfg.diaryTagEmbedUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: cfg.diaryTagEmbedModel, input: texts.map(t => String(t).slice(0, 600)) }),
-      signal: controller.signal,
-    })
-    if (!res.ok) return null
-    const data = JSON.parse(await res.text())
-    const list = (data && data.data) || []
-    const vecs = list.map(d => d.embedding)
-    if (!vecs.length || !Array.isArray(vecs[0])) return null
-    return vecs
-  } catch {
-    return null
-  } finally {
-    clearTimeout(timer)
+  const body = JSON.stringify({ model: cfg.diaryTagEmbedModel, input: texts.map(t => String(t).slice(0, 600)) })
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const res = await fetch(cfg.diaryTagEmbedUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: controller.signal,
+      })
+      if (!res.ok) {
+        if (res.status >= 400 && res.status < 500) return null   // 确定性错误：重试无意义
+        throw new Error('HTTP ' + res.status)
+      }
+      const data = JSON.parse(await res.text())
+      const list = (data && data.data) || []
+      // 仅在每条都带整数 index 时重排；缺 index 的服务端保持原序（向后兼容）
+      const ordered = (list.length && list.every((d) => Number.isInteger(d && d.index)))
+        ? list.slice().sort((a, b) => a.index - b.index)
+        : list
+      const vecs = ordered.map(d => d.embedding)
+      if (!vecs.length || !Array.isArray(vecs[0])) throw new Error('返回体无有效向量')
+      return vecs
+    } catch (e) {
+      if (attempt === 2) return null
+      activeLogger?.warn?.(`[dsh-liubian] 嵌入请求失败（${(e && e.message) || e}），重试一次`)
+      await new Promise((r) => setTimeout(r, 300))
+    } finally {
+      clearTimeout(timer)
+    }
   }
+  return null
 }
 
 /** 读缓存文件。**只校验维度和体量，不校验标签集合** —— 集合差集由调用方算
@@ -2530,6 +2555,31 @@ export function resolveDiaryWorkspace(cfg, agent) {
   return cfg.workspace
 }
 
+/** 会话哈希：SHA256(sessionId) 前 8 位十六进制。
+ *  ⚠ 与基建 `sessionHashFor` / 被炉 `idFor` **同源同配方**（标准 §8：跨接口标识必须同一派生函数）。
+ *  这里是插件内本地实现（插件之间不互相 import），配方由桩测用独立计算的期望值钉住。 */
+export function sessionHashFor(sessionId) {
+  return createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 8)
+}
+
+/** 组装 wiki 工具的 helper 请求（纯函数，便于桩测）。
+ *  归因二分（〈升格流落树约定〉规则 7，2026-10-01 定稿）：
+ *    · 执行者由**调用会话**派生（sessionHash → 注册中心 bindings），不可由传参覆盖；
+ *    · 工具参数 `contributor` 只作「内容来源者」别名传递（升格流的原作者/被引用者）。
+ *  无会话上下文（内部调用/测试）时 sessionHash 为空串 → helper 侧走工作区兜底并标记。 */
+export function buildWikiRequest(cfg, args, agent) {
+  const a = args || {}
+  const sessionId = String((agent && agent.session && agent.session.id) || '')
+  const explicit = a.contributor != null ? String(a.contributor).trim() : ''
+  return {
+    ...a,
+    op: String(a.action || ''),
+    sourceContributor: explicit,
+    sessionHash: sessionId ? sessionHashFor(sessionId) : '',
+    workspace: resolveDiaryWorkspace(cfg, agent),
+  }
+}
+
 /* - 日志 / 待补队列 ------------------------------------------------------------ */
 
 function appendJsonl(file, obj) {
@@ -2868,6 +2918,6 @@ export function apply(ctx, input = {}) {
   ctx.effect(() => () => disposeContextInjection(), 'dsh-liubian: 清理上下文插入状态')
 
   ctx.logger?.info?.(
-    `[dsh-liubian] v${PLUGIN_VERSION} 流变系统已挂载：工具前缀 ${TOOL_PREFIX}，默认工作区}${cfg.workspace}」，后端 ${cfg.memoryScript}`,
+    `[dsh-liubian] v${PLUGIN_VERSION} 流变系统已挂载：工具前缀 ${TOOL_PREFIX}，默认工作区 ${cfg.workspace}，后端 ${cfg.memoryScript}`,
   )
 }
