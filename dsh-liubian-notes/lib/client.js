@@ -187,7 +187,9 @@ window.__ModuleLoader__.load({
         body)
     }
 
-    exports.inject = ['slots']
+    /* 客户端服务声明（结构照 ui-trajectory 的 `const inject = [...]`）：
+     * 只声明真正用到的——slots（插槽注册）+ sessions（在 inject(sessionId) 里解析会话绑定）。 */
+    exports.inject = ['slots', 'sessions']
     exports.apply = function (ctx) {
       ctx.effect(function () {
         var style = document.createElement('style')
@@ -197,15 +199,29 @@ window.__ModuleLoader__.load({
         return function () { style.remove() }
       }, 'liubian-notes: styles')
 
-      // 入口：对话视图栏（与 对话 / 对话上下文轨迹 并排的「流变便签」栏）
-      // inject(sessionId) 由插槽框架传入当前会话 id → 面板据此显示**本对话自己的池**（跟对话走）。
+      /* 入口：对话视图栏（与「对话」「对话上下文轨迹」并排的「流变便签」栏）。
+       * 结构照 **ui-trajectory**（而不是从 ui-conversation 内部抠 renderSlot 细节）：
+       *   ① 需要的客户端服务在 exports.inject 里声明（这里只用 slots + sessions）；
+       *   ② 插槽注册项按官方契约给 id/order/label（`dsh-cordis-client-runner` 的槽位契约表
+       *      source: ui-conversation/src/client/contract/slots.ts:185）；
+       *   ③ 在当前会话上下文里解析绑定（轨迹 L8746 `inject: (sessionId) => {
+       *      const session = ctx.sessions.binding(sessionId)?.session ... }`）——
+       *      取不到**不抛**（面板自行显示错误态，不像轨迹那样 throw 拖垮整个视图）。
+       * 注：`sessionId` 也是该槽位的标准 prop（框架自动传给组件），两条路都通向同一个 id。 */
       ctx.slots.inject('conversation.view', function () {
         return ctx.slots.register({
           name: 'conversation.view',
           id: 'notes',
           order: 20,
           label: '流变便签',
-          inject: function (sessionId) { return { sessionId: sessionId } },
+          inject: function (sessionId) {
+            var live = false
+            try {
+              var binding = ctx.sessions && typeof ctx.sessions.binding === 'function' ? ctx.sessions.binding(sessionId) : null
+              live = !!(binding && binding.session)
+            } catch (e) { live = false }
+            return { sessionId: sessionId, sessionLive: live }
+          },
         }, NotesApp)
       })
     }

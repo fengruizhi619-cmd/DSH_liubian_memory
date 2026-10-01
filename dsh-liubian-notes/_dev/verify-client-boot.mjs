@@ -56,14 +56,17 @@ try { returned = captured.factory(requireStub) } catch (e) { threw = e }
 say('factory 执行不抛错', !threw, threw ? String(threw.message) : 'ok')
 say('★ factory 返回模块导出（根因判据）', !!returned && typeof returned === 'object', '返回类型=' + (returned === undefined ? 'undefined（加载器将 boot 失败）' : typeof returned))
 say('导出含 inject', !!returned && Array.isArray(returned.inject) && returned.inject.includes('slots'), returned && JSON.stringify(returned.inject))
+say('服务声明含 sessions（轨迹式声明）', !!returned && Array.isArray(returned.inject) && returned.inject.includes('sessions'), returned && JSON.stringify(returned.inject))
 say('导出含 apply 函数', !!returned && typeof returned.apply === 'function', returned && typeof returned.apply)
 
-// 运行期形态：apply 拿桩 ctx 应能注册槽位样式与 conversation.view，且**插槽带会话绑定**
+// 运行期形态：apply 拿桩 ctx 应注册 conversation.view，且插槽带**轨迹式会话绑定**
 const registered = []
 let capturedDef = null
 let capturedComp = null
 const ctxStub = {
   effect: (fn) => { fn(); return () => {} },
+  // 轨迹式：inject(sessionId) 内用 ctx.sessions.binding(sessionId)?.session 判断会话是否可用
+  sessions: { binding: (id) => (id === 'sess-live' ? { session: { id } } : undefined) },
   slots: {
     inject: (name, fn) => { const it = fn(); registered.push(name); return it },
     register: (def, comp) => { capturedDef = def; capturedComp = comp; return { def, comp } },
@@ -76,9 +79,12 @@ say('注册项声明 id/order/label', !!capturedDef && capturedDef.id === 'notes
   capturedDef ? ('id=' + capturedDef.id + ' order=' + capturedDef.order + ' label=' + capturedDef.label) : 'undefined')
 say('★ 插槽带会话绑定 inject(sessionId)', !!capturedDef && typeof capturedDef.inject === 'function',
   capturedDef ? typeof capturedDef.inject : 'undefined')
-say('inject 回传当前会话 id', !!capturedDef && typeof capturedDef.inject === 'function'
-  && capturedDef.inject('sess-x').sessionId === 'sess-x',
-  capturedDef && typeof capturedDef.inject === 'function' ? JSON.stringify(capturedDef.inject('sess-x')) : '-')
+say('inject 回传会话 id + 存活标记', !!capturedDef && typeof capturedDef.inject === 'function'
+  && capturedDef.inject('sess-live').sessionId === 'sess-live' && capturedDef.inject('sess-live').sessionLive === true,
+  capturedDef && typeof capturedDef.inject === 'function' ? JSON.stringify(capturedDef.inject('sess-live')) : '-')
+say('取不到绑定时不抛错（降级）', !!capturedDef && typeof capturedDef.inject === 'function'
+  && (function () { try { const r = capturedDef.inject('sess-dead'); return r.sessionId === 'sess-dead' && r.sessionLive === false } catch (e) { return false } })(),
+  capturedDef && typeof capturedDef.inject === 'function' ? JSON.stringify(capturedDef.inject('sess-dead')) : '-')
 say('组件是函数（可挂载）', typeof capturedComp === 'function', typeof capturedComp)
 
 const bad = out.filter((r) => !r.ok)
