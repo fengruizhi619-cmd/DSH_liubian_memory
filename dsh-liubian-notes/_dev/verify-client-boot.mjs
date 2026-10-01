@@ -35,9 +35,9 @@ const say = (name, ok, detail) => out.push({ name, ok: !!ok, detail })
 say('顶层调用了 __ModuleLoader__.load', !!captured, captured ? 'id=' + captured.id : '未捕获')
 say('注册 id 与包名一致', captured && captured.id === 'dsh-liubian-notes', captured && captured.id)
 
-// 桩 require：只需 react 的最小面（组件体内才用 hooks，工厂阶段不调用）
+// 桩 require：react 最小面（createElement 记录 type/props，供双视图断言；组件体内才用 hooks）
 const reactStub = {
-  createElement: () => ({}),
+  createElement: (type, props) => ({ type, props: props || {} }),
   useState: (v) => [v, () => {}],
   useEffect: () => {},
   useRef: (v) => ({ current: v }),
@@ -88,7 +88,21 @@ say('inject 回传会话 id + 存活标记', !!viewDef && typeof viewDef.inject 
 say('取不到绑定时不抛错（降级）', !!viewDef && typeof viewDef.inject === 'function'
   && (function () { try { const r = viewDef.inject('sess-dead'); return r.sessionId === 'sess-dead' && r.sessionLive === false } catch (e) { return false } })(),
   viewDef && typeof viewDef.inject === 'function' ? JSON.stringify(viewDef.inject('sess-dead')) : '-')
-say('组件是函数（可挂载）', typeof comps['conversation.view'] === 'function', typeof comps['conversation.view'])
+say('设置页组件是函数', typeof comps['settings.plugins.tab'] === 'function', typeof comps['settings.plugins.tab'])
+
+/* 插件页卡片：plugins.item（「插件」页列表里流变便签自己的卡片 + 点开后的设置表单） */
+const itemDef = defs['plugins.item']
+const itemComp = comps['plugins.item']
+say('★ 注册 plugins.item（便签自己的卡片）', !!itemDef && itemDef.id === 'dsh-liubian-notes' && itemDef.label === '流变便签',
+  itemDef ? ('id=' + itemDef.id + ' label=' + itemDef.label) : '（未注册）')
+say('插件卡片组件是函数', typeof itemComp === 'function', typeof itemComp)
+if (typeof itemComp === 'function') {
+  const summaryEl = itemComp({ view: 'summary' })
+  const pageEl = itemComp({ view: 'page' })
+  say('summary 视图 = 一行简介（span）', !!summaryEl && summaryEl.type === 'span', 'type=' + summaryEl.type)
+  say('page 视图 = 设置表单组件', !!pageEl && typeof pageEl.type === 'function' && pageEl.type === comps['settings.plugins.tab'],
+    'type===' + (pageEl && typeof pageEl.type))
+}
 
 /* 设置页：settings.plugins.tab（流变便签 · 聚合 API 配置） */
 const setPageDef = defs['settings.plugins.tab']
