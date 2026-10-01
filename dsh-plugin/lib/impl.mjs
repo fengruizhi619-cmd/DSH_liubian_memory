@@ -1205,15 +1205,15 @@ export async function generateLessons(cfg, { count = 8, log, scope = 'global', w
 async function takeProfileMessage(cfg, agent) {
   const state = contextStateFor(agent?.session)
   if (state.profileDelivered) return null
-  if (!state.profilePromise) state.profilePromise = profileBlockCached(cfg)
-  const block = await state.profilePromise
-  // 教训块的注入已于 2026-09-19 移交流变·孪生（lessons*.json 数据与本插件的
-  // lessons CLI / generate 不动）；这里只剩 身份卡 + 能力卡。
+  // 身份卡（buildProfileBlock：写日记匿名/日记规模/检索说明）已于 2026-10-01 随旧日记
+  // 退役一并移除——wiki 注入块自带用法，独特名绑定覆盖工作区归属，卡片无存留价值。
+  // 本函数现在只投递**能力卡**（会话开始提醒扩展能力），并维持 profileDelivered 门控
+  // 能力卡周期重注的计数起点。
   const capabilities = buildCapabilitiesBlock(cfg)   // 能力卡：会话开始提醒有哪些扩展能力
-  if (!block && !capabilities) return null
+  if (!capabilities) return null
   state.profileDelivered = true
   state.lessonsCounter = 0   // 首次注入后开始计轮（该计数器现服务于能力卡周期重注）
-  return pluginMessage([block, capabilities].filter(Boolean).join('\n\n'), 'recall')
+  return pluginMessage(capabilities, 'recall')
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -1679,8 +1679,8 @@ async function memoryMessageFor(ctx, cfg, agent, messages, signal) {
 
 export function mountContextInjection(ctx, cfg) {
   ctx.logger?.info?.(
-    `[dsh-liubian] 上下文插入：身份卡=${cfg.profileInject ? '开' : '关'}`
-    + ` 两级检索注入=${cfg.memoryInject ? `开（主线 ${cfg.memorySeedTop} + 各 ${cfg.memoryRelatedPerSeed} 关联，封顶 ${cfg.memoryTopN}）` : '关'}`
+    `[dsh-liubian] 上下文插入：能力卡=${cfg.profileInject ? '开' : '关'}`
+    + ` wiki 注入=${cfg.memoryInject && cfg.memoryWikiInject ? '开' : '关'}`
     + ` 消息构造器=${createUserMessageFn ? 'dsh-llm' : '内置回退'}`,
   )
 
