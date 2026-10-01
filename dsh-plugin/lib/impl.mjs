@@ -109,6 +109,7 @@ export const DEFAULTS = {
   memorySkillTimeoutMs: 30000,
   memoryTagHints: 100,       // 送给模型的标签候选个数（写日记同款：语义选前 N）
   memoryTimeoutMs: 120000,   // 本地向量 + helper 的超时（helper 首次要读 6114 篇向量，给足）
+  memoryWikiInject: true,    // S4：wiki 条目随轮注入（家族树知识库，简介锚语义匹配；false = 只注旧日记）
   // ── 检索侧外部 API（与写日记**分开的 key**）──
   // 用途只有一处：联合检索里"让模型从候选标签里挑 N 个 tag"那一次调用（screenQueryTags）。
   // 用户 2026-09-12 要求检索走另一把 key（基址同 DeepSeek）。留空则回退用写日记那把 key。
@@ -1669,6 +1670,28 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     else if ((tagSide.skills || []).length) log?.info?.(`[dsh-liubian] 意图路由挑了 ${tagSide.skills.join('、')} 但均已注入过/黑名单，本轮跳过`)
   }
   const tail = [skillBlock, taskSkillBlock, autoSkill].filter(Boolean).join('\n\n')
+  // ── S4：wiki 条目注入（家族树知识库，与日记注入并行；失败不阻塞日记路）──
+  let wikiBlock = ''
+  if (cfg.memoryWikiInject && vec.length) {
+    try {
+      const wraw = await runHelperAsync(cfg, 'wiki_store', [], {
+        stdin: JSON.stringify({ op: 'search', vec, top: 8 }),
+        timeoutMs: Math.max(30000, Number(cfg.memoryTimeoutMs) || 60000),
+      })
+      const wj = JSON.parse(String(wraw || '').trim())
+      if (wj && wj.ok && Array.isArray(wj.results) && wj.results.length) {
+        const wl = [`<liubian-wiki hits="${wj.results.length}">`,
+          '说明：wiki 知识条目（家族树语义匹配，简介为锚）。全文与修订史用 _dsh_external_dsh_liubian_wiki action=get slug=... 取。']
+        for (const r of wj.results) {
+          wl.push(`【${r.slug}】${r.title} [${r.score}]`)
+          wl.push(`  家族: ${r.full_path}｜状态: ${r.status}｜${String(r.intro || '').slice(0, 160)}`)
+        }
+        wl.push('</liubian-wiki>')
+        wikiBlock = wl.join('\n')
+        log?.info?.(`[dsh-liubian] wiki 注入 ${wj.results.length} 条（top1 ${wj.results[0].slug} score=${wj.results[0].score}）`)
+      }
+    } catch (e) { log?.warn?.(`[dsh-liubian] wiki 注入失败（不影响日记注入）: ${e?.message || e}`) }
+  }
   log?.info?.(
     `[dsh-liubian] 两级检索命中 ${final.length} 篇（主线 ${seeds.length} + 关联 ${relatedRows.length}）注入 ${block.length} 字`
     + `（模型挑 tag：${tagSide.tags.join('|') || '无'}｜候选 ${picked.tags.length} 个/${picked.mode}`
@@ -1677,8 +1700,9 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     + `｜技能命中 ${skillHits.length} 个${skillHits.length ? '：' + skillHits.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、') : ''}`
     + `｜${Date.now() - t0}ms）`,
   )
+  const fullBlock = [wikiBlock, block, tail].filter(Boolean).join('\n\n')
   return {
-    block: tail ? `${block}\n\n${tail}` : block,
+    block: fullBlock,
     results: final,
     skills: skillHits,
     tags: tagSide.tags,

@@ -381,12 +381,68 @@ def op_rollback(conn, req):
 
 
 
-def op_search(conn, req):
-    """S4 分级向量检索（银杏骨架 v0.1 + 双余弦加权）。
+VEC_CACHE_FILE = os.path.join(os.path.expanduser("~/.dsh/liubian"), "wiki_vectors.json")
 
-    查询向量 vs 全部条目（简介锚为主通道），按家族树逐层聚合注入。
-    返回注入块结构：roots（stable 根）+ 按根分组的 top-K 条目（简介行）+ 命中数。
-    消费方（impl.mjs）拿 JSON 后拼注入块。"""
+
+def _load_vec_cache():
+    try:
+        with open(VEC_CACHE_FILE, encoding="utf-8") as f:
+            return json.loads(f.read())
+    except Exception:
+        return {}
+
+
+def _save_vec_cache(cache):
+    os.makedirs(os.path.dirname(VEC_CACHE_FILE), exist_ok=True)
+    tmp = VEC_CACHE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f)
+    os.replace(tmp, VEC_CACHE_FILE)
+
+
+def _embed_batch(texts):
+    """批量嵌入（契约 §2.2：单批 ≤64、按 index 排序取回）。"""
+    import urllib.request
+    out = []
+    for i in range(0, len(texts), 64):
+        chunk = texts[i:i + 64]
+        payload = json.dumps({"model": "qwen3-emb", "input": [t[:4000] for t in chunk]}).encode("utf-8")
+        rq = urllib.request.Request(
+            "http://127.0.0.1:8082/v1/embeddings", data=payload,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(rq, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for d in sorted(data["data"], key=lambda x: x["index"]):
+            out.append(d["embedding"])
+    return out
+
+
+def _intro_vectors(conn):
+    """全部条目的简介向量：按 (slug, intro哈希) 命中持久缓存；缺失/变更的批量补嵌（一次 HTTP）。"""
+    rows = conn.execute(
+        "SELECT slug, title, intro, content, status, revisions, updated_at, family_path, full_path"
+        " FROM wiki_pages ORDER BY full_path").fetchall()
+    cache = _load_vec_cache()
+    need = []
+    for r in rows:
+        slug = r[0]
+        text = r[2] or r[1] or ""
+        h = hashlib.md5(text.encode("utf-8")).hexdigest()
+        c = cache.get(slug)
+        if not c or c.get("h") != h:
+            need.append((slug, text, h))
+    if need:
+        vecs = _embed_batch([t for _, t, _ in need])
+        for (slug, text, h), v in zip(need, vecs):
+            cache[slug] = {"h": h, "vec": v}
+        _save_vec_cache(cache)
+    return rows, cache
+
+
+def op_search(conn, req):
+    """S4 分级向量检索：查询向量 vs 全部条目简介锚（向量持久缓存，批量补嵌）。
+
+    返回 top-K 条目（slug/title/intro/full_path/score/...），消费方（impl.mjs）拼注入块。"""
     qv = req.get("vec") or []
     top = max(1, int(req.get("top") or 10))
     if not qv or len(qv) < 64:
@@ -397,51 +453,25 @@ def op_search(conn, req):
         return {"ok": False, "error": "查询向量全零"}
     qv = [x / qn for x in qv]
 
-    # 全量条目 + 简介余弦
-    rows = conn.execute(
-        "SELECT slug, family_path, full_path, title, intro, content, status, revisions, updated_at"
-        " FROM wiki_pages ORDER BY full_path").fetchall()
+    rows, cache = _intro_vectors(conn)
     scored = []
     for r in rows:
-        slug, fp, full, title, intro, content, status, revs, upd = r
-        iv = embed_text_cached(intro or title or "")
-        if iv is None:
+        slug, fp, full, title, intro = r[0], r[1], r[2], r[3], r[4]
+        c = cache.get(slug)
+        if not c:
             continue
+        iv = c["vec"]
         ivn = sum(x * x for x in iv) ** 0.5
         if ivn == 0:
             continue
         iv = [x / ivn for x in iv]
         cos = sum(a * b for a, b in zip(qv, iv))
         scored.append({"slug": slug, "family_path": fp, "full_path": full,
-                       "title": title, "intro": intro, "content": content,
-                       "status": status, "revisions": revs, "updated_at": upd,
+                       "title": title, "intro": intro, "content": r[5],
+                       "status": r[6], "revisions": r[7], "updated_at": r[8],
                        "score": round(cos, 4)})
     scored.sort(key=lambda x: -x["score"])
-    top_entries = scored[:top]
-    return {"ok": True, "total": len(scored), "results": top_entries}
-
-
-def embed_text_cached(text):
-    """本地嵌入（调 wiki_export 同款 8082 服务），带进程级缓存。"""
-    cache_key = hash(text)
-    if cache_key in _embed_cache:
-        return _embed_cache[cache_key]
-    try:
-        import urllib.request
-        payload = json.dumps({"model": "qwen3-emb", "input": [text[:4000]]}).encode("utf-8")
-        req = urllib.request.Request(
-            "http://127.0.0.1:8082/v1/embeddings", data=payload,
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        vec = data["data"][0]["embedding"]
-        _embed_cache[cache_key] = vec
-        return vec
-    except Exception:
-        return None
-
-
-_embed_cache = {}
+    return {"ok": True, "total": len(scored), "results": scored[:top]}
 
 OPS = {
     "create": op_create,
