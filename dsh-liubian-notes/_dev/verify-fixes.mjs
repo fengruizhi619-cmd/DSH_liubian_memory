@@ -342,6 +342,44 @@ const cfg = T.resolveConfig({})
   check('🔴-9 last-active 链已彻底移除（0 引用，含注释）', leftover.length === 0, '残留=' + (leftover.join('/') || '无'))
 }
 
+/* v0.6.0-a：任何形式的唤醒都算一轮（撤回 M4 的「只收含人类内容的轮」） */
+{
+  check('v0.6.0 唤醒轮入窗（assistant-only）', T.shouldSealTurn({ turn: 1, human: [], assistant: ['答'] }) === true, '')
+  check('v0.6.0 人类轮入窗', T.shouldSealTurn({ human: ['问'], assistant: [] }) === true, '')
+  check('v0.6.0 空轮/坏值不入窗', T.shouldSealTurn({ human: [], assistant: [] }) === false && T.shouldSealTurn(null) === false, '')
+  check('v0.6.0 全唤醒窗不空头（回退头取答首行）',
+    T.buildAutoHead([{ turn: 1, human: [], assistant: ['我在处理被炉的消息'] }]).indexOf('（空窗口）') < 0, '')
+  /* maybeAggregate：全唤醒窗也能凑满 R。用 noteLlmGen=false 走拼接回退，不碰网络。 */
+  const s = 'sess-v060-wake-window'
+  const k = K(s)
+  const turns = Array.from({ length: 5 }, (_, i) => ({ turn: i + 1, human: [], assistant: ['唤醒应答 ' + (i + 1)], tools: [] }))
+  T.savePool(basePool(k, { sessionId: s, sealed: turns }))
+  const made = await T.maybeAggregate(T.loadPool(k, s), Object.assign({}, cfg, { noteLlmGen: false }), 5, null)
+  check('v0.6.0 全唤醒窗凑满 R 即聚合（不再被丢弃）', made >= 1, 'made=' + made)
+}
+
+/* v0.6.0-b：unqueue —— queued 原本单向态，这是唯一缓存一致的修复路径 */
+{
+  const s = 'sess-v060-unqueue'
+  const k = K(s)
+  T.savePool(basePool(k, {
+    sessionId: s,
+    notes: [{ id: 'NT-1', source: 'auto', status: 'queued', head: 'h1', body: 'b1', born_turn: 1, heat: [] }],
+  }))
+  fs.mkdirSync(path.dirname(T.pendingPromotionsFile()), { recursive: true })
+  fs.writeFileSync(T.pendingPromotionsFile(),
+    JSON.stringify({ queued_at: 'x', session_key: k, id: 'NT-1', head: 'h1', workspace: '中枢', tags: ['便签升格'] }) + '\n', 'utf8')
+  await T.noteToolAction(cfg, { action: 'unqueue', id: 'NT-1', session: s }, null)
+  check('v0.6.0 unqueue：池内 queued→active', T.loadPool(k, s).notes[0].status === 'active',
+    'status=' + T.loadPool(k, s).notes[0].status)
+  check('v0.6.0 unqueue：pending 队列条目已摘除', T.pendingHasId(k, 'NT-1') === false, '')
+  const again = await T.noteToolAction(cfg, { action: 'unqueue', id: 'NT-1', session: s }, null)
+  check('v0.6.0 unqueue 幂等（再调只回跳过）', /跳过/.test(again) && T.loadPool(k, s).notes[0].status === 'active', String(again).slice(0, 22))
+  T.loadPool(k, s).notes[0].status = 'submitted'
+  const refused = await T.noteToolAction(cfg, { action: 'unqueue', id: 'NT-1', session: s }, null)
+  check('v0.6.0 unqueue：已固化拒绝退回', /拒绝/.test(refused) && T.loadPool(k, s).notes[0].status === 'submitted', String(refused).slice(0, 22))
+}
+
 /* 🔴-8 真行为回归（**放在最后**：它会真的 apply 并最终 dispose，之后本进程不再能落盘）：
  * `ctx.effect(fn)` 的 fn 是「立即执行」的注册面，f返回的函数才是清理器。
  * 旧 bug：`disposed = true` 写在 fn 体里 → 实例**挂载瞬间即自我标记已卸载** →

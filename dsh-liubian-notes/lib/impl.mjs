@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.5.7'
+export const PLUGIN_VERSION = '0.6.0'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -375,9 +375,12 @@ export function buildNoteBody(turns) {
   }).join('\n')
 }
 
-/** 回退用头：各轮提问首行拼接。 */
+/** 回退用头：各轮「提问首行」拼接；**无人类内容的轮（唤醒轮）改用答首行**——
+ *  v0.6.0 起唤醒轮也参与聚合，只取 human 会让全唤醒窗得到「（空窗口）」。 */
 export function buildAutoHead(turns, maxChars = 120) {
-  const parts = turns.map(t => firstLine((t.human || []).join(' '), 40)).filter(Boolean)
+  const parts = turns
+    .map(t => firstLine((t.human || []).join(' '), 40) || firstLine((t.assistant || []).join(' '), 40))
+    .filter(Boolean)
   const head = parts.join('；')
   return head.length > maxChars ? head.slice(0, maxChars) + '…' : (head || '（空窗口）')
 }
@@ -558,10 +561,12 @@ export async function maybeAggregate(pool, cfg, nowTurn, logger) {
   let rejected = 0
   while (true) {
     const window = []
+    /* v0.6.0：**不再丢弃无人类内容的轮**。旧实现在这里把唤醒轮 `shift` 掉——等于白封存、
+     *  聚合永远只吃人类轮。现在任何内容轮都参与凑满 R；只丢 null 这类坏数据。 */
     while (pool.sealed.length && window.length < cfg.aggregateRounds) {
-      const t = pool.sealed[0]
-      if (!t || !(t.human || []).length) { pool.sealed.shift(); continue }
-      window.push(pool.sealed.shift())
+      const t = pool.sealed.shift()
+      if (!t) continue
+      window.push(t)
     }
     if (window.length < cfg.aggregateRounds) {
       pool.sealed.unshift(...window)
@@ -713,6 +718,32 @@ export function pendingHasId(sessionKey, id) {
   } catch { return false }
 }
 
+/** v0.6.0：把一条 pending 条目从队列里摘掉（unqueue 的配套）。jsonl 无唯一键 → 整表重写。
+ *  返回被摘掉的条数；**-1 = 写失败**（调用方必须如实回告，不得假装成功）。 */
+export function removePendingEntry(sessionKey, id) {
+  const wantId = String(id || '')
+  if (!wantId) return 0
+  const file = pendingPromotionsFile()
+  if (!existsSync(file)) return 0
+  let lines = []
+  try { lines = readFileSync(file, 'utf8').split('\n').filter(Boolean) } catch { return -1 }
+  const keep = []
+  let removed = 0
+  for (const line of lines) {
+    let e = null
+    try { e = JSON.parse(line.replace(/^\uFEFF/, '')) } catch { keep.push(line); continue }
+    if (e && String(e.id) === wantId && (!sessionKey || String(e.session_key) === String(sessionKey))) { removed += 1; continue }
+    keep.push(line)
+  }
+  if (!removed) return 0
+  try {
+    const tmp = `${file}.tmp-${process.pid}`
+    writeFileSync(tmp, keep.join('\n') + '\n', 'utf8')
+    renameSync(tmp, file)
+    return removed
+  } catch { return -1 }
+}
+
 /** 升格标签：便签升格 + 会话工作区名 + 2~3 个内容关键词（补位去重，复用型填充）。 */
 export function buildPromoteTags(head, workspace) {
   const words = String(head || '')
@@ -841,6 +872,28 @@ export async function noteToolAction(cfg, args = {}, logger, exec = null) {
       return `已缓存待固化：${note.id} → pending_promotions.jsonl（标签 ${entry.tags.join('/')}）。`
         + `通道就绪（被炉 P2P + 独特名）前只累积不提交。`
         + (savedOk ? '' : '（⚠ 池状态落盘失败：队列条目已在，池内状态仅内存生效，下轮写入会重试）')
+    })
+  }
+
+  /* v0.6.0（管理员 2026-10-01，选项 a）：**解除待固化**。
+   * queued 原本是单向态（promote 只能置位、drop 对 queued 明确拒绝），串池误标后工具面无法修复。
+   * 本动作是唯一**缓存一致**的修复路径：在宿主内改内存对象再落盘，不会像"直接改 pools/*.json"
+   * 那样被活会话的内存快照静默回滚（loadPool 命中缓存直接返回，不比对 mtime）。 */
+  if (action === 'unqueue') {
+    return withPoolLock(pool.sessionKey, async () => {
+      const note = pool.notes.find(n => n.id === String(args.id || ''))
+      if (!note) return `[未找到] 便签 ${args.id}。`
+      if (note.status === 'submitted') {
+        return `[拒绝] ${note.id} 已固化（${note.diary_ref || '已提交'}），不能退回 active——如需重做请走 wiki 侧修订。`
+      }
+      const wasQueued = note.status === 'queued'
+      const removed = removePendingEntry(pool.sessionKey, note.id)
+      if (removed < 0) return '[失败] 写 pending_promotions.jsonl 未成功（池状态未改，可重试）。'
+      if (!wasQueued && !removed) return `[跳过] ${note.id} 本来就不是 queued（池内 ${note.status}，队列里也没有它）。`
+      note.status = 'active'
+      const savedOk = savePool(pool)
+      return `已解除待固化：${note.id}（池内 queued→active；队列摘除 ${removed} 条）。可以重新 promote。`
+        + (savedOk ? '' : '（⚠ 池状态落盘失败：仅内存生效，下轮写入会重试）')
     })
   }
 
@@ -1172,9 +1225,9 @@ function register(ctx, def) {
   ctx.effect(() => ctx.tools.register(tool), TOOL_PREFIX + def.name)
 }
 
-/** 每轮人声文本量进 meta（定 R 的统计口径：human+assistant 字符 / 轮）。
- *  M4（2026-10-01）：另记 humanRounds（含人类内容的轮数）——聚合窗口只吃人类轮，
- *  而内容轮（被炉唤醒等无人类内容的轮）会把 rounds 推高却不进窗，两个口径分开记。 */
+/** 每轮文本量进 meta（定 R 的统计口径：human+assistant 字符 / 轮）。
+ *  v0.6.0（2026-10-01）：聚合窗口已改为**吃全部内容轮**（任何形式的唤醒都算一轮）；
+ *  humanRounds 仅保留为「其中含人类内容的轮数」这一统计口径，不再参与窗口过滤。 */
 export function bumpStats(pool, t) {
   const h = (t.human || []).join('').length
   const a = (t.assistant || []).join('').length
@@ -1186,10 +1239,16 @@ export function bumpStats(pool, t) {
   return true
 }
 
-/** M4：只有含人类内容的轮才进封存窗口。无人类内容的轮（房间唤醒等）对聚合零贡献，
- *  过去它们会占满 sealed 的 16 上限并从最旧开始挤掉人类轮（静默丢窗隐患）。 */
+/** 轮 = **任何形式的唤醒**（被炉 @ / 留言板 / P2P 等无人类内容的轮也算），不再只算人类对话轮。
+ *  v0.6.0（管理员 2026-10-01 指示）：撤回 M4 的「只收含人类内容的轮」口径——唤醒轮同样入窗、
+ *  同样参与凑满 R（见 maybeAggregate 与 pre-step 的聚合调度）。
+ *  ⚠ 已知代价（管理员明示接受）：唤醒密集的会话会更快填满 sealed 上限（16）并从最旧开始挤掉
+ *  人类轮；超限丢弃仍会 warn 留痕，**不静默**。 */
 export function shouldSealTurn(turn) {
-  return !!(turn && Array.isArray(turn.human) && turn.human.length > 0)
+  if (!turn) return false
+  const h = Array.isArray(turn.human) ? turn.human.length : 0
+  const a = Array.isArray(turn.assistant) ? turn.assistant.length : 0
+  return !!(h || a)
 }
 
 export function apply(ctx, input = {}) {
@@ -1207,10 +1266,11 @@ export function apply(ctx, input = {}) {
     name: 'note',
     description: '流变·便签（本对话的短期记忆池）。action=list 看池+热度；show 读全文；'
       + 'stick 主动挂起便签（head=一句话简介即向量来源，body=正文；与自动便签同规则）；'
-      + 'promote 手动晋级（当前为缓存制：入 pending 队列等固化通道）；drop/restore 回收站。'
+      + 'promote 手动晋级（当前为缓存制：入 pending 队列等固化通道）；'
+      + 'unqueue 解除待固化（queued→active 并摘除 pending 条目，串池误标后的修复路径）；drop/restore 回收站。'
       + '默认操作本对话的池（＝调用方会话）；session 可选，用于显式指定别的会话。',
     parameters: {
-      action: { type: 'string', required: true, description: 'list | show | stick | promote | drop | restore', enum: ['list', 'show', 'stick', 'promote', 'drop', 'restore'] },
+      action: { type: 'string', required: true, description: 'list | show | stick | promote | unqueue | drop | restore', enum: ['list', 'show', 'stick', 'promote', 'unqueue', 'drop', 'restore'] },
       head: { type: 'string', description: 'stick 用：便签头（一句话简介，向量来源）' },
       body: { type: 'string', description: 'stick 用：便签正文' },
       id: { type: 'string', description: 'show/promote/drop/restore 用：便签 ID，如 NT-1' },
@@ -1263,7 +1323,7 @@ export function apply(ctx, input = {}) {
         case 'turn/end': {
           if (!pool.current) break
           const ended = pool.current                       // 先留引用（下面会置空）
-          const sealedNow = shouldSealTurn(ended)           // M4：无人类内容的轮不入窗
+          const sealedNow = shouldSealTurn(ended)           // v0.6.0：任何形式的唤醒都算一轮
           if (sealedNow) {
             pool.sealed.push(ended)
             if (pool.sealed.length > 16) {
@@ -1283,7 +1343,7 @@ export function apply(ctx, input = {}) {
           // 诊断（P1 观察封存节奏用）
           ctx.logger?.info?.(
             `[dsh-liubian-notes] 轮封存 t${ended.turn}：human=${ended.human.length} assistant=${ended.assistant.length}`
-            + `｜${sealedNow ? '入窗' : '跳过（无人类内容）'} sealed=${pool.sealed.length}`
+            + `｜${sealedNow ? '入窗' : '跳过（无内容）'} sealed=${pool.sealed.length}`
             + ` humanRounds=${Number(pool.meta.humanRounds) || 0} rounds=${pool.meta.rounds}${counted ? '' : '（无内容不计轮）'}`,
           )
           break
@@ -1304,8 +1364,13 @@ export function apply(ctx, input = {}) {
       const key = sessionKeyFor(sessionId)
       const pool = loadPool(key, sessionId)
       const humanCount = (decision.messages || []).filter(isHumanMessage).length
+      /* v0.6.0：**任何形式的唤醒都算一轮** → 聚合调度移出「有人类提问」这道门。
+       * 旧实现下唤醒轮的 prompt 为空、在下面早退，聚合**永不触发**。scheduleAggregate 自带
+       * 同会话去重，且 maybeAggregate 只在窗口凑满 R 时才动，重复调用是廉价 no-op。
+       * ⚠ 只把**聚合**移出门外；**注入仍只发生在人类轮**（唤醒轮不注 <liubian-notes>，避免注入块膨胀）。 */
+      scheduleAggregate(ctx, cfg, sessionId, pool, humanCount)
       const prompt = currentPrompt(decision.messages)
-      if (!prompt) return decision   // 同轮后续步不重复注入
+      if (!prompt) return decision   // 同轮后续步不重复注入（注入面）
       // 记录当前回合号（面板热度分按它算 l/m；lastTurn 持久化在池文件里）
       if (pool.lastTurn !== humanCount) { pool.lastTurn = humanCount; savePool(pool) }
       /* 🟠-1：同轮去重（内存态 token）。pre-step 在**同一步可能被多次调用**（重试/多段生成），
@@ -1316,8 +1381,7 @@ export function apply(ctx, input = {}) {
        * 人类消息条数在同一步重试时不变，天然是"本回合"的稳定标识。
        * 用内存态而非 pool.lastTurn：持久化的话重启后首轮会被误抑制。 */
       if (injectionAlreadyDone(key, humanCount)) return decision   // 本回合已注入过，直接放行
-      // ① 自动聚合（fire-and-forget，LLM 调用耗时绝不能卡本轮）
-      scheduleAggregate(ctx, cfg, sessionId, pool, humanCount)
+      // ① 自动聚合已在上方调度（v0.6.0：唤醒轮同样触发）
       // ② 向量注入：该轮对话 + 上一轮完整问答 作查询
       const prev = previousQAPair(decision.messages, messageText, isHumanMessage)
       const block = await injectionBlock(pool, cfg, composeQueryText(prompt, prev), humanCount)
@@ -1367,7 +1431,7 @@ export const __test = {
   previousQAPair, buildNotesBlock, buildPackPrompt, generateNoteViaLlm,
   addNoteToPool, loadPool, savePool, loadRetired, saveRetired, injectionBlock,
   maybeAggregate, noteToolAction, embedTexts, pluginMessage, messageText,
-  isHumanMessage, currentPrompt, bumpStats, shouldSealTurn, buildPromoteTags, pendingPromotionsFile,
+  isHumanMessage, currentPrompt, bumpStats, shouldSealTurn, buildPromoteTags, pendingPromotionsFile, removePendingEntry,
   /* L157 `function quarantinePool(key)`（坏池隔离）、L683 `export function pendingHasId(...)`（promote 幂等） */
   pendingHasId, quarantinePool,
   injectionAlreadyDone, markInjectionDone, backfillVectors,
