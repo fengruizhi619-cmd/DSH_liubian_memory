@@ -90,19 +90,13 @@ say('取不到绑定时不抛错（降级）', !!viewDef && typeof viewDef.injec
   viewDef && typeof viewDef.inject === 'function' ? JSON.stringify(viewDef.inject('sess-dead')) : '-')
 say('设置页组件是函数', typeof comps['settings.plugins.tab'] === 'function', typeof comps['settings.plugins.tab'])
 
-/* 插件页卡片：plugins.item（「插件」页列表里流变便签自己的卡片 + 点开后的设置表单） */
-const itemDef = defs['plugins.item']
-const itemComp = comps['plugins.item']
-say('★ 注册 plugins.item（便签自己的卡片）', !!itemDef && itemDef.id === 'dsh-liubian-notes' && itemDef.label === '流变便签',
-  itemDef ? ('id=' + itemDef.id + ' label=' + itemDef.label) : '（未注册）')
-say('插件卡片组件是函数', typeof itemComp === 'function', typeof itemComp)
-if (typeof itemComp === 'function') {
-  const summaryEl = itemComp({ view: 'summary' })
-  const pageEl = itemComp({ view: 'page' })
-  say('summary 视图 = 一行简介（span）', !!summaryEl && summaryEl.type === 'span', 'type=' + summaryEl.type)
-  say('page 视图 = 设置表单组件', !!pageEl && typeof pageEl.type === 'function' && pageEl.type === comps['settings.plugins.tab'],
-    'type===' + (pageEl && typeof pageEl.type))
-}
+/* ★ 便签插件页上的设置表单：plugins.bundle.config（keyed，key = bundle 包名） */
+const bundleCfgDef = defs['plugins.bundle.config']
+say('★ 注册 plugins.bundle.config（key=包名）', !!bundleCfgDef && bundleCfgDef.key === 'dsh-liubian-notes',
+  bundleCfgDef ? ('key=' + bundleCfgDef.key) : '（未注册）')
+say('插件页设置表单组件是函数', typeof comps['plugins.bundle.config'] === 'function', typeof comps['plugins.bundle.config'])
+say('不再误用 plugins.item（那是官方组新卡，界面看不到）', !defs['plugins.item'],
+  defs['plugins.item'] ? '仍注册（应删除）' : '未注册 ✓')
 
 /* 设置页：settings.plugins.tab（流变便签 · 聚合 API 配置） */
 const setPageDef = defs['settings.plugins.tab']

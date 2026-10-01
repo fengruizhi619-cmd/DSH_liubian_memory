@@ -186,19 +186,8 @@ window.__ModuleLoader__.load({
       return React.createElement('div', { className: 'nts-panel' }, body)
     }
 
-    /** 插件页卡片（plugins.item）：summary = 卡片上的一行简介；page = 点开后的设置表单。
-     *  这就是「在便签的插件下面加一个设置选项」的官方挂点。 */
-    function NotesPluginItem(props) {
-      var view = (props && props.view) || 'summary'
-      if (view === 'summary') {
-        return React.createElement('span', null,
-          '短期记忆池（自动聚合 + 热度赛马）。配置聚合 API 见点开后的设置表单。')
-      }
-      return React.createElement(NotesSettingsPage)
-    }
-
-    /** 设置页（settings.plugins.tab：设置 → 插件 → 流变便签）：聚合 LLM 的 API 配置。
-     *  形态参考设置中的模型配置；数据走本插件宿主路由的 op=settings / settings-save / settings-test。 */
+    /** 设置表单：聚合 LLM 的 API 配置（形态参考设置中的模型配置）。
+     *  数据走本插件宿主路由的 op=settings / settings-save / settings-test。 */
     function NotesSettingsPage() {
       var st = React.useState({ url: '', model: '', key: '', loaded: false, msg: '', busy: false })
       var state = st[0]
@@ -318,17 +307,16 @@ window.__ModuleLoader__.load({
         }, NotesApp)
       })
 
-      /* 插件页卡片（plugins.item）：「插件」页列表里流变便签自己的卡片——
-       * summary = 卡片一行简介；page（点开卡片）= 聚合 API 设置表单。
-       * 这就是「在便签的插件下面加一个设置选项」的官方挂点（契约：
-       * registerOptions = id 必填 + order/label；ownerProps.view = 'summary' | 'page'）。 */
-      ctx.slots.inject('plugins.item', function () {
+      /* ★ 便签插件页上的设置表单（管理员要的「在便签的插件下面加一个设置选项」）。
+       * 契约：plugins.bundle.config —— keyed，**key = bundle 包名**，
+       * 渲染在**该 bundle 自己的页面**上（description 与 rows 之间，view:'page'）。
+       * 官方先例：experimental-client-ui-voice-input 用自己包名注册 VoicePreparation。
+       * 注：先前误用 plugins.item（那是往「官方组」新增一张卡，所以看不到）。 */
+      ctx.slots.inject('plugins.bundle.config', function () {
         return ctx.slots.register({
-          name: 'plugins.item',
-          id: 'dsh-liubian-notes',
-          order: 30,
-          label: '流变便签',
-        }, NotesPluginItem)
+          name: 'plugins.bundle.config',
+          key: 'dsh-liubian-notes',
+        }, NotesSettingsPage)
       })
 
       /* 设置页：设置 → 插件区里的「流变便签」页（契约：settings.plugins.tab，
