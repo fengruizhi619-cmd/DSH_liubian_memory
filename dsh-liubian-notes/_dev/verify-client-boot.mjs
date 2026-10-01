@@ -63,29 +63,41 @@ say('导出含 apply 函数', !!returned && typeof returned.apply === 'function'
 const registered = []
 let capturedDef = null
 let capturedComp = null
+const defs = {}            // 按槽名收集全部注册项（conversation.view / conversation.input.overlay）
+const comps = {}
 const ctxStub = {
   effect: (fn) => { fn(); return () => {} },
   // 轨迹式：inject(sessionId) 内用 ctx.sessions.binding(sessionId)?.session 判断会话是否可用
   sessions: { binding: (id) => (id === 'sess-live' ? { session: { id } } : undefined) },
   slots: {
     inject: (name, fn) => { const it = fn(); registered.push(name); return it },
-    register: (def, comp) => { capturedDef = def; capturedComp = comp; return { def, comp } },
+    register: (def, comp) => { defs[def.name] = def; comps[def.name] = comp; capturedDef = def; capturedComp = comp; return { def, comp } },
   },
 }
 let applyThrew = null
 try { returned.apply(ctxStub) } catch (e) { applyThrew = e }
 say('apply 可运行（注册 slots）', !applyThrew && registered.includes('conversation.view'), applyThrew ? String(applyThrew.message) : 'slots=' + registered.join(','))
-say('注册项声明 id/order/label', !!capturedDef && capturedDef.id === 'notes' && capturedDef.order === 20 && capturedDef.label === '流变便签',
-  capturedDef ? ('id=' + capturedDef.id + ' order=' + capturedDef.order + ' label=' + capturedDef.label) : 'undefined')
-say('★ 插槽带会话绑定 inject(sessionId)', !!capturedDef && typeof capturedDef.inject === 'function',
-  capturedDef ? typeof capturedDef.inject : 'undefined')
-say('inject 回传会话 id + 存活标记', !!capturedDef && typeof capturedDef.inject === 'function'
-  && capturedDef.inject('sess-live').sessionId === 'sess-live' && capturedDef.inject('sess-live').sessionLive === true,
-  capturedDef && typeof capturedDef.inject === 'function' ? JSON.stringify(capturedDef.inject('sess-live')) : '-')
-say('取不到绑定时不抛错（降级）', !!capturedDef && typeof capturedDef.inject === 'function'
-  && (function () { try { const r = capturedDef.inject('sess-dead'); return r.sessionId === 'sess-dead' && r.sessionLive === false } catch (e) { return false } })(),
-  capturedDef && typeof capturedDef.inject === 'function' ? JSON.stringify(capturedDef.inject('sess-dead')) : '-')
-say('组件是函数（可挂载）', typeof capturedComp === 'function', typeof capturedComp)
+const viewDef = defs['conversation.view'] || null
+say('注册项声明 id/order/label', !!viewDef && viewDef.id === 'notes' && viewDef.order === 20 && viewDef.label === '流变便签',
+  viewDef ? ('id=' + viewDef.id + ' order=' + viewDef.order + ' label=' + viewDef.label) : 'undefined')
+say('★ 插槽带会话绑定 inject(sessionId)', !!viewDef && typeof viewDef.inject === 'function',
+  viewDef ? typeof viewDef.inject : 'undefined')
+say('inject 回传会话 id + 存活标记', !!viewDef && typeof viewDef.inject === 'function'
+  && viewDef.inject('sess-live').sessionId === 'sess-live' && viewDef.inject('sess-live').sessionLive === true,
+  viewDef && typeof viewDef.inject === 'function' ? JSON.stringify(viewDef.inject('sess-live')) : '-')
+say('取不到绑定时不抛错（降级）', !!viewDef && typeof viewDef.inject === 'function'
+  && (function () { try { const r = viewDef.inject('sess-dead'); return r.sessionId === 'sess-dead' && r.sessionLive === false } catch (e) { return false } })(),
+  viewDef && typeof viewDef.inject === 'function' ? JSON.stringify(viewDef.inject('sess-dead')) : '-')
+say('组件是函数（可挂载）', typeof comps['conversation.view'] === 'function', typeof comps['conversation.view'])
+
+/* 输入条 overlay：便签视图激活时盖住对话输入框（机制同 dsh-context 的 context-modal） */
+const overlayDef = defs['conversation.input.overlay']
+say('★ 注册 conversation.input.overlay', !!overlayDef && overlayDef.id === 'notes-input-overlay',
+  overlayDef ? 'id=' + overlayDef.id : '（未注册）')
+say('overlay inject 回传会话 id', !!(overlayDef && typeof overlayDef.inject === 'function')
+  && overlayDef.inject('sess-live').sessionId === 'sess-live',
+  overlayDef && typeof overlayDef.inject === 'function' ? JSON.stringify(overlayDef.inject('sess-live')) : '-')
+say('overlay 组件是函数', typeof comps['conversation.input.overlay'] === 'function', typeof comps['conversation.input.overlay'])
 
 const bad = out.filter((r) => !r.ok)
 for (const r of out) console.log((r.ok ? '  ✅ ' : '  ❌ ') + r.name + '   [' + r.detail + ']')
