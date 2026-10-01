@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.4.6'
+export const PLUGIN_VERSION = '0.4.7'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -475,6 +475,10 @@ function findDuplicate(pool, vec, threshold) {
 }
 
 function raceEvict(pool, cfg, nowTurn) {
+  /* 赛马门槛（管理员 2026-10-01）：**缓存满 poolSize 篇后才开始赛马**——
+   * 池未满时一个都不淘汰。计数口径 = 池内全部便签（含 queued/submitted，与面板「N/10 篇」一致）；
+   * queued/submitted 本身受保护不占赛马名额（见 racableNotes）。 */
+  if (pool.notes.length < cfg.poolSize) return null
   let evicted = null
   while (racableNotes(pool).length >= cfg.poolSize) {
     let worst = null

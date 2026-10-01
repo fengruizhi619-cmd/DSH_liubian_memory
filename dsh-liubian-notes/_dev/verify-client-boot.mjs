@@ -99,6 +99,18 @@ say('overlay inject 回传会话 id', !!(overlayDef && typeof overlayDef.inject 
   overlayDef && typeof overlayDef.inject === 'function' ? JSON.stringify(overlayDef.inject('sess-live')) : '-')
 say('overlay 组件是函数', typeof comps['conversation.input.overlay'] === 'function', typeof comps['conversation.input.overlay'])
 
+/* overlay CSS 回归护栏（v0.4.6 的静默失败）：宿主 overlayAnchor 是 height:0 的定位锚点，
+ * overlay 若用 inset:0 或不显式撑高度 = 渲染了但 0 高不可见。规则里必须有正高度、不得用 inset:0。 */
+{
+  const src = fs.readFileSync(FILE, 'utf8')
+  const m = src.match(/'\.nts-inputOverlay\{([^}]*)\}'/)
+  const css = m ? m[1] : ''
+  const hasHeight = /height:\s*(?!0[;}%])/.test(css)
+  const noInset0 = !/inset:\s*0/.test(css)
+  say('overlay CSS 显式撑高度（v0.4.6 回归护栏）', !!m && hasHeight && noInset0,
+    m ? css.slice(0, 80) : '（找不到 .nts-inputOverlay 规则）')
+}
+
 const bad = out.filter((r) => !r.ok)
 for (const r of out) console.log((r.ok ? '  ✅ ' : '  ❌ ') + r.name + '   [' + r.detail + ']')
 console.log('')

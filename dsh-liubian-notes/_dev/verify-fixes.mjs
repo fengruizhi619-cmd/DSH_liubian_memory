@@ -211,6 +211,26 @@ const cfg = T.resolveConfig({})
   check('会话绑定：空态 key 仍是该会话的池键', other && other.key === K('sess-never-existed'), other && other.key)
 }
 
+/* 赛马门槛（管理员 2026-10-01）：缓存满 poolSize 篇后才开始赛马——池未满一个都不淘汰 */
+{
+  const session = 'sess-race-gate'
+  const key = K(session)
+  const pool = T.loadPool(key, session)
+  const mk = (i) => ({ id: 'NT-' + i, source: 'auto', gen: 'llm', status: 'active', head: '便签' + i, body: 'b', born_turn: i, heat: [] })
+  // 塞满 9 篇（< poolSize=10）：再来一篇不得触发淘汰
+  for (let i = 1; i <= 9; i++) pool.notes.push(mk(i))
+  const r9 = await T.addNoteToPool(pool, { head: '第10篇', body: 'b', source: 'manual' }, cfg, 10)
+  check('赛马门槛：池未满（9→10）不淘汰', r9.ok === true && pool.notes.length === 10 && !r9.evicted,
+    'notes=' + pool.notes.length + ' evicted=' + (r9.evicted ? r9.evicted.id : '无'))
+  // 第 11 篇：池已满 10 → 赛马启动，淘汰一篇，池保持 10
+  const r11 = await T.addNoteToPool(pool, { head: '第11篇', body: 'b', source: 'manual' }, cfg, 11)
+  const retiredCount = T.loadRetired(key).length
+  check('赛马门槛：满 10 后第 11 篇触发赛马', r11.ok === true && !!r11.evicted && pool.notes.length === 10 && retiredCount >= 1,
+    'evicted=' + (r11.evicted ? r11.evicted.id : '无') + ' notes=' + pool.notes.length + ' retired=' + retiredCount)
+  // 清理本测试产生的回收站文件，避免污染其他用例
+  try { fs.rmSync(path.join(poolsDir, key + '.retired.jsonl'), { force: true }) } catch {}
+}
+
 /* M4 回归：封存过滤与双口径 */
 {
   const p = { meta: { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 } }

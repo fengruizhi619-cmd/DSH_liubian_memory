@@ -13,8 +13,10 @@ window.__ModuleLoader__.load({
     var CSS = [
       // ── 根：与对话主区同底，毛玻璃通透 ──
       '.nts-panel{display:flex;flex-direction:column;min-width:0;height:100%;background:color-mix(in srgb, var(--dsw-alias-bg-base) 72%, transparent);-webkit-backdrop-filter:blur(18px) saturate(1.15);backdrop-filter:blur(18px) saturate(1.15);color:var(--dsw-alias-label-primary);font-size:14px;overflow:hidden;position:relative}',
-      // 便签视图激活时盖住输入条区域（机制同 dsh-context 的 conversation.input.overlay）
-      '.nts-inputOverlay{position:absolute;inset:0;z-index:5;background:var(--dsw-alias-bg-base);display:flex;align-items:center;justify-content:center}',
+      // 便签视图激活时盖住输入条区域（机制同 dsh-context 的 conversation.input.overlay）。
+      // ⚠ 宿主的 overlayAnchor 是 `position:absolute; inset:0 0 auto; height:0`——
+      //   overlay 必须自己撑高度；v0.4.6 用 inset:0 在 0 高父级里 = 不可见（这就是"还是会出现输入框"的根因）。
+      '.nts-inputOverlay{position:absolute;top:0;left:0;right:0;height:280px;z-index:5;background:var(--dsw-alias-bg-base);display:flex;align-items:center;justify-content:center;border-radius:0 0 18px 18px}',
       '.nts-inputOverlayHint{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;user-select:none}',
       // （原 .nts-header / .nts-crumb / .nts-scope / .nts-stats 已随表头一并删除——栏目标签由插槽提供，不再重复）
       // ── 卡片网格 ──
