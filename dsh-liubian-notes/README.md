@@ -21,7 +21,7 @@
 
 `~/.dsh/liubian-notes/config.json`：`enabled / poolSize=10 / injectTop=3 / aggregateRounds=5 / dedupThreshold=0.90 / noteLlmGen / embedUrl …`（全量见 impl.mjs DEFAULTS）。
 
-- **聚合 LLM 通道**：url/key/model 读 `~/.dsh/liubian/diary.json`（自动日记同一把 key，单一来源）。
+- **聚合 LLM 通道**（v0.3.3 收敛）：读取顺序 = `~/.dsh/liubian/config.json` 的 `llmApiUrl` / `llmApiKey` / `llmApiModel`（家族共享键单一来源，记忆向量名下）→ `~/.dsh/liubian/diary.json`（过渡期兜底；其属主 auto-diary 子系统已于 2026-10-01 退役 `d3c1d50`）→ 内置默认（deepseek）。
 - **记忆侧 5 键**（python/memoryScript/liubianRoot/workspace/memoryTimeoutMs）：单一来源 `~/.dsh/liubian/config.json`（P2 wiki 提交通道使用；缺键回落内置兜底）。
 
 ## 与流变记忆的交接（2026-10-01 与记忆向量对齐，v0.3.0 更新）

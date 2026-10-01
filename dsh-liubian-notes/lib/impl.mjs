@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.3.2'
+export const PLUGIN_VERSION = '0.3.3'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -97,11 +97,16 @@ export function resolveConfig(input = {}) {
     if (memCfg[k] !== undefined) cfg[k] = memCfg[k]
     else if (cfg[k] === undefined) cfg[k] = MEMORY_FALLBACKS[k]
   }
-  // 聚合 LLM 通道：~/.dsh/liubian/diary.json（自动日记同一把 key，单一来源）
+  // 聚合 LLM 通道（v0.3.3 收敛）：优先家族共享键 `llmApiUrl` / `llmApiKey` / `llmApiModel`
+  // （config.json，记忆向量名下单一来源）→ 过渡期回落到 diary.json（其属主 auto-diary 子系统
+  // 已于 2026-10-01 退役 d3c1d50，文件成无主状态，故不再作为唯一来源）→ 内置默认。
+  if (memCfg.llmApiUrl) cfg.diaryApiUrl = memCfg.llmApiUrl
+  if (memCfg.llmApiModel) cfg.diaryApiModel = memCfg.llmApiModel
+  if (memCfg.llmApiKey) cfg.diaryApiKey = memCfg.llmApiKey
   const d = readJson(diaryApiConfigFile()) || {}
-  if (d.url) cfg.diaryApiUrl = d.url
-  if (d.model) cfg.diaryApiModel = d.model
-  if (d.apiKey) cfg.diaryApiKey = d.apiKey
+  if (!memCfg.llmApiUrl && d.url) cfg.diaryApiUrl = d.url
+  if (!memCfg.llmApiModel && d.model) cfg.diaryApiModel = d.model
+  if (!memCfg.llmApiKey && d.apiKey) cfg.diaryApiKey = d.apiKey
   cfg.poolSize = Math.max(1, Number(cfg.poolSize) || 10)
   cfg.injectTop = Math.max(1, Number(cfg.injectTop) || 3)
   cfg.aggregateRounds = Math.max(1, Number(cfg.aggregateRounds) || 5)
