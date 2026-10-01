@@ -13,6 +13,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const IMPL = 'E:/DSH_data/流变系统/dsh-liubian-notes/lib/impl.mjs'
+const ROOT = 'E:/DSH_data/流变系统/dsh-liubian-notes'   // 源码级护栏用（读 lib/impl.mjs 文本断言）
 const url = (tag) => pathToFileURL(IMPL).href + '?t=' + tag
 const T = (await import(url('main'))).__test
 const impl = await import(url('main'))
@@ -240,9 +241,9 @@ const cfg = T.resolveConfig({})
   const w = T.settingsWrite({ llmApiUrl: 'https://new.example/v1', llmApiKey: 'NEWKEY', llmApiModel: 'new-model' })
   const after = JSON.parse(fs.readFileSync(file, 'utf8'))
   const baks = fs.readdirSync(liubianDir).filter((f) => f.startsWith('config.json.bak-notes-settings-'))
-  check('设置写：返回 true 且三键更新', w === true
+  check('设置写：返回 ok 且三键更新', !!(w && w.ok === true)
     && after.llmApiUrl === 'https://new.example/v1' && after.llmApiKey === 'NEWKEY' && after.llmApiModel === 'new-model',
-    JSON.stringify({ url: after.llmApiUrl, key: after.llmApiKey, model: after.llmApiModel }))
+    JSON.stringify({ ok: w && w.ok, url: after.llmApiUrl, key: after.llmApiKey, model: after.llmApiModel }))
   check('设置写：其余键保留（单一来源文件不被破坏）',
     after.liubianRoot === 'C:/x' && after.workspace === '工作组' && after.memoryScript === 'm.py', '')
   check('设置写：留有备份', baks.length >= 1, baks.join(','))
@@ -252,7 +253,25 @@ const cfg = T.resolveConfig({})
   // 掩码回写防护：把掩码当 key 保存不应覆盖真实 key
   const w2 = T.settingsWrite({ llmApiKey: rd.llmApiKeyMasked })
   const after2 = JSON.parse(fs.readFileSync(file, 'utf8'))
-  check('设置写：掩码不覆盖真实 Key（空/掩码不落盘）', w2 === false || after2.llmApiKey === 'NEWKEY', 'key=' + after2.llmApiKey)
+  check('设置写：掩码不覆盖真实 Key（空/掩码不落盘）', !!(w2 && w2.ok === true) && after2.llmApiKey === 'NEWKEY', 'key=' + after2.llmApiKey)
+  /* v0.5.3 回归：测试连接必须取**原文 Key**（原先误用掩码读取 → 已配置却报「缺少 API Key」） */
+  const raw = T.settingsRaw()
+  check('测试连接取原文 Key（不再误用掩码）', raw.llmApiKey === 'NEWKEY', 'raw=' + (raw.llmApiKey ? '有' : '无'))
+  /* 设置写入不受 disposed 影响（守卫只该管写池）——本进程未 apply，disposed 默认为 false，
+   * 这里直接断言函数体内不再引用 disposed：源码级护栏（被重新加回即失败）。 */
+  const implSrc = fs.readFileSync(path.join(ROOT, 'lib', 'impl.mjs'), 'utf8')
+  const swBody = implSrc.slice(implSrc.indexOf('export function settingsWrite'), implSrc.indexOf('export async function settingsTest'))
+  check('设置写入不再受 disposed 守卫（路由被旧代实例持有时也能保存）', swBody.indexOf('disposed') < 0,
+    swBody.indexOf('disposed') < 0 ? '无 disposed 引用 ✓' : '仍引用 disposed ✗')
+  /* 🟠-6 源码级护栏：disposed 拒绝落盘必须**告警**（事故：静默拒绝 → 便签 2 小时未落盘而日志无异常） */
+  check('disposed 拒绝落盘会告警（不再静默）',
+    implSrc.indexOf('warnDisposedOnce') > 0
+    && /if \(disposed\) \{ warnDisposedOnce\('savePool'\)/.test(implSrc)
+    && /if \(disposed\) \{ warnDisposedOnce\('saveRetired'\)/.test(implSrc)
+    && /if \(disposed\) \{ warnDisposedOnce\('session\/event 采集'\)/.test(implSrc),
+    'savePool/saveRetired/采集 三处均告警')
+  /* 设置写失败必须回传精确原因（不再只给「详见宿主日志」） */
+  check('设置写失败回传精确 error', /sendJson\(res, 500, \{ error: '写入失败：'/.test(implSrc), '路由含精确 error 回传')
 }
 
 /* M4 回归：封存过滤与双口径 */

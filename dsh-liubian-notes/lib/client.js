@@ -217,17 +217,28 @@ window.__ModuleLoader__.load({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         })
-          .then(function (r) { return r.json() })
-          .then(function (j) { done(j) })
+          /* 错误可诊断（v0.5.3）：先取原文再解析——被门禁 403/路由未命中时也能看到 HTTP 状态与响应体，
+           * 而不是只抛一个 JSON 解析错的 SyntaxError。 */
+          .then(function (r) {
+            return r.text().then(function (txt) {
+              var j = null
+              try { j = JSON.parse(txt) } catch (e) { j = null }
+              if (!j) { done({ ok: false, error: 'HTTP ' + r.status + '：' + String(txt || '(空响应)').slice(0, 200) }); return }
+              if (!r.ok && !j.error) j.error = 'HTTP ' + r.status
+              done(j)
+            })
+          })
           .catch(function (e) { done({ ok: false, error: String((e && e.message) || e) }) })
       }
       function save() {
         post('settings-save', { llmApiUrl: state.url, llmApiModel: state.model, llmApiKey: state.key }, function (j) {
+          var ok = !!(j && j.ok)
           setState(function (s) {
             return Object.assign({}, s, {
               busy: false,
-              key: '',
-              msg: (j && j.ok) ? '已保存 ✓ 下一次聚合（≤ R 轮）即使用新配置，无需重启。' : '保存失败：' + ((j && (j.error || j.message)) || '未知'),
+              /* 成功才清空 Key 输入框；失败保留（别让用户白输一遍） */
+              key: ok ? '' : s.key,
+              msg: ok ? '已保存 ✓ 下一次聚合（≤ R 轮）即使用新配置，无需重启。' : '保存失败：' + ((j && (j.error || j.message)) || '未知'),
             })
           })
         })

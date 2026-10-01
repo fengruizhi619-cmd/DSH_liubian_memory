@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.5.2'
+export const PLUGIN_VERSION = '0.5.3'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -152,6 +152,17 @@ const poolCache = new Map()
  * 所以：dispose 时置 disposed=true，savePool/dispose 之后一律拒绝回写。 */
 let disposed = false
 let currentLogger = null
+/** 卸载后仍被回调时的**限一次**告警（🟠-6，v0.5.3）：这一状态此前完全静默——
+ *  实例已卸载 → 所有落盘被拒，可持续数小时而日志只显示正常的「轮封存」。 */
+let disposedWarned = false
+function warnDisposedOnce(where) {
+  if (disposedWarned) return
+  disposedWarned = true
+  currentLogger?.warn?.(
+    `[dsh-liubian-notes] ⚠ 本实例已卸载（disposed）却仍在被回调：${where}——`
+    + '所有落盘（池/回收站）已被拒绝，便签在此期间不会持久化。请重载或重启该插件。',
+  )
+}
 
 /** 坏池文件隔离：**改名保留现场**（不删、不被空池覆盖），返回隔离后的路径。 */
 function quarantinePool(key) {
@@ -204,7 +215,7 @@ function loadPool(key, sessionId) {
 /** 原子落盘（🔴-2）：写临时文件 → rename 替换，避免半截 JSON。
  *  返回 boolean 供调用方判成败（🟡-1：不再"内存改了就算成功"）。 */
 function savePool(pool) {
-  if (disposed) return false   // 🟠-3：已卸载实例不得回写旧快照
+  if (disposed) { warnDisposedOnce('savePool'); return false }   // 🟠-3：已卸载实例不得回写旧快照
   pool.updatedAt = new Date().toISOString()
   try {
     mkdirSync(notesDir(), { recursive: true })
@@ -230,7 +241,7 @@ function loadRetired(key) {
 }
 
 function saveRetired(key, list) {
-  if (disposed) return false
+  if (disposed) { warnDisposedOnce('saveRetired'); return false }
   try {
     mkdirSync(notesDir(), { recursive: true })
     /* 🟠-5：回收站也是「整份重写」语义 —— 同样改成 tmp + rename 原子替换，
@@ -908,22 +919,32 @@ function maskKey(k) {
   return s.slice(0, 8) + '…' + s.slice(-4)
 }
 
-/** 设置页读侧：聚合 LLM 三键（Key 只回掩码，不回原文）。 */
-export function settingsRead() {
+/** 设置读侧（**内部**）：含真实 Key——只给宿主内部（如测试连接）用，路由绝不下发原文。 */
+function settingsRaw() {
   const mem = readJson(memoryConfigFile()) || {}
-  const key = String(mem.llmApiKey || '')
   return {
     llmApiUrl: String(mem.llmApiUrl || ''),
     llmApiModel: String(mem.llmApiModel || ''),
-    llmKeySet: !!key,
-    llmApiKeyMasked: maskKey(key),
+    llmApiKey: String(mem.llmApiKey || ''),
   }
 }
 
-/** 设置页写侧：只更新提供的非空 llmApi* 字段；**只动 llmApi* 三键**（文件归记忆向量名下，其余键原样保留）。
- *  先备份（.bak-notes-settings-<ts>）再原子替换。返回 boolean。 */
+/** 设置读侧（路由用）：Key 只回掩码。 */
+export function settingsRead() {
+  const r = settingsRaw()
+  return {
+    llmApiUrl: r.llmApiUrl,
+    llmApiModel: r.llmApiModel,
+    llmKeySet: !!r.llmApiKey,
+    llmApiKeyMasked: maskKey(r.llmApiKey),
+  }
+}
+
+/** 设置写侧：只更新提供的非空 llmApi* 字段；**只动 llmApi* 三键**（文件归记忆向量名下，其余键原样保留）。
+ *  先备份（.bak-notes-settings-<ts>）再原子替换；原子路径被占用时退化为直接写。
+ *  ⚠ v0.5.3：**去掉 disposed 守卫**——那是为「写池」防陈旧实例覆盖而设的；配置写入与实例生命周期无关，
+ *  被守卫拦住会表现为「读得到、保存失败」（路由仍由旧代实例持有时）。返回 `{ ok, error? }`。 */
 export function settingsWrite(patch) {
-  if (disposed) return false
   try {
     const file = memoryConfigFile()
     const cur = readJson(file) || {}
@@ -934,20 +955,34 @@ export function settingsWrite(patch) {
     if (typeof p.llmApiKey === 'string' && p.llmApiKey.trim() && p.llmApiKey.indexOf('…') < 0) next.llmApiKey = p.llmApiKey.trim()
     if (typeof p.llmApiModel === 'string' && p.llmApiModel.trim()) next.llmApiModel = p.llmApiModel.trim()
     mkdirSync(dirname(file), { recursive: true })
-    if (existsSync(file)) { try { copyFileSync(file, `${file}.bak-notes-settings-${Date.now()}`) } catch {} }
-    const tmp = `${file}.tmp-${process.pid}`
-    writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8')
-    renameSync(tmp, file)
-    return true
+    if (existsSync(file)) {
+      try { copyFileSync(file, `${file}.bak-notes-settings-${Date.now()}`) } catch { /* 备份失败不阻断写入 */ }
+    }
+    const data = JSON.stringify(next, null, 2)
+    const tmp = `${file}.tmp-${process.pid}-${Date.now()}`
+    try {
+      writeFileSync(tmp, data, 'utf8')
+      renameSync(tmp, file)
+    } catch (err) {
+      /* Windows：rename 覆盖被其他进程占用的文件可能 EPERM/EBUSY——退化为直接写（配置体量小）。 */
+      try { writeFileSync(file, data, 'utf8') } catch (err2) {
+        const msg = `${(err2 && err2.code) || ''} ${(err2 && err2.message) || err2}`.trim()
+        console.error(`[dsh-liubian-notes] 设置写入失败：${msg}`)
+        return { ok: false, error: msg }
+      }
+      console.error(`[dsh-liubian-notes] 原子替换失败（${(err && err.code) || ''} ${(err && err.message) || err}），已退化为直接写入`)
+    }
+    return { ok: true }
   } catch (err) {
-    currentLogger?.warn?.(`[dsh-liubian-notes] 写入共享配置失败：${(err && err.message) || err}`)
-    return false
+    const msg = `${(err && err.code) || ''} ${(err && err.message) || err}`.trim()
+    console.error(`[dsh-liubian-notes] 设置写入异常：${msg}`)
+    return { ok: false, error: msg }
   }
 }
 
 /** 设置页「测试连接」：用传入 Key（或已存 Key）对聚合端点做一次最小对话调用。 */
 export async function settingsTest(keyOverride) {
-  const s = settingsRead()
+  const s = settingsRaw()   /* ⚠ 必须取**原文**：settingsRead 只回掩码，用它会导致「已存 Key 却报缺少 Key」 */
   const key = String(keyOverride || '').trim() || s.llmApiKey
   const useUrl = s.llmApiUrl
   const useModel = s.llmApiModel
@@ -1050,9 +1085,13 @@ export function mountPanelRoutes(ctx, cfg) {
         const op = url.searchParams.get('op') || 'pools'
         if (req.method === 'POST') {
           const body = await readBody(req)
+          /* 诊断留痕（管理员报「保存 api key 显示错误」时加的）：只记 op/字段名/门禁标记，**绝不记 key 值**。 */
+          currentLogger?.info?.(`[dsh-liubian-notes] POST op=${op} 字段=${Object.keys(body || {}).join(',') || '(空)'}`
+            + ` rendererHeader=${req.headers && req.headers['x-dsh-desktop-renderer'] ? 'yes' : 'no'}`)
           if (op === 'settings-save') {
-            const ok = settingsWrite(body || {})
-            if (!ok) { sendJson(res, 500, { error: '写入 ~/.dsh/liubian/config.json 失败（详见宿主日志）' }); return }
+            const r = settingsWrite(body || {})
+            currentLogger?.info?.(`[dsh-liubian-notes] settings-save 写入=${r.ok ? '成功' : '失败：' + (r.error || '未知')}`)
+            if (!r.ok) { sendJson(res, 500, { error: '写入失败：' + (r.error || '未知') }); return }
             sendJson(res, 200, { ok: true }); return
           }
           if (op === 'settings-test') {
@@ -1167,6 +1206,10 @@ export function apply(ctx, input = {}) {
   ctx.on('session/event', (session, event) => {
     try {
       if (!session || !event) return
+      /* 🟠-6（v0.5.3）：**已卸载实例仍被回调时不得静默**。
+       * 事故：路由/钩子留在一个 disposed 实例上，轮结束照常打印「轮封存」，但 savePool 被 disposed
+       * 守卫静默拒绝 → 便签 2 小时未落盘而日志毫无异常（管理员保存设置报错才暴露）。 */
+      if (disposed) { warnDisposedOnce('session/event 采集'); return }
       const id = String(session.id)
       const pool = loadPool(sessionKeyFor(id), id)
       switch (event.type) {
@@ -1290,6 +1333,6 @@ export const __test = {
   pendingHasId, quarantinePool,
   injectionAlreadyDone, markInjectionDone, backfillVectors,
   poolPayload, poolPayloadForSession,
-  settingsRead, settingsWrite, settingsTest,
+  settingsRead, settingsWrite, settingsTest, settingsRaw,
   MEMORY_KEYS, DEFAULTS, notesDir,
 }
