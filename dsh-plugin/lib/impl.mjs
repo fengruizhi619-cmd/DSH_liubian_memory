@@ -427,34 +427,7 @@ export function registerTools(ctx, cfg) {
     },
   })
 
-  /* - 流变·记忆：写日记（mcp-memory-write?------------------------------------------------------------ */
-  register(ctx, {
-    name: 'write',
-    description: '写一篇流变记忆日记（每轮对话结束记录要点）。**匿名写入**，不需要任何身份 / 密码 / KEY。'
-      + 'tags 至少 5 个细小标签；返回 [OK] Dxxxx',
-    parameters: {
-      tags: { type: 'string', required: true, description: '标签，逗号分隔，至少 5 个；细小标签优先于宽泛词（"记忆skill-标签优化"优于"经验"）' },
-      summary: { type: 'string', required: true, description: '句话摘要' },
-      content: { type: 'string', required: true, description: '正文（覆盖本轮对话要点；超 20KB 自动改走临时文件通道，不受命令行长度限制' },
-      kind: { type: 'string', enum: ['diary', 'log'], description: 'diary=日常日记（默认）；log=工作流/实践日志' },
-      workspace: ARG_WORKSPACE,
-    },
-    async execute(args) {
-      const tags = String(args.tags || '')
-      const tagCount = tags.split(',').filter(t => t.trim()).length
-      if (tagCount < 5) return `[错误] 写日记需要至少 5 个标签（当前 ${tagCount} 个）。`
-      const content = String(args.content || '')
-      return withTempPayload(content, file => {
-        // 关键：**不带 -u**。memory.py 的 write 整段被 `if username:` 包着，
-        // 不带 username 时完全不鉴权，也不校验工作区归属 —— DSH 侧写日记因此零身份。
-        const argv = ['write', '-t', tags, '-s', String(args.summary || '')]
-        if (file) argv.push('--file', file)
-        else argv.push('--content', content)
-        if (String(args.kind || 'diary') === 'log') argv.push('-k', 'log')
-        return runMemory(cfg, argv, { workspace: args.workspace })
-      })
-    },
-  })
+  /* -- 流变·记忆：写日记已退役（2026-10-01 用户指令：信息源切换为便签升格→wiki 条目） -- */
 
   /* - 流变·记忆：检索（mcp-memory-search?------------------------------------------------------------ */
   register(ctx, {
@@ -675,8 +648,8 @@ export function registerTools(ctx, cfg) {
       const cli = runLiubianCli(cfg, ['status'], { workspace: args.workspace })
       return [
         '[DSH 侧接入]',
-        '  写日记：匿名写入（无身份 / 无密码 / 无 KEY）',
-        '  向量服务：由独立插件 dsh-liubian-embed 负责（用 _dsh_external_dsh_liubian_embed action=status 查看）',
+        '  写日记：已退役（信息源=便签升格→wiki）',
+        '  向量服务：流变基建 dsh-liubian-infra（_dsh_external_dsh_liubian_infra embed-status）',
         '',
         '[注册表统计]',
         stats,
@@ -687,123 +660,9 @@ export function registerTools(ctx, cfg) {
     },
   })
 
-  /* ── 自动日记（外部 API 撰写，下一轮写上一轮） ────────────────────────── */
-  register(ctx, {
-    name: 'diary',
-    description: '自动日记的查看与运维：外部 API 按上一轮完整对话撰写日记，下一轮开始时写上一轮。'
-      + 'action: status 看开关/key/待补队列/最近日志｜preview 预览将要发给 API 的完整输入（不调用 API）'
-      + '｜run 立刻补写当前未写的轮次｜retry 重试待补队列｜enable / disable。'
-      + '（enable 时若还没配 key，用 api_key=… 带上；也支持 url= / model= 覆盖）',
-    parameters: {
-      action: { type: 'string', required: true, enum: ['status', 'preview', 'run', 'retry', 'enable', 'disable'], description: '操作' },
-      api_key: { type: 'string', description: 'enable 时可选：新 API key（只落本地 diary.json，不回显全文）' },
-      url: { type: 'string', description: 'enable 时可选：API 端点' },
-      model: { type: 'string', description: 'enable 时可选：模型' },
-      workspace: ARG_WORKSPACE,
-    },
-    async execute(args, exec) {
-      const action = String(args.action || 'status').toLowerCase()
-      const agent = exec && exec.agent
-      const sessionId = String((agent && agent.session && agent.session.id) || 'default')
+  /* ── 自动日记已退役（2026-10-01 用户指令：信息源切换为便签升格→wiki 条目，API key 即将注销） ── */
 
-      if (action === 'enable' || action === 'disable') {
-        const dc0 = diaryConfig()
-        const patch = { enabled: action === 'enable' }
-        if (args.api_key) patch.apiKey = String(args.api_key).trim()
-        if (args.url) patch.url = String(args.url).trim()
-        if (args.model) patch.model = String(args.model).trim()
-        if (action === 'enable' && !(patch.apiKey || dc0.apiKey)) {
-          return '[错误] 还没配置 API key：enable 时请带 api_key=…（或用 url= / model= 覆盖端点与模型）'
-        }
-        if (patch.url) patch.url = normalizeDiaryUrl(patch.url)
-        saveDiaryConfig(patch)
-        const dc = diaryConfig()
-        // 刚开启：立刻把标签向量缓存热起来（约 0.2 秒）。
-        // 否则要等下一轮用到才懒加载，status 也会显示"未命中"误导人。
-        if (dc.enabled) void warmTagVectors(ctx, cfg)
-        return `[OK] 自动日记已${action === 'enable' ? '开启' : '关闭'}`
-          + `\n[端点] ${dc.url}\n[模型] ${dc.model}\n[key] ${maskKey(dc.apiKey)}`
-          + `\n[规则] 下一轮写上一轮｜每篇 ≤${cfg.diaryMaxChars} 字，超出新建一篇（篇数不限）｜标签${String(cfg.diaryTagSelect) === 'semantic' ? `用助手正文向量相似度取前 ${cfg.diaryTagTopN} 个` : '用整张表'}随对话送入｜工作区 ${cfg.diaryWorkspace}`
-          + (action === 'enable' ? '\n[提示] 开启后不要再手动 write，否则同一轮会写两遍。' : '')
-      }
-
-      if (action === 'retry') {
-        const r = await flushPending(ctx, cfg, 10)
-        return `[OK] 待补队列：尝试 ${r.tried} 条，成功 ${r.done || 0} 条，剩余 ${r.left} 条`
-      }
-
-      if (action === 'run') {
-        const buf = turnBuffers.get(sessionId)
-        const sealed = buf ? buf.sealed.length : 0
-        const turn = takeUnwrittenTurn(sessionId)
-        if (!turn) return `[无] 当前会话没有"已封口且未写"的轮次（已封口 ${sealed} 轮）`
-        const r = await writeTurnDiary(ctx, cfg, agent, turn)
-        if (r.skipped) return `[跳过] ${r.skipped}`
-        if (r.error) return `[失败] ${r.error}（已入待补队列；用 action=retry 重试）`
-        return `[OK] 已写 turn=${turn.turn}：${r.written.map(w => `${w.id || '(失败)'}`).join('、')}`
-          + `\n${r.written.map(w => `  ${w.id} [${w.tags.join(',')}] ${w.summary}`).join('\n')}`
-      }
-
-      if (action === 'preview') {
-        const buf = turnBuffers.get(sessionId)
-        const turn = (buf && buf.sealed.length) ? buf.sealed[buf.sealed.length - 1] : null
-        if (!turn) return `[无] 当前会话还没有已封口的轮次（正在进行的轮次结束后才有）｜已封口 ${buf ? buf.sealed.length : 0} 轮`
-        const workspace = resolveDiaryWorkspace(cfg, agent)
-        const picked = await selectDiaryTags(cfg, turn, ctx.logger)
-        const hints = picked.tags
-        const payload = await buildDiaryPayload(cfg, turn, hints, workspace)
-        const head = s => String(s).length > 2600 ? String(s).slice(0, 2600) + `\n…（共 ${String(s).length} 字，此处截断展示）` : String(s)
-        const scored = (picked.scored || []).slice(0, 12)
-          .map(h => `${h.tag}(${h.score.toFixed(3)})`).join('、')
-        return [
-          `[预览] turn=${turn.turn}｜工作区 ${workspace}｜结束状态 ${turn.reason}`,
-          `[采集] 提问 ${turn.human.length} 段｜助手正文 ${turn.assistant.length} 段｜工具 ${[...new Set(turn.tools)].join('、') || '无'}`,
-          `[选标签] 模式 ${picked.mode}｜${hints.length} 个${scored ? `｜相似度前 12：${scored}` : ''}`,
-          `[体量] 对话原文 ${turnText(turn).length} 字｜送 API 输入 ${payload.messages[1].content.length} 字`,
-          '[提示] 以下是**将要发送给外部 API 的完整输入**（未调用 API）：',
-          '',
-          '------------- system -------------',
-          head(payload.messages[0].content),
-          '',
-          '------------- user -------------',
-          head(payload.messages[1].content),
-        ].join('\n')
-      }
-
-      // status
-      const dc = diaryConfig()
-      const buf = turnBuffers.get(sessionId)
-      const pending = readPending()
-      const tagN = (await allTagsFor(cfg)).length
-      const mode = String(cfg.diaryTagSelect || 'semantic')
-      const svc = mode === 'semantic'
-        ? `语义取前 ${cfg.diaryTagTopN}（${
-          tagVecMemo ? `向量缓存已就绪 ${tagVecMemo.names.length} 个/${tagVecMemo.dim} 维`
-            : (dc.enabled ? '向量缓存未命中，本轮退回整张表（正在建）' : '日记关着，缓存按需加载')
-        }）`
-        : (mode === 'all' ? '整张表' : '不给')
-      let logTail = []
-      try {
-        logTail = readFileSync(diaryLogFile(), 'utf8').replace(/^\uFEFF/, '').split('\n').filter(l => l.trim()).slice(-5)
-          .map(l => { const o = JSON.parse(l); return `  ${o.at} turn=${o.turn} @${o.workspace} → ${(o.entries || []).map(e => e.id || '(失败)').join('、')}` })
-      } catch { /* 还没有日志 */ }
-      return [
-        `[开关] ${dc.enabled ? '开' : '关'}　[key] ${maskKey(dc.apiKey)}`,
-        `[端点] ${dc.url}　[模型] ${dc.model}　[temperature] ${dc.temperature}　[maxTokens] ${dc.maxTokens}`,
-        `[规则] 下一轮写上一轮｜每篇 ≤${cfg.diaryMaxChars} 字（超出新建，篇数不限）`,
-        `[标签] ${svc}｜字典 ${tagN} 个｜[工作区] ${cfg.diaryWorkspace}`,
-        `[检索侧 API] ${(() => {
-          const api = retrievalApiConfig(cfg, dc)
-          return `${api.model}　key ${maskKey(api.apiKey)}　来源 ${api.source}`
-        })()}`,
-        `[本会话] 已封口 ${buf ? buf.sealed.length : 0} 轮｜待写 ${takeUnwrittenTurn(sessionId) ? '有' : '无'}`,
-        `[待补队列] ${pending.length} 条`,
-        `[已写日志] ${writtenKeys.size} 条`,
-        logTail.length ? '[最近日志]\n' + logTail.join('\n') : '[最近日志] （空）',
-        `[文件] ${diaryConfigFile()}`,
-      ].join('\n')
-    },
-  })
+  /* ── 通用教训（全局+工作区） ────────────────────────── */
 
   /* - 面板（mcp-memory-panel） ------------------------------------------------------------ */
   register(ctx, {
@@ -1095,8 +954,8 @@ async function buildProfileBlock(cfg) {
 
   const dc = diaryConfig()
   lines.push(dc.enabled && dc.apiKey
-    ? '[自动日记] 已开启：下一轮会自动写上一轮（外部 API 撰写）。**不要再手动 write，会写重**'
-    : '[自动日记] 未开启：按技能流程手动 write（至少 5 个细小标签）。')
+    ? '[自动日记] 已退役（2026-10-01）：信息源 = 便签升格 → wiki 条目。'
+    : '[自动日记] 已退役。')
   if (card?.last_diary) {
     const d = card.last_diary
     lines.push(`[最近记忆] ${d.id}@${d.workspace} ${d.date} — ${clipText(d.summary, 80)}`)
@@ -3051,8 +2910,8 @@ export function apply(ctx, input = {}) {
   // 上下文插入：会话启动身份卡 + 每轮联合检索注入（对照 DSH 记忆插件的接线）
   mountContextInjection(ctx, cfg)
 
-  // 自动日记：采集（session/event）+ 下一轮写上一轮（末轮不兜底，交给下一次对话）
-  mountAutoDiary(ctx, cfg)
+  // 自动日记已退役（2026-10-01 用户指令）：信息源切换为 便签升格 → 银杏审核 → wiki 条目
+  // mountAutoDiary(ctx, cfg)
 
   ctx.effect(() => () => disposeContextInjection(), 'dsh-liubian: 清理上下文插入状态')
 
