@@ -307,6 +307,39 @@ const cfg = T.resolveConfig({})
   check('M4 回归：非人类轮不入窗', T.shouldSealTurn({ human: [] }) === false && T.shouldSealTurn({ human: ['x'] }) === true, '')
 }
 
+/* 🔴-8 真行为回归（**放在最后**：它会真的 apply 并最终 dispose，之后本进程不再能落盘）：
+ * `ctx.effect(fn)` 的 fn 是「立即执行」的注册面，f返回的函数才是清理器。
+ * 旧 bug：`disposed = true` 写在 fn 体里 → 实例**挂载瞬间即自我标记已卸载** →
+ * 此后所有 savePool/saveRetired 被自家守卫拒绝（日志照打「轮封存」、聚合照跑，便签却不落盘；
+ * 线上 14:44→17:38 池文件停更数小时，且重启无效——新实例同样生来 disposed）。 */
+{
+  const session = 'sess-apply-live'
+  const key = K(session)
+  const cleanups = []
+  let routeMounted = 0
+  const ctxStub = {
+    /* 真框架语义：effect 体立即执行，返回值是清理器 */
+    effect: (fn) => { const c = fn(); if (typeof c === 'function') cleanups.push(c); return () => {} },
+    on: () => () => {},
+    logger: { info() {}, warn() {}, error() {} },
+    reflect: { get: () => ({ register: () => { routeMounted += 1; return () => {} } }) },
+    tools: { register: () => () => {} },
+  }
+  let applyThrew = null
+  try { impl.apply(ctxStub, {}) } catch (e) { applyThrew = e }
+  check('apply 可挂载（桩 ctx，框架 effect 语义）', !applyThrew && routeMounted >= 1,
+    applyThrew ? String(applyThrew.message) : '路由挂载 ' + routeMounted + ' 次')
+  const pool = T.loadPool(key, session)
+  pool.notes.push({ id: 'NT-1', source: 'auto', gen: 'llm', status: 'active', head: 'h', body: 'b', born_turn: 1, heat: [] })
+  const wrote = T.savePool(pool)
+  check('★ apply 后实例未自我标记卸载（落盘必须真能写）', wrote === true && fs.existsSync(path.join(poolsDir, key + '.json')),
+    'savePool=' + wrote + ' 文件=' + fs.existsSync(path.join(poolsDir, key + '.json')))
+  /* 反向：真卸载后必须拒写（守卫本身仍然有效） */
+  for (const c of cleanups) { try { c() } catch { /* 清理器可能重复调用 */ } }
+  const afterDispose = T.savePool(T.loadPool(key, session))
+  check('★ 真卸载后确实拒写（守卫仍有效）', afterDispose === false, 'savePool=' + afterDispose)
+}
+
 const bad = results.filter((r) => !r.ok)
 for (const r of results) console.log((r.ok ? '  ✅ ' : '  ❌ ') + r.name + (r.detail ? '   [' + r.detail + ']' : ''))
 console.log('')

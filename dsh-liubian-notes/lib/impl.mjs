@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.5.4'
+export const PLUGIN_VERSION = '0.5.5'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -1333,16 +1333,24 @@ export function apply(ctx, input = {}) {
   }))
 
   ctx.effect(() => {
-    /* 🟠-3：卸载本实例时置 disposed —— 在途异步闭包（聚合最长 120s）此后不得再 savePool，
-     * 否则它会把旧快照整份写回、覆盖新实例期间的写入。
-     * ⚠ 只清**本实例**的 poolCache；共享守卫（池锁 / 聚合在飞 / 同轮 token）**不清**，
-     * 它们属于进程内其它仍存活的实例。 */
-    disposed = true
-    poolCache.clear()
-    /* 🟠-7：显式摘掉本实例的钩子——否则「已卸载实例继续收 session/event」会重演 */
-    for (const offFn of hookOffs) { try { offFn() } catch { /* 已摘 */ } }
-    hookOffs.length = 0
-  }, 'dsh-liubian-notes: 标记实例已卸载并清理本实例池缓存')
+    /* 🔴-8（v0.5.5 修复）：**清理逻辑必须在返回的 disposer 里**。
+     * `ctx.effect(fn)` 的 fn 是「立即执行」的注册面（同文件和 mountPanelRoutes 都是这个语义），
+     * 旧写法把 `disposed = true` 放在 fn 体里 → **挂载瞬间就自我标记已卸载** →
+     * 该实例此后所有 savePool/saveRetired 全被自家守卫拒绝：日志照打「轮封存」、聚合照跑，
+     * 便签却再也不落盘（14:44 起线上池文件停更数小时），且**重启也治不好**（新实例同样生来 disposed）。
+     */
+    return () => {
+      /* 🟠-3：卸载本实例时置 disposed —— 在途异步闭包（聚合最长 120s）此后不得再 savePool，
+       * 否则它会把旧快照整份写回、覆盖新实例期间的写入。
+       * ⚠ 只清**本实例**的 poolCache；共享守卫（池锁 / 聚合在飞 / 同轮 token）**不清**，
+       * 它们属于进程内其它仍存活的实例。 */
+      disposed = true
+      poolCache.clear()
+      /* 🟠-7：显式摘掉本实例的钩子——否则「已卸载实例继续收 session/event」会重演 */
+      for (const offFn of hookOffs) { try { offFn() } catch { /* 已摘 */ } }
+      hookOffs.length = 0
+    }
+  }, 'dsh-liubian-notes: 卸载时标记实例已卸载、清池缓存并摘钩子')
 
   ctx.logger?.info?.(
     `[dsh-liubian-notes] v${PLUGIN_VERSION} 便签已挂载：池 ${cfg.poolSize}/注入 ${cfg.injectTop}/R ${cfg.aggregateRounds}`
