@@ -329,17 +329,6 @@ window.__ModuleLoader__.load({
           key: 'dsh-liubian-notes',
         }, NotesSettingsPage)
       })
-
-      /* 设置页：设置 → 插件区里的「流变便签」页（契约：settings.plugins.tab，
-       * registerOptions = id 必填 + order/label；section 对组件不提供 props，页面自取数）。
-       * 内容 = 聚合 API 配置（形态参考设置中的模型配置）。 */
-      ctx.slots.inject('settings.plugins.tab', function () {
-        return ctx.slots.register({
-          name: 'settings.plugins.tab',
-          id: 'liubian-notes',
-          label: '流变便签',
-        }, NotesSettingsPage)
-      })
     }
 
     /* ⚠ 必须返回模块导出：加载器以**工厂返回值**作为该客户端的模块（官方客户端模块与

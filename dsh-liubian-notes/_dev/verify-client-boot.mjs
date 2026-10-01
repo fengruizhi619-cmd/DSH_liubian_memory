@@ -88,7 +88,6 @@ say('inject 回传会话 id + 存活标记', !!viewDef && typeof viewDef.inject 
 say('取不到绑定时不抛错（降级）', !!viewDef && typeof viewDef.inject === 'function'
   && (function () { try { const r = viewDef.inject('sess-dead'); return r.sessionId === 'sess-dead' && r.sessionLive === false } catch (e) { return false } })(),
   viewDef && typeof viewDef.inject === 'function' ? JSON.stringify(viewDef.inject('sess-dead')) : '-')
-say('设置页组件是函数', typeof comps['settings.plugins.tab'] === 'function', typeof comps['settings.plugins.tab'])
 
 /* ★ 便签插件页上的设置表单：plugins.bundle.config（keyed，key = bundle 包名） */
 const bundleCfgDef = defs['plugins.bundle.config']
@@ -98,11 +97,9 @@ say('插件页设置表单组件是函数', typeof comps['plugins.bundle.config'
 say('不再误用 plugins.item（那是官方组新卡，界面看不到）', !defs['plugins.item'],
   defs['plugins.item'] ? '仍注册（应删除）' : '未注册 ✓')
 
-/* 设置页：settings.plugins.tab（流变便签 · 聚合 API 配置） */
-const setPageDef = defs['settings.plugins.tab']
-say('★ 注册设置页 settings.plugins.tab', !!setPageDef && setPageDef.id === 'liubian-notes' && setPageDef.label === '流变便签',
-  setPageDef ? ('id=' + setPageDef.id + ' label=' + setPageDef.label) : '（未注册）')
-say('设置页组件是函数', typeof comps['settings.plugins.tab'] === 'function', typeof comps['settings.plugins.tab'])
+/* 独立设置页已删（管理员 2026-10-01 定夺：设置入口只保留插件页便签条目下的表单）——防回归断言 */
+say('不再注册 settings.plugins.tab（独立设置页已删）', !defs['settings.plugins.tab'],
+  defs['settings.plugins.tab'] ? '仍注册（应删除）' : '未注册 ✓')
 
 /* 输入条 overlay 已撤除（管理员 2026-10-01 定夺：保持原生输入框，不做花活）——防回归断言 */
 say('★ 不再注册输入框遮挡 overlay（已撤除）',
