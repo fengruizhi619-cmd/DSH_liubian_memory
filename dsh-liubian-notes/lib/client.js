@@ -14,6 +14,19 @@ window.__ModuleLoader__.load({
       // ── 根：与对话主区同底，毛玻璃通透 ──
       '.nts-panel{display:flex;flex-direction:column;min-width:0;height:100%;background:color-mix(in srgb, var(--dsw-alias-bg-base) 72%, transparent);-webkit-backdrop-filter:blur(18px) saturate(1.15);backdrop-filter:blur(18px) saturate(1.15);color:var(--dsw-alias-label-primary);font-size:14px;overflow:hidden;position:relative}',
       // （原 .nts-header / .nts-crumb / .nts-scope / .nts-stats 已随表头一并删除——栏目标签由插槽提供，不再重复）
+      // ── 设置页（settings.plugins.tab：流变便签 · 聚合 API 配置）──
+      '.nts-set{max-width:660px;margin:0 auto;padding:26px 32px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}',
+      '.nts-setTitle{font-size:15px;font-weight:600;color:var(--dsw-alias-label-primary);line-height:22px}',
+      '.nts-setHint{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:20px}',
+      '.nts-setRow{display:flex;flex-direction:column;gap:6px}',
+      '.nts-setLabel{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}',
+      '.nts-setInput{box-sizing:border-box;width:100%;background:var(--dsw-specific-input-major,transparent);border:.5px solid var(--dsw-alias-border-l2);border-radius:10px;padding:8px 12px;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;outline:none}',
+      '.nts-setInput:focus{border-color:var(--dsw-alias-border-l3)}',
+      '.nts-setBtns{display:flex;gap:10px;align-items:center}',
+      '.nts-setBtn{cursor:pointer;border:none;border-radius:10px;padding:7px 16px;font:inherit;font-size:13px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.nts-setBtn[disabled]{opacity:.55;cursor:default}',
+      '.nts-setBtn:hover:not([disabled]){filter:brightness(1.08)}',
+      '.nts-setMsg{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);white-space:pre-wrap;word-break:break-all}',
       // （v0.4.6/v0.4.7 的输入框遮挡 overlay 已整体撤除——管理员定夺：保持原生输入框，不做花活）
       // ── 卡片网格 ──
       '.nts-scroll{min-height:0;flex:auto;overflow-y:auto;scrollbar-gutter:stable;padding:18px 32px}',
@@ -173,6 +186,89 @@ window.__ModuleLoader__.load({
       return React.createElement('div', { className: 'nts-panel' }, body)
     }
 
+    /** 设置页（settings.plugins.tab：设置 → 插件 → 流变便签）：聚合 LLM 的 API 配置。
+     *  形态参考设置中的模型配置；数据走本插件宿主路由的 op=settings / settings-save / settings-test。 */
+    function NotesSettingsPage() {
+      var st = React.useState({ url: '', model: '', key: '', loaded: false, msg: '', busy: false })
+      var state = st[0]
+      var setState = st[1]
+
+      React.useEffect(function () {
+        var alive = true
+        fetch('/api/liubian-notes?op=settings')
+          .then(function (r) { return r.json() })
+          .then(function (j) {
+            if (!alive) return
+            setState(function (s) {
+              return Object.assign({}, s, {
+                url: j.llmApiUrl || '', model: j.llmApiModel || '', loaded: true,
+                msg: j.llmKeySet ? ('当前 Key：' + j.llmApiKeyMasked + '（留空保存 = 保持不变）') : '当前未配置 Key',
+              })
+            })
+          })
+          .catch(function () { if (alive) setState(function (s) { return Object.assign({}, s, { loaded: true, msg: '读取当前配置失败（宿主路由不可达）' }) }) })
+        return function () { alive = false }
+      }, [])
+
+      function post(op, payload, done) {
+        setState(function (s) { return Object.assign({}, s, { busy: true }) })
+        fetch('/api/liubian-notes?op=' + op, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+          .then(function (r) { return r.json() })
+          .then(function (j) { done(j) })
+          .catch(function (e) { done({ ok: false, error: String((e && e.message) || e) }) })
+      }
+      function save() {
+        post('settings-save', { llmApiUrl: state.url, llmApiModel: state.model, llmApiKey: state.key }, function (j) {
+          setState(function (s) {
+            return Object.assign({}, s, {
+              busy: false,
+              key: '',
+              msg: (j && j.ok) ? '已保存 ✓ 下一次聚合（≤ R 轮）即使用新配置，无需重启。' : '保存失败：' + ((j && (j.error || j.message)) || '未知'),
+            })
+          })
+        })
+      }
+      function test() {
+        post('settings-test', { llmApiKey: state.key }, function (j) {
+          setState(function (s) {
+            return Object.assign({}, s, {
+              busy: false,
+              msg: (j && j.ok) ? '连接成功 ✓（该端点与 Key 可用）' : '连接失败：' + ((j && j.error) || '未知'),
+            })
+          })
+        })
+      }
+
+      var row = function (labelText, input) {
+        return React.createElement('div', { className: 'nts-setRow' },
+          React.createElement('span', { className: 'nts-setLabel' }, labelText), input)
+      }
+      var mkInput = function (value, onChange, placeholder, type) {
+        return React.createElement('input', {
+          className: 'nts-setInput', value: value, type: type || 'text', placeholder: placeholder || '',
+          onChange: function (e) { onChange(e.target.value) },
+        })
+      }
+
+      return React.createElement('div', { className: 'nts-set' },
+        React.createElement('div', { className: 'nts-setTitle' }, '流变便签 · 聚合 API 配置'),
+        React.createElement('div', { className: 'nts-setHint' },
+          '用于「多轮对话 → 自动聚合便签」的 LLM 通道。保存后**下一次聚合即生效**（无需重启）；'
+          + '「测试连接」会向该端点发一次最小对话调用。'),
+        row('API 地址', mkInput(state.url, function (v) { setState(function (s) { return Object.assign({}, s, { url: v }) }) }, 'https://api.deepseek.com/chat/completions')),
+        row('模型名', mkInput(state.model, function (v) { setState(function (s) { return Object.assign({}, s, { model: v }) }) }, 'deepseek-flash')),
+        row('API Key', mkInput(state.key, function (v) { setState(function (s) { return Object.assign({}, s, { key: v }) }) },
+          state.msg.indexOf('当前 Key') === 0 ? state.msg : '留空 = 保持现有 Key 不变', 'password')),
+        React.createElement('div', { className: 'nts-setBtns' },
+          React.createElement('button', { className: 'nts-setBtn', disabled: state.busy, onClick: save }, '保存'),
+          React.createElement('button', { className: 'nts-setBtn', disabled: state.busy, onClick: test }, '测试连接'),
+          React.createElement('span', { className: 'nts-setMsg' }, state.msg)))
+    }
+
     /* 客户端服务声明（结构照 ui-trajectory 的 `const inject = [...]`）：
      * 只声明真正用到的——slots（插槽注册）+ sessions（在 inject(sessionId) 里解析会话绑定）。 */
     exports.inject = ['slots', 'sessions']
@@ -209,6 +305,17 @@ window.__ModuleLoader__.load({
             return { sessionId: sessionId, sessionLive: live }
           },
         }, NotesApp)
+      })
+
+      /* 设置页：设置 → 插件区里的「流变便签」页（契约：settings.plugins.tab，
+       * registerOptions = id 必填 + order/label；section 对组件不提供 props，页面自取数）。
+       * 内容 = 聚合 API 配置（形态参考设置中的模型配置）。 */
+      ctx.slots.inject('settings.plugins.tab', function () {
+        return ctx.slots.register({
+          name: 'settings.plugins.tab',
+          id: 'liubian-notes',
+          label: '流变便签',
+        }, NotesSettingsPage)
       })
     }
 

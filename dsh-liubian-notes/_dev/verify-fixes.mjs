@@ -231,6 +231,30 @@ const cfg = T.resolveConfig({})
   try { fs.rmSync(path.join(poolsDir, key + '.retired.jsonl'), { force: true }) } catch {}
 }
 
+/* 设置读写：settingsWrite 只动 llmApi* 三键、其余键保留；有备份；settingsRead 掩码 */
+{
+  const liubianDir = path.join(HOME, 'liubian')
+  fs.mkdirSync(liubianDir, { recursive: true })
+  const file = path.join(liubianDir, 'config.json')
+  fs.writeFileSync(file, JSON.stringify({ liubianRoot: 'C:/x', workspace: '工作组', memoryScript: 'm.py', llmApiUrl: 'https://old.example/v1', llmApiKey: 'OLDKEY', llmApiModel: 'old-model' }, null, 2), 'utf8')
+  const w = T.settingsWrite({ llmApiUrl: 'https://new.example/v1', llmApiKey: 'NEWKEY', llmApiModel: 'new-model' })
+  const after = JSON.parse(fs.readFileSync(file, 'utf8'))
+  const baks = fs.readdirSync(liubianDir).filter((f) => f.startsWith('config.json.bak-notes-settings-'))
+  check('设置写：返回 true 且三键更新', w === true
+    && after.llmApiUrl === 'https://new.example/v1' && after.llmApiKey === 'NEWKEY' && after.llmApiModel === 'new-model',
+    JSON.stringify({ url: after.llmApiUrl, key: after.llmApiKey, model: after.llmApiModel }))
+  check('设置写：其余键保留（单一来源文件不被破坏）',
+    after.liubianRoot === 'C:/x' && after.workspace === '工作组' && after.memoryScript === 'm.py', '')
+  check('设置写：留有备份', baks.length >= 1, baks.join(','))
+  const rd = T.settingsRead()
+  check('设置读：Key 只回掩码', rd.llmKeySet === true && rd.llmApiKeyMasked.indexOf('NEWKEY') < 0 && rd.llmApiKeyMasked.includes('…'),
+    'masked=' + rd.llmApiKeyMasked)
+  // 掩码回写防护：把掩码当 key 保存不应覆盖真实 key
+  const w2 = T.settingsWrite({ llmApiKey: rd.llmApiKeyMasked })
+  const after2 = JSON.parse(fs.readFileSync(file, 'utf8'))
+  check('设置写：掩码不覆盖真实 Key（空/掩码不落盘）', w2 === false || after2.llmApiKey === 'NEWKEY', 'key=' + after2.llmApiKey)
+}
+
 /* M4 回归：封存过滤与双口径 */
 {
   const p = { meta: { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 } }

@@ -14,7 +14,7 @@
  * 方案文档：E:\DSH_data\流变系统\docs\便签系统_DSH实施方案.md
  */
 import { randomUUID, createHash } from 'node:crypto'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 /* ── 可选依赖：有 junction 就用 defineTool，没有就退回裸对象（绝不因依赖挂掉插件）── */
@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.4.8'
+export const PLUGIN_VERSION = '0.5.0'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -425,20 +425,26 @@ export function buildPackPrompt(text) {
     '只输出一个 JSON 对象：{"head":"...","body":"..."}，不要输出任何其他内容。\n\n对话窗口：\n' + text
 }
 
-/** LLM 生成便签（头+正文）。任何失败返回 null → 调用方回退拼接。 */
+/** 聚合 LLM 生成便签（头+正文）。任何失败返回 null → 调用方回退拼接。
+ *  🟡 设置热生效（v0.5.0）：每次聚合**重读** llmApi* 三键（设置页保存后下一次聚合即用新值，无需重启）。 */
 export async function generateNoteViaLlm(cfg, turns) {
   try {
-    if (cfg.noteLlmGen === false || !cfg.diaryApiKey) return null
+    if (cfg.noteLlmGen === false) return null
+    const fresh = readJson(memoryConfigFile()) || {}
+    const useUrl = fresh.llmApiUrl || cfg.diaryApiUrl
+    const useKey = fresh.llmApiKey || cfg.diaryApiKey
+    const useModel = fresh.llmApiModel || cfg.diaryApiModel
+    if (!useKey) return null
     const text = turns.map(t =>
       `【轮${t.turn}】问：${(t.human || []).join(' ') || '（无）'}\n答：${(t.assistant || []).join(' ') || '（无）'}`,
     ).join('\n\n').slice(0, 12000)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), cfg.llmTimeoutMs)
     try {
-      const res = await fetch(cfg.diaryApiUrl, {
+      const res = await fetch(useUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.diaryApiKey}` },
-        body: JSON.stringify({ model: cfg.diaryApiModel, messages: [{ role: 'user', content: buildPackPrompt(text) }] }),
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${useKey}` },
+        body: JSON.stringify({ model: useModel, messages: [{ role: 'user', content: buildPackPrompt(text) }] }),
         signal: controller.signal,
       })
       if (!res.ok) return null
@@ -885,6 +891,84 @@ function sendJson(res, code, obj) {
   } catch { /* 客户端断开等，忽略 */ }
 }
 
+function readBody(req) {
+  return new Promise((resolve) => {
+    let raw = ''
+    req.on('data', (c) => { raw += c })
+    req.on('end', () => { try { resolve(JSON.parse(raw || '{}')) } catch { resolve({}) } })
+    req.on('error', () => resolve({}))
+  })
+}
+
+function maskKey(k) {
+  const s = String(k || '')
+  if (!s) return ''
+  /* 短 Key 防泄漏：≤14 位时只留前 3 位（否则 slice(0,8)+slice(-4) 会把全文拼回去） */
+  if (s.length <= 14) return s.slice(0, 3) + '…'
+  return s.slice(0, 8) + '…' + s.slice(-4)
+}
+
+/** 设置页读侧：聚合 LLM 三键（Key 只回掩码，不回原文）。 */
+export function settingsRead() {
+  const mem = readJson(memoryConfigFile()) || {}
+  const key = String(mem.llmApiKey || '')
+  return {
+    llmApiUrl: String(mem.llmApiUrl || ''),
+    llmApiModel: String(mem.llmApiModel || ''),
+    llmKeySet: !!key,
+    llmApiKeyMasked: maskKey(key),
+  }
+}
+
+/** 设置页写侧：只更新提供的非空 llmApi* 字段；**只动 llmApi* 三键**（文件归记忆向量名下，其余键原样保留）。
+ *  先备份（.bak-notes-settings-<ts>）再原子替换。返回 boolean。 */
+export function settingsWrite(patch) {
+  if (disposed) return false
+  try {
+    const file = memoryConfigFile()
+    const cur = readJson(file) || {}
+    const next = { ...cur }
+    const p = patch || {}
+    if (typeof p.llmApiUrl === 'string' && p.llmApiUrl.trim()) next.llmApiUrl = p.llmApiUrl.trim()
+    /* 掩码防护：设置卡回传的 Key 若含省略号（…）说明是**掩码**而非真实 Key——跳过，不得覆盖真值。 */
+    if (typeof p.llmApiKey === 'string' && p.llmApiKey.trim() && p.llmApiKey.indexOf('…') < 0) next.llmApiKey = p.llmApiKey.trim()
+    if (typeof p.llmApiModel === 'string' && p.llmApiModel.trim()) next.llmApiModel = p.llmApiModel.trim()
+    mkdirSync(dirname(file), { recursive: true })
+    if (existsSync(file)) { try { copyFileSync(file, `${file}.bak-notes-settings-${Date.now()}`) } catch {} }
+    const tmp = `${file}.tmp-${process.pid}`
+    writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8')
+    renameSync(tmp, file)
+    return true
+  } catch (err) {
+    currentLogger?.warn?.(`[dsh-liubian-notes] 写入共享配置失败：${(err && err.message) || err}`)
+    return false
+  }
+}
+
+/** 设置页「测试连接」：用传入 Key（或已存 Key）对聚合端点做一次最小对话调用。 */
+export async function settingsTest(keyOverride) {
+  const s = settingsRead()
+  const key = String(keyOverride || '').trim() || s.llmApiKey
+  const useUrl = s.llmApiUrl
+  const useModel = s.llmApiModel
+  const missing = [!key && 'API Key', !useUrl && 'API 地址', !useModel && '模型名'].filter(Boolean)
+  if (missing.length) return { ok: false, error: '缺少 ' + missing.join(' / ') }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 30000)
+  try {
+    const res = await fetch(useUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model: useModel, messages: [{ role: 'user', content: '回复ok' }] }),
+      signal: controller.signal,
+    })
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}：${(await res.text()).slice(0, 200)}` }
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) + (String(err?.message || '').includes('abort') ? '（30s 超时）' : '') }
+  } finally { clearTimeout(timer) }
+}
+
 /** 单个池 → 面板载荷（op=pool 与 op=pools 共用；**纯读**，不改写 heat）。 */
 export function poolPayload(key, pool, cfg) {
   const m = cfg.heatRounds
@@ -964,6 +1048,26 @@ export function mountPanelRoutes(ctx, cfg) {
       try {
         const url = new URL(req.url, 'http://local')
         const op = url.searchParams.get('op') || 'pools'
+        if (req.method === 'POST') {
+          const body = await readBody(req)
+          if (op === 'settings-save') {
+            const ok = settingsWrite(body || {})
+            if (!ok) { sendJson(res, 500, { error: '写入 ~/.dsh/liubian/config.json 失败（详见宿主日志）' }); return }
+            sendJson(res, 200, { ok: true }); return
+          }
+          if (op === 'settings-test') {
+            sendJson(res, 200, await settingsTest((body && body.llmApiKey) || '')); return
+          }
+          sendJson(res, 400, { error: '未知 POST op：' + op }); return
+        }
+        if (op === 'settings') {
+          const s = settingsRead()
+          sendJson(res, 200, {
+            llmApiUrl: s.llmApiUrl, llmApiModel: s.llmApiModel,
+            llmApiKeyMasked: s.llmApiKeyMasked, llmKeySet: s.llmKeySet,
+          })
+          return
+        }
         if (op === 'pool') {
           /* 「跟对话走」：面板按当前会话 id 取该会话自己的池（会话尚无池时返回空载荷，不是 404）。 */
           const sid = url.searchParams.get('session') || ''
@@ -1186,5 +1290,6 @@ export const __test = {
   pendingHasId, quarantinePool,
   injectionAlreadyDone, markInjectionDone, backfillVectors,
   poolPayload, poolPayloadForSession,
+  settingsRead, settingsWrite, settingsTest,
   MEMORY_KEYS, DEFAULTS, notesDir,
 }

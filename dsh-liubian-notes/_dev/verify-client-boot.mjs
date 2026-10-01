@@ -90,6 +90,12 @@ say('取不到绑定时不抛错（降级）', !!viewDef && typeof viewDef.injec
   viewDef && typeof viewDef.inject === 'function' ? JSON.stringify(viewDef.inject('sess-dead')) : '-')
 say('组件是函数（可挂载）', typeof comps['conversation.view'] === 'function', typeof comps['conversation.view'])
 
+/* 设置页：settings.plugins.tab（流变便签 · 聚合 API 配置） */
+const setPageDef = defs['settings.plugins.tab']
+say('★ 注册设置页 settings.plugins.tab', !!setPageDef && setPageDef.id === 'liubian-notes' && setPageDef.label === '流变便签',
+  setPageDef ? ('id=' + setPageDef.id + ' label=' + setPageDef.label) : '（未注册）')
+say('设置页组件是函数', typeof comps['settings.plugins.tab'] === 'function', typeof comps['settings.plugins.tab'])
+
 /* 输入条 overlay 已撤除（管理员 2026-10-01 定夺：保持原生输入框，不做花活）——防回归断言 */
 say('★ 不再注册输入框遮挡 overlay（已撤除）',
   !defs['conversation.input.overlay'] && registered.indexOf('conversation.input.overlay') < 0,
