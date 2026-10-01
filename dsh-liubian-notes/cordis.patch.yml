@@ -1,0 +1,8 @@
+# 流变·便签（dsh-liubian-notes）bundle 自装配声明
+# 依据：家族接口与构造标准 §1（缺 dsh.bundle.patch 的包在 patch 重读时被整批丢弃）
+# 迁移动因（管理员 2026-10-01 14:28 指令）：不得依赖 @dsh-external/dsh-super-injector
+#   —— 本包原为「纯注入」态（只存在于注入器 registry，靠其 autoRestore 加载）；
+#      注入器删除后不会自装配，故转为 profile bundles 归属（dependencies link + bundles 数组）。
+- insert:
+    - id: dsh-liubian-notes
+      name: 'dsh-liubian-notes'

@@ -1,6 +1,6 @@
 {
   "name": "dsh-liubian-notes",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "流变·便签 —— 流变系统的短期记忆子系统：会话内便签池（自动聚合 + 主动挂起），向量唯一检索，热度 l/m，赛马淘汰，晋级缓存制；对话内「流变便签」栏卡片可视化",
   "private": true,
   "type": "module",
@@ -8,7 +8,8 @@
   "exports": {
     ".": "./lib/main.mjs",
     "./client": "./lib/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
     "lib/",
@@ -28,6 +29,9 @@
   ],
   "license": "MIT",
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-runtime",
