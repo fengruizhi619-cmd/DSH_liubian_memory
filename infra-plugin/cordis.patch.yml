@@ -1,0 +1,5 @@
+# 流变·基建（dsh-liubian-infra）bundle 自装配声明
+# 依据：家族接口与构造标准 §1（缺 dsh.bundle.patch 的包在 patch 重读时被整批丢弃）
+- insert:
+    - id: dsh-liubian-infra
+      name: 'dsh-liubian-infra'

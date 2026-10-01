@@ -1,0 +1,132 @@
+/**
+ * dsh-liubian-infra 纯函数/真库桩测（家族标准 §8 第一层：不依赖宿主可跑）
+ * 跑法：node.cmd _dev/stub_test.mjs  （临时 DB，不碰生产注册表）
+ */
+import { createHash } from 'node:crypto'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import {
+  normalizeName, deriveHash, computeShortIds, recomputeShortIds,
+  openDb, registerIdentity, verifyName, lookupIdentity, listIdentities, retireIdentity,
+  resolveConfig,
+} from '../lib/impl.mjs'
+
+let pass = 0, fail = 0
+function t(label, fn) {
+  try { fn(); pass++; console.log(`  ✓ ${label}`) }
+  catch (e) { fail++; console.log(`  ✗ ${label}\n      ${e.message}`) }
+}
+function eq(a, b, msg = '') { if (a !== b) throw new Error(`期望 ${JSON.stringify(b)}，实际 ${JSON.stringify(a)} ${msg}`) }
+function throws(fn, frag) {
+  try { fn() } catch (e) { if (!String(e.message).includes(frag)) throw new Error(`错误消息缺「${frag}」：${e.message}`); return }
+  throw new Error(`应当抛出含「${frag}」的错误，但没有抛`)
+}
+
+console.log('== normalizeName ==')
+t('合法中文名', () => eq(normalizeName('基石').ok, true))
+t('去首尾空白', () => eq(normalizeName('  基石  ').name, '基石'))
+t('空名拒绝', () => eq(normalizeName('   ').ok, false))
+t('超长拒绝', () => eq(normalizeName('x'.repeat(65)).ok, false))
+t('@开头拒绝', () => eq(normalizeName('@基石').ok, false))
+t('#开头拒绝', () => eq(normalizeName('#基石').ok, false))
+t('控制字符拒绝', () => eq(normalizeName('a\u0000b').ok, false))
+t('大小写不敏感 key', () => eq(normalizeName('Alice').key, 'alice'))
+t('NFC 规范化', () => eq(normalizeName('e\u0301').name, 'é'))
+
+console.log('== deriveHash ==')
+t('SHA-256/UTF-8 配方', () => eq(deriveHash('基石'), createHash('sha256').update('基石', 'utf8').digest('hex')))
+t('全长 64 hex 小写', () => eq(/^[0-9a-f]{64}$/.test(deriveHash('基石')), true))
+t('同名同 hash、异名异 hash', () => {
+  eq(deriveHash('基石'), deriveHash('基石'))
+  if (deriveHash('基石') === deriveHash('博物君')) throw new Error('不同名不应同 hash')
+})
+t('NFC 等价形式同 hash', () => eq(deriveHash(normalizeName('e\u0301').name), deriveHash('é')))
+
+console.log('== computeShortIds（git 式最短唯一前缀） ==')
+t('无碰撞 → 恒 8 位', () => {
+  const m = computeShortIds(['aaaaaaaa' + '0'.repeat(56), 'bbbbbbbb' + '0'.repeat(56)])
+  eq(m['aaaaaaaa' + '0'.repeat(56)].length, 8)
+})
+t('前 8 位碰撞 → 双双扩位到 9', () => {
+  const h1 = 'abcdef01' + '0'.repeat(56), h2 = 'abcdef01' + 'f'.repeat(56)
+  const m = computeShortIds([h1, h2])
+  eq(m[h1], h1.slice(0, 9), 'h1 扩到 9')
+  eq(m[h2], h2.slice(0, 9), 'h2 扩到 9')
+})
+t('空集合/单条 → 8 位', () => {
+  eq(computeShortIds([])['x'], undefined)
+  eq(computeShortIds(['ab12cd34' + '9'.repeat(56) ])['ab12cd34' + '9'.repeat(56)].length, 8)
+})
+
+console.log('== 注册表（临时真库） ==')
+const dir = mkdtempSync(join(tmpdir(), 'infra-stub-'))
+const dbPath = join(dir, 'registry.db')
+const db = openDb(dbPath)
+
+t('注册返回完整身份', () => {
+  const row = registerIdentity(db, '基石', '流变基建维护者')
+  eq(row.name, '基石'); eq(row.status, 'active')
+  eq(row.hash, deriveHash('基石'))
+  eq(row.short_id.length, 8)
+  if (!row.created_at) throw new Error('缺 created_at')
+})
+t('重复注册拒绝（独热）', () => throws(() => registerIdentity(db, '基石'), '已被注册'))
+t('大小写变体同 key 拒绝', () => {
+  registerIdentity(db, 'Jasmine', '大小写用例')
+  throws(() => registerIdentity(db, 'jasmine'), '已被注册')
+})
+t('verify 未占用 → available', () => {
+  const r = verifyName(db, '博物君')
+  eq(r.available, true); if (!r.hash) throw new Error('应给出将来的 hash')
+})
+t('verify 已占用 → 拒绝理由', () => {
+  const r = verifyName(db, '基石')
+  eq(r.available, false); eq(r.status, 'active')
+})
+t('lookup 按名', () => eq(lookupIdentity(db, { name: '基石' }).row.hash, deriveHash('基石')))
+t('lookup 按短 ID', () => {
+  const short = lookupIdentity(db, { name: '基石' }).row.short_id
+  eq(lookupIdentity(db, { id: short }).row.name, '基石')
+})
+t('lookup 按全 hash', () => eq(lookupIdentity(db, { id: deriveHash('基石') }).row.name, '基石'))
+t('lookup 未命中', () => eq(lookupIdentity(db, { id: 'deadbeef' + '0'.repeat(56) }).row, null))
+t('lookup 非法 id 拒绝', () => throws(() => lookupIdentity(db, { id: 'xyz' }), '十六进制'))
+t('构造 8 位前缀碰撞 → 扩位后 lookup 不歧义', () => {
+  // 直接插两条手工 hash（绕过注册派生），再触发重算
+  db.prepare('INSERT INTO identities (name, name_key, hash, short_id, status, created_at) VALUES (?,?,?,?,?,?)')
+    .run('碰撞甲', '碰撞甲', 'abcdef01' + '0'.repeat(56), 'abcdef01', 'active', '2026-01-01T00:00:00Z')
+  db.prepare('INSERT INTO identities (name, name_key, hash, short_id, status, created_at) VALUES (?,?,?,?,?,?)')
+    .run('碰撞乙', '碰撞乙', 'abcdef01' + 'f'.repeat(56), 'abcdef01', 'active', '2026-01-01T00:01:00Z')
+  recomputeShortIds(db)
+  const rows = listIdentities(db)
+  const jia = rows.find(r => r.name === '碰撞甲'), yi = rows.find(r => r.name === '碰撞乙')
+  if (jia.short_id.length < 9 || yi.short_id.length < 9) throw new Error(`应扩位到 ≥9：${jia.short_id} / ${yi.short_id}`)
+  eq(lookupIdentity(db, { id: jia.short_id }).row.name, '碰撞甲')
+})
+t('retire 停用但独热保留', () => {
+  registerIdentity(db, '临时测试员', '桩测用')
+  const r = retireIdentity(db, '临时测试员', '桩测结束')
+  eq(r.status, 'retired')
+  throws(() => registerIdentity(db, '临时测试员'), '独热保留')
+})
+t('retire 幂等', () => {
+  const r = retireIdentity(db, '临时测试员')
+  eq(r.alreadyRetired, true)
+})
+t('未注册名 retire 拒绝', () => throws(() => retireIdentity(db, '不存在的人'), '不在册'))
+
+db.close()
+try { rmSync(dir, { recursive: true, force: true }) } catch {}
+
+console.log('== resolveConfig ==')
+t('默认值 + input 覆盖 + 字符串布尔收敛', () => {
+  const c = resolveConfig({ probeTimeoutMs: '5000', embedPort: '' })
+  eq(c.probeTimeoutMs, 5000)
+  eq(c.embedPort, 8082, '空串不覆盖')
+  if (typeof c.dbPath !== 'string' || !c.dbPath.includes('registry.db')) throw new Error('dbPath 默认值异常')
+})
+
+console.log(`\n桩测结果：${pass} 过 / ${fail} 败`)
+process.exitCode = fail ? 1 : 0
