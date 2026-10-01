@@ -9,7 +9,7 @@ import { join } from 'node:path'
 
 import {
   normalizeName, deriveHash, computeShortIds, recomputeShortIds, sessionHashFor,
-  openDb, registerIdentity, verifyName, lookupIdentity, listIdentities, retireIdentity,
+  openDb, registerIdentity, verifyName, lookupIdentity, listIdentities, retireIdentity, renameIdentity,
   bindSession, unbindSession, bindingFor, listBindings,
   attributeWorkspace, noteSession, seenWorkspaceFor,
   callerSessionOf,
@@ -216,9 +216,6 @@ t('与 sessionHashFor 闭环：caller.id 可直接派生会话哈希', () => {
   eq(sessionHashFor(c.id), sessionHashFor('sess-1'))
 })
 
-db.close()
-try { rmSync(dir, { recursive: true, force: true }) } catch {}
-
 console.log('== resolveConfig ==')
 t('默认值 + input 覆盖 + 字符串布尔收敛', () => {
   const c = resolveConfig({ probeTimeoutMs: '5000', embedPort: '' })
@@ -226,6 +223,75 @@ t('默认值 + input 覆盖 + 字符串布尔收敛', () => {
   eq(c.embedPort, 8082, '空串不覆盖')
   if (typeof c.dbPath !== 'string' || !c.dbPath.includes('registry.db')) throw new Error('dbPath 默认值异常')
 })
+
+console.log('== rename（v0.3.0：hash 不变 + 别名 + 改名账目） ==')
+t('改名成功：hash/short_id/注册时间不变，只换名', () => {
+  const before = lookupIdentity(db, { name: '基石' }).row
+  const after = renameIdentity(db, '基石', '基石Pro', '基石', '契约 v1.1 改名用例')
+  eq(after.name, '基石Pro')
+  eq(after.hash, before.hash, 'hash 必须不变')
+  eq(after.short_id, before.short_id, 'short_id 不变')
+  eq(after.created_at, before.created_at, '注册时间不变')
+  eq(db.prepare('SELECT COUNT(*) AS c FROM renames WHERE hash = ?').get(after.hash).c, 1)
+})
+t('新名 lookup 命中；旧名回查 → 别名指向同一 hash', () => {
+  const h = deriveHash('基石')
+  eq(lookupIdentity(db, { name: '基石Pro' }).row.hash, h)
+  const r = lookupIdentity(db, { name: '基石' })
+  eq(r.row, null)
+  eq(r.alias.hash, h)
+})
+t('verify 旧名 → 判为历史名（不可注册）', () => {
+  const r = verifyName(db, '基石')
+  eq(r.available, false)
+  eq(r.status, 'alias')
+  eq(r.aliasOf, '基石Pro')
+})
+t('重复注册旧名被拒（改名不改身份）', () => throws(() => registerIdentity(db, '基石'), '历史名'))
+t('改回自己的历史名 → 允许，且该名不再算别名', () => {
+  const back = renameIdentity(db, '基石Pro', '基石', '基石')
+  eq(back.name, '基石')
+  eq(back.hash, deriveHash('基石'))
+  eq(lookupIdentity(db, { name: '基石' }).row.hash, back.hash)
+  eq(db.prepare('SELECT COUNT(*) AS c FROM name_aliases WHERE name_key = ?').get('基石').c, 0)
+})
+t('撞他人名 → 拒且零写入（身份表逐行比对）', () => {
+  const snap = () => listIdentities(db).map(r => `${r.name}|${r.hash}|${r.status}`).join(',')
+  const before = snap()
+  throws(() => renameIdentity(db, '基石', 'Jasmine'), '已被占用')
+  eq(snap(), before, '拒绝时必须零写入')
+})
+t('新名为空 / 超长 → 拒', () => {
+  throws(() => renameIdentity(db, '基石', '   '), '新名无效')
+  throws(() => renameIdentity(db, '基石', 'x'.repeat(65)), '新名无效')
+})
+t('同名改名 → 幂等 noop，不新增账目', () => {
+  const n0 = db.prepare('SELECT COUNT(*) AS c FROM renames').get().c
+  eq(renameIdentity(db, '基石', '基石').noop, true)
+  eq(db.prepare('SELECT COUNT(*) AS c FROM renames').get().c, n0)
+})
+t('停用身份不可改名', () => {
+  registerIdentity(db, '待停用', null)
+  retireIdentity(db, '待停用', '用例')
+  throws(() => renameIdentity(db, '待停用', '待停用2'), '停用身份不可改名')
+})
+t('占用他人历史名作新名 → 拒', () => {
+  registerIdentity(db, '甲', null)
+  registerIdentity(db, '乙', null)
+  renameIdentity(db, '甲', '甲Pro', null)
+  throws(() => renameIdentity(db, '乙', '甲'), '历史名')
+})
+t('不存在的名字 → 拒', () => throws(() => renameIdentity(db, '不存在的人', 'X'), '不在册'))
+t('改名不影响会话绑定（独热配对仍在，只是显示新名）', () => {
+  const sh = 'a1b2c3d4'
+  bindSession(db, sh, 'Jasmine')
+  renameIdentity(db, 'Jasmine', 'JasminePro', '基石')
+  eq(bindingFor(db, sh).name, 'JasminePro')
+  eq(lookupIdentity(db, { name: 'JasminePro' }).row.hash, deriveHash('Jasmine'))
+})
+
+db.close()
+try { rmSync(dir, { recursive: true, force: true }) } catch {}
 
 console.log(`\n桩测结果：${pass} 过 / ${fail} 败`)
 process.exitCode = fail ? 1 : 0

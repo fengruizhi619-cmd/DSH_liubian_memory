@@ -24,7 +24,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const PLUGIN_NAME = 'dsh-liubian-infra'
-export const PLUGIN_VERSION = '0.2.2'
+export const PLUGIN_VERSION = '0.3.0'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
@@ -179,6 +179,27 @@ CREATE TABLE IF NOT EXISTS session_seen (
   last_seen    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+/* v0.3.0 改名支持（管理员 2026-10-01 联合任务 · B1 模型）：
+   hash = 账号 ID（注册时派生，此后不可变）；name = 可变展示名。
+   改名只动 identities.name/name_key；旧名入别名表供 lookup 回查（历史引用不断裂）；每次改名留账。 */
+CREATE TABLE IF NOT EXISTS name_aliases (
+  name_key   TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  hash       TEXT NOT NULL,
+  renamed_at TEXT NOT NULL,
+  note       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_aliases_hash ON name_aliases(hash);
+CREATE TABLE IF NOT EXISTS renames (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  hash     TEXT NOT NULL,
+  old_name TEXT NOT NULL,
+  new_name TEXT NOT NULL,
+  at       TEXT NOT NULL,
+  actor    TEXT,
+  note     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_renames_hash ON renames(hash);
 `
 
 export function openDb(dbPath) {
@@ -212,7 +233,13 @@ export function registerIdentity(db, rawName, note, workspace) {
     throw new Error(`[拒绝] 名字「${name}」已被注册：${st}｜短ID ${dup.short_id}｜注册于 ${dup.created_at}。全局独热，同一名字不可二次注册。`)
   }
   const byHash = db.prepare('SELECT name FROM identities WHERE hash = ?').get(hash)
-  if (byHash) throw new Error(`[拒绝] 哈希与在册条目「${byHash.name}」碰撞（SHA-256 碰撞属异常，请核查派生函数是否一致）`)
+  if (byHash) {
+    // v0.3.0：改名不改身份，旧名的 hash 仍归原身份 → 旧名不可被二次注册
+    const wasAlias = db.prepare('SELECT renamed_at FROM name_aliases WHERE name_key = ? AND hash = ?').get(key, hash)
+    throw new Error(wasAlias
+      ? `[拒绝] 名字「${name}」是「${byHash.name}」的历史名（${wasAlias.renamed_at} 改名）——改名不改身份，旧名不可被二次注册。`
+      : `[拒绝] 哈希与在册条目「${byHash.name}」碰撞（SHA-256 碰撞属异常，请核查派生函数是否一致）`)
+  }
   const now = new Date().toISOString()
   db.prepare('INSERT INTO identities (name, name_key, hash, short_id, status, workspace, note, created_at) VALUES (?,?,?,?,?,?,?,?)')
     .run(name, key, hash, hash.slice(0, 8), 'active', ws, note ? String(note) : null, now)
@@ -255,7 +282,18 @@ export function verifyName(db, rawName) {
   const norm = normalizeName(rawName)
   if (!norm.ok) return { ok: false, available: false, error: norm.error }
   const row = db.prepare('SELECT name, status, short_id, created_at, retired_at, workspace FROM identities WHERE name_key = ?').get(norm.key)
-  if (!row) return { ok: true, available: true, name: norm.name, hash: deriveHash(norm.name) }
+  if (!row) {
+    const alias = db.prepare('SELECT hash, renamed_at FROM name_aliases WHERE name_key = ?').get(norm.key)
+    if (alias) {
+      const cur = db.prepare('SELECT name FROM identities WHERE hash = ?').get(alias.hash)
+      return {
+        ok: true, available: false, name: norm.name, status: 'alias',
+        aliasOf: cur ? cur.name : null, hash: alias.hash, shortId: alias.hash.slice(0, 8),
+        reason: `是「${cur ? cur.name : '?'}」的历史名（${alias.renamed_at} 改名）——改名不改身份，不可注册`,
+      }
+    }
+    return { ok: true, available: true, name: norm.name, hash: deriveHash(norm.name) }
+  }
   return {
     ok: true,
     available: false,
@@ -274,7 +312,10 @@ export function lookupIdentity(db, { name, id } = {}) {
     const norm = normalizeName(name)
     if (!norm.ok) throw new Error(norm.error)
     const row = db.prepare('SELECT * FROM identities WHERE name_key = ?').get(norm.key)
-    return { by: 'name', row: row || null }
+    if (row) return { by: 'name', row }
+    // v0.3.0：旧名回查（历史引用不断裂）
+    const alias = db.prepare('SELECT name, hash, renamed_at FROM name_aliases WHERE name_key = ?').get(norm.key)
+    return { by: 'name', row: null, alias: alias || null }
   }
   if (id) {
     const q = String(id).trim().toLowerCase()
@@ -303,6 +344,57 @@ export function retireIdentity(db, rawName, note) {
   db.prepare('UPDATE identities SET status = ?, retired_at = ?, retired_note = ? WHERE name_key = ?')
     .run('retired', now, note ? String(note) : null, norm.key)
   return db.prepare('SELECT * FROM identities WHERE name_key = ?').get(norm.key)
+}
+
+/**
+ * 改名（v0.3.0，B1 模型）：hash 是账号 ID **不可变**，name 是可变展示名。
+ * 只改 identities.name/name_key；hash / short_id / created_at / workspace / note / status 与 bindings **全不动**；
+ * 旧名登记进 name_aliases（lookup 旧名可回查，历史引用不断裂），并写一行 renames 账目。
+ * 校验任一不过 → 抛错且零写入。
+ */
+export function renameIdentity(db, rawName, rawNew, actor, note) {
+  const norm = normalizeName(rawName)
+  if (!norm.ok) throw new Error(`[拒绝] ${norm.error}`)
+  const nn = normalizeName(rawNew)
+  if (!nn.ok) throw new Error(`[拒绝] 新名无效：${nn.error}`)
+  const row = db.prepare('SELECT * FROM identities WHERE name_key = ?').get(norm.key)
+  if (!row) {
+    const viaAlias = db.prepare('SELECT hash FROM name_aliases WHERE name_key = ?').get(norm.key)
+    if (viaAlias) {
+      const cur = db.prepare('SELECT name FROM identities WHERE hash = ?').get(viaAlias.hash)
+      throw new Error(`[错误] 「${norm.name}」是历史名（现名「${cur ? cur.name : '?'}」，#${viaAlias.hash.slice(0, 8)}）——请用当前名发起改名。`)
+    }
+    throw new Error(`[错误] 名字「${norm.name}」不在册`)
+  }
+  if (row.status === 'retired') throw new Error(`[拒绝] 「${row.name}」已停用（${row.retired_at || '?'}），停用身份不可改名。`)
+  if (nn.key === row.name_key) return { ...row, noop: true }
+  const dup = db.prepare('SELECT name, status FROM identities WHERE name_key = ?').get(nn.key)
+  if (dup) throw new Error(`[拒绝] 新名「${nn.name}」已被占用（${dup.status === 'retired' ? '已停用身份，独热保留' : '在册身份'}）。`)
+  const aliasOf = db.prepare('SELECT hash FROM name_aliases WHERE name_key = ?').get(nn.key)
+  if (aliasOf && aliasOf.hash !== row.hash) {
+    throw new Error(`[拒绝] 新名「${nn.name}」是另一身份（#${aliasOf.hash.slice(0, 8)}）的历史名，不可占用。`)
+  }
+  const now = new Date().toISOString()
+  // 多条写入包事务：拒绝路径在写入前已全部拦下（真零写入），此处防"写到一半失败"留下半截状态
+  db.exec('BEGIN')
+  let moved
+  try {
+    db.prepare('UPDATE identities SET name = ?, name_key = ? WHERE hash = ?').run(nn.name, nn.key, row.hash)
+    // 绑定行存的是名字副本 → 改名必须传播（否则出现「两处真相」，与管理员 2026-10-01 要治的毛病同源）
+    moved = db.prepare('UPDATE bindings SET name = ? WHERE name = ?').run(nn.name, row.name)
+    // 改回自己的历史名时，该别名不再是"历史"，先摘掉再登记旧名
+    db.prepare('DELETE FROM name_aliases WHERE name_key = ? AND hash = ?').run(nn.key, row.hash)
+    db.prepare('INSERT OR REPLACE INTO name_aliases (name_key, name, hash, renamed_at, note) VALUES (?,?,?,?,?)')
+      .run(row.name_key, row.name, row.hash, now, note ? String(note) : null)
+    db.prepare('INSERT INTO renames (hash, old_name, new_name, at, actor, note) VALUES (?,?,?,?,?,?)')
+      .run(row.hash, row.name, nn.name, now, actor ? String(actor) : null, note ? String(note) : null)
+    db.exec('COMMIT')
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 回滚失败也要把原错抛出 */ }
+    throw e
+  }
+  const out = db.prepare('SELECT * FROM identities WHERE hash = ?').get(row.hash)
+  return { ...out, bindingsMoved: moved.changes ?? 0 }
 }
 
 /* ── 会话↔身份独热绑定（v0.2.0，管理员钉） ── */
@@ -647,7 +739,7 @@ function fmtRow(r) {
   ].filter(Boolean).join('\n')
 }
 
-const REGISTRY_ACTIONS = 'register / verify / lookup / list / retire / attribute / bind / unbind / binding / bindings / status'
+const REGISTRY_ACTIONS = 'register / verify / lookup / list / rename / retire / attribute / bind / unbind / binding / bindings / status'
 const EMBED_ACTIONS = 'embed-status / embed-ensure / embed-stop / embed-restart'
 
 function fmtBindingRow(r) {
@@ -666,7 +758,9 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
         type: 'string', required: true,
         description: `操作：${REGISTRY_ACTIONS}｜${EMBED_ACTIONS}`,
       },
-      name: { type: 'string', description: 'register/verify/lookup/retire/attribute/bind/unbind/binding 用：独特名' },
+      name: { type: 'string', description: 'register/verify/lookup/rename/retire/attribute/bind/unbind/binding 用：独特名（rename 时为旧名）' },
+      new: { type: 'string', description: 'rename 用：新名（全局独热；hash 不变，只换展示名）' },
+      actor: { type: 'string', description: 'rename 用：发起者（独特名，可选，落改名账目）' },
       id: { type: 'string', description: 'lookup 用：短或全 hash（8~64 位十六进制）' },
       session: { type: 'string', description: 'bind/unbind/binding 用：会话哈希（8 位十六进制，注入提示里给的）' },
       workspace: { type: 'string', description: 'register/attribute 用：归属工作区名（名字按工作区归属）' },
@@ -705,14 +799,19 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
         const db = state.getDb()
         const r = verifyName(db, args.name)
         if (!r.ok) return `[错误] ${r.error}`
-        return r.available
-          ? `[可用] 「${r.name}」未被占用，可注册。\n  注册后身份hash将为：${r.hash}`
-          : `[占用] 「${r.name}」${r.reason}｜短ID ${r.shortId}｜注册于 ${r.registeredAt}`
+        if (r.available) return `[可用] 「${r.name}」未被占用，可注册。\n  注册后身份hash将为：${r.hash}`
+        if (r.status === 'alias') return `[历史名] 「${r.name}」${r.reason}（现名「${r.aliasOf}」，#${r.shortId}）`
+        return `[占用] 「${r.name}」${r.reason}｜短ID ${r.shortId}｜注册于 ${r.registeredAt}`
       }
       if (action === 'lookup') {
         const db = state.getDb()
         const r = lookupIdentity(db, { name: args.name, id: args.id })
         if (r.row) return `[OK] （按${r.by === 'name' ? '名字' : 'hash'}命中）\n${fmtRow(r.row)}`
+        if (r.alias) {
+          const cur = db.prepare('SELECT * FROM identities WHERE hash = ?').get(r.alias.hash)
+          return `[历史名] 「${r.alias.name}」是旧名（${r.alias.renamed_at} 改名）——现名「${cur ? cur.name : '?'}」：\n`
+            + (cur ? fmtRow(cur) : `  #${r.alias.hash.slice(0, 8)}`)
+        }
         if (r.ambiguous) return `[歧义] 前缀命中 ${r.ambiguous.length} 条，请用更长的 hash：\n` +
           r.ambiguous.map(c => `  ${c.name}  ${c.hash}`).join('\n')
         return `[未找到] 注册表中没有该${r.by === 'name' ? '名字' : 'hash'}对应的身份。`
@@ -730,6 +829,16 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
         const row = retireIdentity(db, args.name, args.note)
         if (row.alreadyRetired) return `[OK] 「${row.name}」此前已停用（${row.retired_at}）。独热保留不回收。`
         return `[OK] 已停用「${row.name}」（${row.retired_at}）。名字独热保留，不可被再次注册。`
+      }
+      if (action === 'rename') {
+        const db = state.getDb()
+        const r = renameIdentity(db, args.name, args.new, args.actor, args.note)
+        if (r.noop) return `[OK] 新旧同名（幂等）：「${r.name}」#${r.short_id}，未产生变更与账目。`
+        const rev = db.prepare('SELECT COUNT(*) AS c FROM renames WHERE hash = ?').get(r.hash).c
+        return `[OK] 改名成功：「${args.name}」→「${r.name}」（#${r.short_id}）`
+          + `\n  └─ hash 不变（账号 ID 不随名字变）｜旧名「${args.name}」已登记别名（lookup 旧名可回查）`
+          + `｜改名账目 rev ${rev}｜同步绑定行 ${r.bindingsMoved ?? 0} 条`
+          + '\n' + fmtRow(r)
       }
 
       /* ── 会话绑定（v0.2.0） ── */
