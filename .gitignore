@@ -53,3 +53,6 @@ Thumbs.db
 desktop.ini
 *.swp
 *~
+
+# 插件本地依赖 junction（指向宿主 checkout，不入库）
+infra-plugin/node_modules/
