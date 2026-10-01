@@ -483,7 +483,7 @@ export function buildInfraService(state) {
         return { ok: false, error: (e && e.message) || String(e) }
       }
     },
-    /** 复活：写 'lift' 事件。显式再注册前**必须先调**，否则消费方轮询会把刚建的本-地记录清掉。 */
+    /** 复活：写 'lift' 事件。**当前语义 = 管理员专用**（工具动作 revive 是唯一入口，契约 §8.2 硬拒裁定）。 */
     liftTombstone: async ({ sessionHash, actor, reason } = {}) => {
       try {
         const db = state.getDb()
@@ -492,7 +492,16 @@ export function buildInfraService(state) {
         return { ok: false, error: (e && e.message) || String(e) }
       }
     },
-    /** 同步游标：{ seq, identities（全量）, bindings（全量）, tombstones（id > since 增量） }。 */
+    /** 单点查态：该会话当前是否被删。消费方查"是否被删"用这个，别用 since:0 拉全量事件流（会踩水位坑）。 */
+    isForgotten: async ({ sessionHash } = {}) => {
+      try {
+        const db = state.getDb()
+        return { ok: true, forgotten: isForgotten(db, sessionHash) }
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || String(e) }
+      }
+    },
+    /** 同步游标：{ seq, identities（全量）, bindings（全量）, forgotten（全量）, tombstones（id > since 增量） }。 */
     changes: async ({ since = 0 } = {}) => {
       try {
         const db = state.getDb()
@@ -624,10 +633,20 @@ export function changesSince(db, since = 0) {
   const from = Number.isFinite(Number(since)) ? Number(since) : 0
   const tombstones = db.prepare('SELECT id, session_hash, op, at, actor, reason FROM tombstones WHERE id > ? ORDER BY id').all(from)
   const maxRow = db.prepare('SELECT MAX(id) AS m FROM tombstones').get()
+  // 当前仍处于墓碑态的会话（最新一条事件是 'forget'）——**全量快照**，与 identities/bindings 同构。
+  // 为什么要有它：消费方要回答"这个会话是不是被删了"，若只能拉 since:0 的全量事件流来查态，
+  // 就会踩上「顺手推水位 → 漏事件」的坑（被炉实测踩到过，本字段因此补）。查态与消费事件由此分开。
+  const forgotten = db.prepare(`
+    SELECT session_hash FROM tombstones t
+    WHERE t.op = 'forget'
+      AND t.id = (SELECT MAX(id) FROM tombstones WHERE session_hash = t.session_hash)
+    ORDER BY session_hash
+  `).all().map(r => r.session_hash)
   return {
     seq: maxRow && maxRow.m ? maxRow.m : 0,
     identities: listIdentities(db),
     bindings: listBindings(db),
+    forgotten,
     tombstones,
   }
 }
@@ -679,6 +698,7 @@ export function launch(cfg) {
       windowsHide: true,
     })
     child.unref()
+    explicitStop = false   // 任何一次拉起都表示"我们要它活着"——清掉显式停止标记
     return '已启动（直起 exe，无窗）'
   } catch (err) {
     return '[错误] ' + ((err && err.message) || String(err))
@@ -780,6 +800,24 @@ export function privateCommitMb(pid) {
 }
 
 let lastEnsureAt = 0
+/** 操作员是否显式停过服务（embed-stop 置 true，任何一次成功 launch / embed-ensure 清 false）。
+ *  作用：让"存活恢复"不去抢人有意关掉的服务——「谁关的」必须可分辨，否则又是一个两处真相。 */
+let explicitStop = false
+
+/**
+ * 存活恢复判据（**纯函数**，便于桩测）：探活失败 + 无进程 + 不是显式停的 + 自动拉起开着 → 该恢复。
+ * 2026-10-01 事故（服务静默死亡 ≥90 分钟、消费方三次 `嵌入请求失败(fetch failed)`）：
+ * 旧看门狗**只查内存超限**，服务不在线就直接 return —— 进程崩了没人拉起，直到下次 DSH 重启。
+ * 判据抽成纯函数是刻意的：这条规则错一次就是"服务死了没人管"，必须有可跑的用例钉住。
+ */
+export function shouldRecoverLiveness({ probeOk, pids, explicitStop: stopped, autoEnsureOnLoad } = {}) {
+  if (probeOk) return false
+  if (Array.isArray(pids) && pids.length) return false   // 进程在（可能在载入模型）→ 不重复拉起
+  if (stopped) return false                              // 操作员显式停过 → 不抢
+  if (!autoEnsureOnLoad) return false                     // 配置关了自动拉起 → 不抢
+  return true
+}
+
 /** 插件加载 / 冷却带起：探活在线就不动作（fire-and-forget，不阻塞宿主）。
  *  2026-10-01 教训（GPU 空转满载排查）：churn 期本函数曾被每分钟触发一次、probe 一失败就
  *  无脑 spawn → 一天 18 个 llama-server 实例抢 8082，每次 spawn 都是整模 GPU 载入。
@@ -796,8 +834,21 @@ export function ensureInFlow(cfg, logger, { force = false } = {}) {
       logger?.info?.(`[${PLUGIN_NAME}] /health 未就绪但已有 llama-server 进程（PID ${exist.join('/')}，可能在载入模型）——不重复拉起，等它自愈`)
       return
     }
-    launch(cfg)
-    logger?.info?.(`[${PLUGIN_NAME}] 向量服务离线，已在后台拉起（直起 exe，无窗）`)
+    const res = launch(cfg)
+    // 拉起结果**按实际返回值**记账：旧版无条件报「已在后台拉起」，spawn 失败时同样报成功 = 静默失败
+    if (String(res).startsWith('[错误]')) {
+      logger?.warn?.(`[${PLUGIN_NAME}] 向量服务拉起失败：${res}`)
+      return
+    }
+    logger?.info?.(`[${PLUGIN_NAME}] 向量服务离线，已在后台拉起（${res}）`)
+    // 存活自证：3s 后复查进程；起不来必须说出来，不能让"已拉起"这句话替事实背书
+    setTimeout(() => {
+      try {
+        if (!serverPids(cfg.serverExe).length) {
+          logger?.warn?.(`[${PLUGIN_NAME}] 拉起后 3s 仍无 llama-server 进程——拉起可能失败，请查 ${cfg.serverExe} 与显存`)
+        }
+      } catch { /* 复查失败不抛 */ }
+    }, 3000)
   })().catch(() => {})
 }
 
@@ -812,7 +863,19 @@ let overLimitStreak = 0
 export async function watchdogTick(cfg, logger) {
   try {
     const up = await probe(cfg)
-    if (!up.ok) { overLimitStreak = 0; return }
+    if (!up.ok) {
+      overLimitStreak = 0
+      // 2026-10-01 事故修复：旧版这里直接 return —— 看门狗**只管内存超限、不管进程还在不在**，
+      // 于是 llama-server 一崩就再没人拉起（当晚 ≥90 分钟无人察觉，消费方三次 fetch failed）。
+      const pids = serverPids(cfg.serverExe)
+      if (shouldRecoverLiveness({ probeOk: up.ok, pids, explicitStop, autoEnsureOnLoad: cfg.autoEnsureOnLoad })) {
+        logger?.warn?.(`[${PLUGIN_NAME}] 看门狗：向量服务不在线且无 llama-server 进程 → 按存活恢复拉起（explicitStop=false）`)
+        ensureInFlow(cfg, logger)
+      } else if (!pids.length && explicitStop) {
+        logger?.info?.(`[${PLUGIN_NAME}] 看门狗：向量服务不在线，但此前被**显式停过**（explicitStop=true）——不抢，恢复请用 embed-ensure`)
+      }
+      return
+    }
     const pid = listeningPid(cfg.embedPort)
     if (!pid) { overLimitStreak = 0; return }
     const mb = privateCommitMb(pid)
@@ -939,7 +1002,8 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
     parameters: {
       action: {
         type: 'string', required: true,
-        description: `操作：${REGISTRY_ACTIONS}｜${EMBED_ACTIONS}`,
+        description: `操作：${REGISTRY_ACTIONS}｜${EMBED_ACTIONS}。`
+          + 'revive 是**唯一**的复活入口——被炉等消费方对墓碑采取**硬拒**语义（join / mode 等入房路径都会拒绝，不会自动恢复，管理员 2026-10-01 裁定）。',
       },
       name: { type: 'string', description: 'register/verify/lookup/rename/retire/attribute/bind/unbind/binding 用：独特名（rename 时为旧名）' },
       new: { type: 'string', description: 'rename 用：新名（全局独热；hash 不变，只换展示名）' },
@@ -1028,6 +1092,7 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
         const r = liftTombstone(db, { sessionHash: args.session, actor: args.actor || null, reason: args.note || null })
         return r.lifted
           ? `[OK] 已复活会话 ${r.sessionHash}（墓碑留痕 'lift'，历史不删）。`
+            + `\n  └─ 消费方（被炉等）按 changes(since) 消费到这条 lift 事件后解除本地墓碑；这是**唯一**的复活通道。`
           : `[OK] 会话 ${r.sessionHash} 无墓碑（本就活跃），无需复活。`
       }
       if (action === 'rename') {
@@ -1095,7 +1160,10 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       if (action === 'embed-stop') {
         const r = stopService(cfg)
         if (!r.ok) return `[错误] 关停失败（PID ${r.pid}）：${r.error}`
-        return r.pid ? `[OK] 已关停向量服务（PID ${r.pid}）。注意：基建看门狗只重启不主动拉起，关停后想恢复用 embed-ensure。` : '[OK] 端口上没有监听进程。'
+        explicitStop = true   // 显式停：看门狗"存活恢复"从此不抢（谁关的必须可分辨）
+        return r.pid
+          ? `[OK] 已关停向量服务（PID ${r.pid}）。\n  └─ 已标记**显式停止**：看门狗不会把它抢回来（防"我关了它又自己活了"）。恢复用 embed-ensure 或 embed-restart。`
+          : '[OK] 端口上没有监听进程。'
       }
       if (action === 'embed-restart') {
         const r = stopService(cfg)
@@ -1105,6 +1173,7 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
         return `[OK] 向量服务已重启并就绪（${up.seconds}s）：${cfg.embedUrl}\n${up.body}`
       }
       if (action === 'embed-ensure') {
+        explicitStop = false   // ensure 表示"要它活着"——清掉显式停止标记
         const up = await ensureReady(cfg)
         if (up.ok) return up.already ? `[OK] 向量服务已在线：${cfg.embedUrl}\n${up.body}` : `[OK] 向量服务已就绪（${up.seconds}s）：${cfg.embedUrl}\n${up.body}`
         if (up.pending) return `[待加载] 已拉起，${up.seconds}s 未就绪（模型首次加载更久）。稍后 embed-status 复查。`
@@ -1225,6 +1294,7 @@ export const __test = {
   forgetSession,
   liftTombstone,
   changesSince,
+  shouldRecoverLiveness,
   bindingFor,
   listBindings,
   attributeWorkspace,

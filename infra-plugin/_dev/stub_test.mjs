@@ -13,6 +13,7 @@ import {
   resolveIdentityRef, buildInfraService,
   bindSession, unbindSession, bindingFor, listBindings,
   isForgotten, forgetSession, liftTombstone, changesSince,
+  shouldRecoverLiveness,
   attributeWorkspace, noteSession, seenWorkspaceFor,
   callerSessionOf,
   resolveConfig,
@@ -425,6 +426,47 @@ await ta('服务面：svc.forgetSession + svc.changes（消费方调用形态）
   eq(c.ok, true); eq(Array.isArray(c.tombstones), true)
   return `changes: identities=${c.identities.length}｜tombstones=${c.tombstones.length}`
 })
+
+await ta('changes.forgotten 快照：查态不必再 since:0 拉全量事件流（水位坑的解法）', () => {
+  const c = changesSince(db, 999999)          // 水位推到最后 → 事件增量为空
+  eq(c.tombstones.length, 0, '增量应为空')
+  eq(c.forgotten.includes('bbbb2222'), true, '但"当前墓碑态"快照必须仍列出它')
+  eq(c.forgotten.includes('cccc3333'), true)
+  eq(c.forgotten.includes('aaaa1111'), false, 'aaaa1111 已 lift，不该在墓碑态里')
+  return `forgotten=${JSON.stringify(c.forgotten)}`
+})
+await ta('复活后从 forgotten 快照移除（唯一复活入口的后果）', () => {
+  liftTombstone(db, { sessionHash: 'bbbb2222', actor: '管理员 revive' })
+  eq(changesSince(db, 999999).forgotten.includes('bbbb2222'), false)
+  eq(isForgotten(db, 'cccc3333'), true, '未复活的仍在墓碑态')
+})
+await ta('服务面 isForgotten 单点查询（消费方查态的省事路）', async () => {
+  eq((await svc.isForgotten({ sessionHash: 'cccc3333' })).forgotten, true)
+  eq((await svc.isForgotten({ sessionHash: 'bbbb2222' })).forgotten, false)
+  eq((await svc.isForgotten({ sessionHash: 'zzz' })).ok, false, '非法哈希折成 ok:false 不抛')
+})
+await ta('lift 事件仍能被水位看见（查态与消费事件两条路互不干扰）', () => {
+  const before = changesSince(db, 0).seq
+  liftTombstone(db, { sessionHash: 'cccc3333', actor: '管理员 revive' })
+  const delta = changesSince(db, before).tombstones
+  eq(delta.length, 1); eq(delta[0].op, 'lift')
+  eq(changesSince(db, 999999).forgotten.includes('cccc3333'), false)
+})
+
+console.log('== 存活恢复判据（纯函数：服务崩了该不该自动拉起） ==')
+t('探活失败 + 无进程 + 未显式停 + 自动拉起开 → 恢复', () =>
+  eq(shouldRecoverLiveness({ probeOk: false, pids: [], explicitStop: false, autoEnsureOnLoad: true }), true))
+t('探活成功 → 不动作', () =>
+  eq(shouldRecoverLiveness({ probeOk: true, pids: [], explicitStop: false, autoEnsureOnLoad: true }), false))
+t('有进程（可能在载入模型）→ 不重复拉起', () =>
+  eq(shouldRecoverLiveness({ probeOk: false, pids: [1234], explicitStop: false, autoEnsureOnLoad: true }), false))
+t('显式停过 → 不抢（我关了它，别自己活过来）', () =>
+  eq(shouldRecoverLiveness({ probeOk: false, pids: [], explicitStop: true, autoEnsureOnLoad: true }), false))
+t('配置关了自动拉起 → 不抢', () =>
+  eq(shouldRecoverLiveness({ probeOk: false, pids: [], explicitStop: false, autoEnsureOnLoad: false }), false))
+t('空参数防御：不抛、默认不动作', () => eq(shouldRecoverLiveness(), false))
+t('2026-10-01 事故回放：崩了（无进程）且没人显式停 → 必须恢复', () =>
+  eq(shouldRecoverLiveness({ probeOk: false, pids: [], explicitStop: false, autoEnsureOnLoad: true }), true))
 
 db.close()
 try { rmSync(dir, { recursive: true, force: true }) } catch {}
