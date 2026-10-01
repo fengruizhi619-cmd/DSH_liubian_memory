@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import {
   normalizeName, deriveHash, computeShortIds, recomputeShortIds, sessionHashFor,
   openDb, registerIdentity, verifyName, lookupIdentity, listIdentities, retireIdentity, renameIdentity,
+  resolveIdentityRef, buildInfraService,
   bindSession, unbindSession, bindingFor, listBindings,
   attributeWorkspace, noteSession, seenWorkspaceFor,
   callerSessionOf,
@@ -288,6 +289,60 @@ t('改名不影响会话绑定（独热配对仍在，只是显示新名）', ()
   renameIdentity(db, 'Jasmine', 'JasminePro', '基石')
   eq(bindingFor(db, sh).name, 'JasminePro')
   eq(lookupIdentity(db, { name: 'JasminePro' }).row.hash, deriveHash('Jasmine'))
+})
+
+console.log('== 跨插件服务通道（reflect provide：被炉账号工具用） ==')
+const ta = async (label, fn) => {
+  try { const extra = await fn(); pass++; console.log(`  ✓ ${label}${extra ? '｜' + extra : ''}`) }
+  catch (e) { fail++; console.log(`  ✗ ${label}\n      ${e.message}`) }
+}
+const svc = buildInfraService({ getDb: () => db })
+
+await ta('resolveIdentityRef：全 hash / 唯一前缀 / 名字 三路都能定位', () => {
+  const h = deriveHash('基石')
+  eq(resolveIdentityRef(db, h).name, '基石')
+  eq(resolveIdentityRef(db, h.slice(0, 10)).name, '基石')
+  eq(resolveIdentityRef(db, '基石').name, '基石')
+})
+await ta('服务 rename（按 hash）→ ok + hash 不变 + 名字变 + 账目 +1', async () => {
+  const h = deriveHash('基石')
+  const n0 = db.prepare('SELECT COUNT(*) AS c FROM renames WHERE hash = ?').get(h).c
+  const r = await svc.rename({ hash: h, newName: '基石Svc', actor: '拾遗', note: '服务通道用例' })
+  eq(r.ok, true, JSON.stringify(r))
+  eq(r.hash, h); eq(r.name, '基石Svc')
+  eq(db.prepare('SELECT COUNT(*) AS c FROM renames WHERE hash = ?').get(h).c, n0 + 1, '账目应 +1')
+  return `rev ${n0} → ${n0 + 1}｜bindingsMoved=${r.bindingsMoved}`
+})
+await ta('服务改名后：旧名可回查（别名指向同一 hash）', () => {
+  eq(lookupIdentity(db, { name: '基石' }).alias.hash, deriveHash('基石'))
+})
+await ta('服务改名失败不抛，折成 {ok:false,error}', async () => {
+  const r = await svc.rename({ hash: 'deadbeefdeadbeef', newName: '谁' })
+  eq(r.ok, false)
+  if (!r.error) throw new Error('应带 error 字段')
+  return String(r.error).slice(0, 34)
+})
+await ta('服务改名撞名 → ok:false 且零写入', async () => {
+  const snap = () => listIdentities(db).map(x => x.name + '|' + x.hash).join(',')
+  const before = snap()
+  const r = await svc.rename({ hash: deriveHash('基石'), newName: 'Jasmine' })
+  eq(r.ok, false)
+  eq(snap(), before, '拒绝时必须零写入')
+})
+await ta('服务 unbind：删绑定（removed 1 → 二次 0 幂等）', async () => {
+  const r1 = await svc.unbind({ sessionHash: 'a1b2c3d4' })
+  eq(r1.ok, true); eq(r1.removed, 1)
+  const r2 = await svc.unbind({ sessionHash: 'a1b2c3d4' })
+  eq(r2.removed, 0)
+})
+await ta('服务 unbind 非法会话哈希 → ok:false 不抛', async () => {
+  const r = await svc.unbind({ sessionHash: 'zzz' })
+  eq(r.ok, false)
+})
+await ta('服务改回原名（收尾复原）', async () => {
+  const r = await svc.rename({ hash: deriveHash('基石'), newName: '基石', actor: '基石' })
+  eq(r.ok, true)
+  eq(resolveIdentityRef(db, deriveHash('基石')).name, '基石')
 })
 
 db.close()

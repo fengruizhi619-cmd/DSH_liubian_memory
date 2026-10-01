@@ -1,4 +1,4 @@
-/**
+﻿/**
  * dsh-liubian-infra —— 流变基建
  *
  * 三大职责：
@@ -24,7 +24,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const PLUGIN_NAME = 'dsh-liubian-infra'
-export const PLUGIN_VERSION = '0.3.0'
+export const PLUGIN_VERSION = '0.3.1'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
@@ -397,8 +397,59 @@ export function renameIdentity(db, rawName, rawNew, actor, note) {
   return { ...out, bindingsMoved: moved.changes ?? 0 }
 }
 
-/* ── 会话↔身份独热绑定（v0.2.0，管理员钉） ── */
+/* ── 跨插件服务通道（2026-10-01 管理员账号指令）：被炉等消费方以服务调用写注册中心，
+ *    按单写者规矩由本插件落笔；消费方不直写 registry.db。 ── */
 
+/** 按 hash（全值或唯一前缀）或当前名定位身份行。 */
+export function resolveIdentityRef(db, ref) {
+  const q = String(ref ?? '').trim()
+  if (!q) throw new Error('[错误] 需要 hash（全值或唯一前缀）或名字')
+  if (/^[0-9a-fA-F]{8,64}$/.test(q)) {
+    const h = q.toLowerCase()
+    const exact = db.prepare('SELECT * FROM identities WHERE hash = ?').get(h)
+    if (exact) return exact
+    const cands = db.prepare('SELECT * FROM identities WHERE hash LIKE ?').all(h + '%')
+    if (cands.length === 1) return cands[0]
+    if (cands.length > 1) throw new Error(`[歧义] hash 前缀命中 ${cands.length} 条，请给更长的 hash`)
+  }
+  const norm = normalizeName(q)
+  if (norm.ok) {
+    const row = db.prepare('SELECT * FROM identities WHERE name_key = ?').get(norm.key)
+    if (row) return row
+  }
+  throw new Error(`[错误] 未找到身份：${q}`)
+}
+
+/** 服务实现（纯函数化：只依赖 state.getDb，便于桩测）。错误一律折成 {ok:false,error} 不抛。 */
+export function buildInfraService(state) {
+  return {
+    version: 1,
+    /** 改名：hash 不变 + 旧名入别名 + 改名账目。ref/hash 二者给一个即可。 */
+    rename: async ({ ref, hash, newName, actor, note } = {}) => {
+      try {
+        const db = state.getDb()
+        const row = resolveIdentityRef(db, ref ?? hash)
+        const out = renameIdentity(db, row.name, newName, actor, note)
+        if (out.noop) return { ok: true, noop: true, hash: out.hash, name: out.name, shortId: out.short_id }
+        return { ok: true, hash: out.hash, name: out.name, shortId: out.short_id, bindingsMoved: out.bindingsMoved ?? 0 }
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || String(e) }
+      }
+    },
+    /** 解绑会话（删 bindings 行）。仅在「删除账号」时使用；退房不解绑。 */
+    unbind: async ({ sessionHash } = {}) => {
+      try {
+        const db = state.getDb()
+        const r = unbindSession(db, { session: sessionHash })
+        return { ok: true, removed: r.nothing ? 0 : 1, name: r.released ? r.released.name : null }
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || String(e) }
+      }
+    },
+  }
+}
+
+/* ── 会话↔身份独热绑定（v0.2.0，管理员钉） ── */
 /** 会话哈希合法化：8 位 hex（与被炉 idFor 同源派生的产物）。 */
 function normSessionHash(raw) {
   const q = String(raw ?? '').trim().toLowerCase()
@@ -926,8 +977,7 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
   })
 }
 
-function registerTools(ctx, cfg, state) {
-  ctx.effect(() => ctx.tools.register(
+function registerTools(ctx, cfg, state) {  ctx.effect(() => ctx.tools.register(
     buildInfraTool(cfg, state, {
       name: TOOL_NAME,
       descriptionNote: '流变·基建（dsh-liubian-infra）。',
@@ -938,6 +988,29 @@ function registerTools(ctx, cfg, state) {
       name: ALIAS_TOOL_NAME,
       descriptionNote: `（过渡期别名：原 dsh-liubian-embed 控制面，v0.2.0 起由 dsh-liubian-infra 承载，注册中心动作同样可用。）`,
     }), ALIAS_TOOL_NAME))
+}
+
+/** 把服务挂上宿主通道：优先 ctx.provide（cordis 标准形），回退 ctx.reflect.provide；
+ *  两者都没有 → 明确告警（不静默），工具面仍可单独承担改名/解绑。 */
+function provideService(ctx, state) {
+  const svc = buildInfraService(state)
+  const arm = (label, fn) => {
+    try {
+      const disposer = fn('liubianInfra', svc)
+      ctx.logger?.info?.(`[${PLUGIN_NAME}] 跨插件服务已挂载：liubianInfra v${svc.version}（${label}）`)
+      return disposer
+    } catch (e) {
+      ctx.logger?.warn?.(`[${PLUGIN_NAME}] 跨插件服务挂载失败（${label}）：${(e && e.message) || e}`)
+      return undefined
+    }
+  }
+  if (typeof ctx.provide === 'function') {
+    ctx.effect(() => arm('ctx.provide', (n, v) => ctx.provide(n, v)), 'dsh-liubian-infra: 跨插件服务')
+  } else if (typeof ctx.reflect?.provide === 'function') {
+    ctx.effect(() => arm('ctx.reflect.provide', (n, v) => ctx.reflect.provide(n, v)), 'dsh-liubian-infra: 跨插件服务')
+  } else {
+    ctx.logger?.warn?.(`[${PLUGIN_NAME}] 宿主无 provide 通道（ctx.provide / ctx.reflect.provide 皆不可用）——跨插件写服务未挂载；改名/解绑仍可走 infra 工具面`)
+  }
 }
 
 /* ══ 入口 ══ */
@@ -962,6 +1035,7 @@ export function apply(ctx, input = {}) {
   }
 
   registerTools(ctx, cfg, state)
+  provideService(ctx, state)
 
   // 挂牌迁移（v0.2.0）：服务所有权——加载自动带起 + 内存看门狗
   ensureInFlow(cfg, ctx.logger, { force: true })
