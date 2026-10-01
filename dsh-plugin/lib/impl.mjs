@@ -1613,11 +1613,10 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
       const wj = JSON.parse(String(wraw || '').trim())
       if (wj && wj.ok && Array.isArray(wj.results) && wj.results.length) {
         wikiResults = wj.results
-        const wl = [`<liubian-wiki hits="${wj.results.length}">`,
-          '说明：wiki 知识条目（家族树语义匹配，简介为锚）。全文与修订史用 _dsh_external_dsh_liubian_wiki action=get slug=... 取。']
+        const wl = [`<liubian-wiki hits="${wj.results.length}">`]
         for (const r of wj.results) {
           wl.push(`【${r.slug}】${r.title} [${r.score}]`)
-          wl.push(`  家族: ${r.full_path}｜状态: ${r.status}｜${String(r.intro || '').slice(0, 160)}`)
+          wl.push(`  ${r.full_path}｜${String(r.intro || '').slice(0, 120)}`)
         }
         wl.push('</liubian-wiki>')
         wikiBlock = wl.join('\n')

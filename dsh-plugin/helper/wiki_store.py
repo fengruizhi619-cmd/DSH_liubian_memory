@@ -91,6 +91,7 @@ def connect():
         out({"ok": False, "error": "liubian.db not found: " + db})
         sys.exit(0)
     conn = sqlite3.connect(db, timeout=20)
+    conn.row_factory = sqlite3.Row  # 命名访问——杜绝列序错位（v0.2.2 注入块字段错位教训）
     for stmt in DDL:  # 幂等建表
         conn.execute(stmt)
     conn.commit()
@@ -425,15 +426,14 @@ def _intro_vectors(conn):
     cache = _load_vec_cache()
     need = []
     for r in rows:
-        slug = r[0]
-        text = r[2] or r[1] or ""
+        text = r["intro"] or r["title"] or ""
         h = hashlib.md5(text.encode("utf-8")).hexdigest()
-        c = cache.get(slug)
+        c = cache.get(r["slug"])
         if not c or c.get("h") != h:
-            need.append((slug, text, h))
+            need.append((r["slug"], text, h))
     if need:
         vecs = _embed_batch([t for _, t, _ in need])
-        for (slug, text, h), v in zip(need, vecs):
+        for (slug, _, h), v in zip(need, vecs):
             cache[slug] = {"h": h, "vec": v}
         _save_vec_cache(cache)
     return rows, cache
@@ -442,7 +442,7 @@ def _intro_vectors(conn):
 def op_search(conn, req):
     """S4 分级向量检索：查询向量 vs 全部条目简介锚（向量持久缓存，批量补嵌）。
 
-    返回 top-K 条目（slug/title/intro/full_path/score/...），消费方（impl.mjs）拼注入块。"""
+    返回 top-K 条目（命名字段：slug/title/family_path/full_path/intro/status/score）。"""
     qv = req.get("vec") or []
     top = max(1, int(req.get("top") or 10))
     if not qv or len(qv) < 64:
@@ -456,8 +456,7 @@ def op_search(conn, req):
     rows, cache = _intro_vectors(conn)
     scored = []
     for r in rows:
-        slug, fp, full, title, intro = r[0], r[1], r[2], r[3], r[4]
-        c = cache.get(slug)
+        c = cache.get(r["slug"])
         if not c:
             continue
         iv = c["vec"]
@@ -465,11 +464,12 @@ def op_search(conn, req):
         if ivn == 0:
             continue
         iv = [x / ivn for x in iv]
-        cos = sum(a * b for a, b in zip(qv, iv))
-        scored.append({"slug": slug, "family_path": fp, "full_path": full,
-                       "title": title, "intro": intro, "content": r[5],
-                       "status": r[6], "revisions": r[7], "updated_at": r[8],
-                       "score": round(cos, 4)})
+        scored.append({
+            "slug": r["slug"], "title": r["title"],
+            "family_path": r["family_path"], "full_path": r["full_path"],
+            "intro": r["intro"], "status": r["status"],
+            "score": round(sum(a * b for a, b in zip(qv, iv)), 4),
+        })
     scored.sort(key=lambda x: -x["score"])
     return {"ok": True, "total": len(scored), "results": scored[:top]}
 
