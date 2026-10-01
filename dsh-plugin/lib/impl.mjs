@@ -965,9 +965,8 @@ async function buildProfileBlock(cfg) {
   lines.push(`[记忆规模] ${data.user_count} 用户 / ${data.workspace_count} 工作区 / `
     + `${data.tag_entries} 条 tag 索引 / ${data.tag_names} 个标签`)
   lines.push('[检索] ' + (cfg.memoryInject
-    ? `每轮已自动注入 ${cfg.memoryTopN} 篇相关日记（前 ${cfg.memorySeedTop} 篇主线全文 + 关联摘要行${cfg.memoryRelatedDigest === false ? '（当前配置：关联也是全文）' : '，要全文用 read 工具取'}）——不用再重复搜；`
-      + '只有第一轮 / 无命中 / 想换角度时才用 _dsh_external_dsh_liubian_search（至少 4 个标签）。'
-    : '本轮无自动注入，需要时用 _dsh_external_dsh_liubian_search（至少 4 个标签）。'))
+    ? `每轮已自动注入 wiki 知识条目（家族树语义匹配，全文与修订史用 _dsh_external_dsh_liubian_wiki action=get slug=... 取）——不用再重复搜。`
+    : '本轮无自动注入。'))
 
   // 预算裁剪：超预算就条丢，先丢末尾的说明行。
   const budget = Number(cfg.profileTokenBudget) || 700
@@ -1531,76 +1530,12 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     : ''
 
   const t0 = Date.now()
-  const topN = Math.max(1, Number(cfg.memoryTopN) || 30)              // 总注入上限（主线 + 关联）
-  const seedTop = Math.max(1, Number(cfg.memorySeedTop) || 5)         // 第一跳：前几篇作主线
-  const perSeed = Math.max(1, Number(cfg.memoryRelatedPerSeed) || 5)  // 第二跳：每条主线找回几篇关联
-  // ① 标签候选（取法与写日记同款：语义选前 N）+ 查询向量 + 命中的技能（并行，互不依赖）
-  const picked = await selectDiaryTags(cfg, { human: [question || ''], assistant: [reply || ''], tools: [] }, log)
+  // ① 查询向量（wiki 语义锚）+ 语义命中的技能（并行，互不依赖）
   const [vec, skillHits] = await Promise.all([
     queryEmbedding(cfg, query),
     skillHitsFor(cfg, query),
   ])
-  if (!vec.length && !picked.tags.length && !skillHits.length) return null
-  // 让模型从候选里挑 N 个 tag（与语义路**并行**：语义-元数据顺手一起取）。
-  // P7：技能目录捎进同一次调用——模型按**任务意图**挑 0~N 个技能，不再依赖模型自觉调 skill 工具。
-  const catalog = cfg.skillTaskInject ? skillCatalog(cfg) : []
-  const [cand, tagSide] = await Promise.all([
-    vec.length
-      ? jointQuery(cfg, { workspace, vec, top: Math.max(200, topN * 20), full: false, mode: 'semantic' })
-      : Promise.resolve({ ok: true, results: [], semCandidates: 0 }),
-    screenQueryTags(cfg, query, picked.tags, log, catalog),
-  ])
-  if (!cand || !cand.ok) log?.warn?.(`[dsh-liubian] 语义路失败：${(cand && cand.error) || '未知'}`)
-  // ?融合排序（helper 里算，公式与 full 模式同源。
-  const ranked = await jointQuery(cfg, {
-    workspace, tags: tagSide.tags, vec, top: Math.max(50, topN * 5), full: false, mode: 'rank',
-  })
-  if (!ranked || !ranked.ok) {
-    log?.warn?.(`[dsh-liubian] 融合排序失败：${(ranked && ranked.error) || '未知'}`)
-    return null
-  }
-  const seeds = (ranked.results || []).slice(0, seedTop)
-  if (!seeds.length) {
-    log?.info?.(`[dsh-liubian] 联合检索无命中（tags=${tagSide.tags.join('|') || '无'}，语义候选 ${ranked.semCandidates || 0}）`)
-    return null
-  }
-  // 第二跳：种子（主线）的语义近邻作**候选池**，再按**查询向量**重排取关联（P0，2026-09-26：
-  // 旧版只按"与主线相似"扩，与用户问题无关，是离题注入的主源）。失败只退回主线（少一路，绝不抛）。
-  const seedKeys = seeds.map(r => `${r.ws}|${r.id}`)
-  const relatedRows = []
-  const rel = await jointQuery(cfg, {
-    workspace: '', mode: 'related', top: perSeed, full: false, seeds: seedKeys, vec,
-  })
-  if (rel && rel.ok && rel.related) {
-    const seen = new Set(seeds.map(r => `${r.ws}#${r.id}`))
-    for (const s of seeds) {
-      for (const r of (rel.related[`${s.ws}|${s.id}`] || [])) {
-        const k = `${r.ws}#${r.id}`
-        if (seen.has(k)) continue
-        seen.add(k)
-        relatedRows.push({
-          ws: r.ws, id: r.id, sem: Number(r.sem) || 0, tag: 0,
-          score: Number(r.sem) || 0, source: 'related', fromSeed: `${s.ws}|${s.id}`,
-        })
-      }
-    }
-  } else {
-    log?.warn?.(`[dsh-liubian] 关联跳失败（已退回仅主线）：${(rel && rel.error) || '未知'}`)
-  }
-  // 关联按查询相关度降序排（离题种子的残留弱项沉底，先把最相关的注进来）
-  relatedRows.sort((a, b) => b.sem - a.sem)
-  const winners = [...seeds.map(r => ({ ...r, source: 'seed' })), ...relatedRows].slice(0, topN)
-  // 按 id 精确取正文（主线 + 关联一起）
-  const detail = await jointQuery(cfg, {
-    workspace, mode: 'ids', top: winners.length, full: true,
-    ids: winners.map(r => `${r.ws}|${r.id}`),   // 用 "ws|id" 串：嵌套数组在序列化路上容易被二次编码
-  })
-  const got = new Map(((detail && detail.results) || []).map(r => [`${r.ws}#${r.id}`, r]))
-  const final = winners.map(w => {
-    const d = got.get(`${w.ws}#${w.id}`) || {}
-    return { ...w, date: d.date || '', summary: d.summary || '', content: d.content || '', tags: d.tags || [] }
-  })
-  const block = formatMemoryBlock(final, cfg)
+  if (!vec.length && !skillHits.length) return null
   // 技能命中作为**独立块**附加（只给名字 + 摘要，不给全文）
   const skillBlock = formatSkillBlock(skillHits, cfg)
   // 技能自动装载：语义分超阈值 → 读 SKILL.md 全文随本轮注入并建议使用（每技能每会话只注一次）
@@ -1632,7 +1567,8 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
     }
     if (autoSkill) log?.info?.(`[dsh-liubian] 技能${fullMode ? '自动装载(全文)' : '提示'}：${pickedSkills.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、')}，阈值 ${threshold}，本会话已提示/装载 ${st.autoLoadedSkills.length} 个`)
   }
-  // ── P7 任务技能注入：硬规则（B）优先 + 意图路由（A，模型在挑 tag 时顺手挑的）──
+  // ── P7 任务技能注入：硬规则（B 路，正则匹配，不依赖外部 API）──
+  // 意图路由（A 路，模型挑 tag 时顺手挑技能）随外部 API 退役一并摘除（2026-10-01）。
   // 与语义命中的 hint/full 通道共用 st.autoLoadedSkills 去重；注入全文，上限 skillTaskMax。
   let taskSkillBlock = ''
   if (cfg.skillTaskInject && agent) {
@@ -1653,10 +1589,6 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
         }
       } catch { /* 坏正则跳过 */ }
     }
-    for (const s of (tagSide.skills || [])) {
-      if (chosen.length >= maxN) break
-      if (!chosen.includes(s)) { chosen.push(s); why.push(`意图:${s}`) }
-    }
     for (const name of chosen.slice(0, maxN)) {
       if (blacklist.has(name) || st.autoLoadedSkills.includes(name)) continue
       const body = readSkillBody(cfg, name)
@@ -1667,11 +1599,11 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
         + `【任务装载】本轮任务需要 ${name} 技能，全文已注入上文——直接按该技能的指令执行本任务，无需再调 skill 工具加载。`
     }
     if (taskSkillBlock) log?.info?.(`[dsh-liubian] 任务技能注入：${why.join('、')}（本会话累计 ${st.autoLoadedSkills.length} 个）`)
-    else if ((tagSide.skills || []).length) log?.info?.(`[dsh-liubian] 意图路由挑了 ${tagSide.skills.join('、')} 但均已注入过/黑名单，本轮跳过`)
   }
   const tail = [skillBlock, taskSkillBlock, autoSkill].filter(Boolean).join('\n\n')
-  // ── S4：wiki 条目注入（家族树知识库，与日记注入并行；失败不阻塞日记路）──
+  // ── S4：wiki 条目注入（家族树知识库语义检索；向量持久缓存，见 wiki_vectors.json）──
   let wikiBlock = ''
+  let wikiResults = []
   if (cfg.memoryWikiInject && vec.length) {
     try {
       const wraw = await runHelperAsync(cfg, 'wiki_store', [], {
@@ -1680,6 +1612,7 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
       })
       const wj = JSON.parse(String(wraw || '').trim())
       if (wj && wj.ok && Array.isArray(wj.results) && wj.results.length) {
+        wikiResults = wj.results
         const wl = [`<liubian-wiki hits="${wj.results.length}">`,
           '说明：wiki 知识条目（家族树语义匹配，简介为锚）。全文与修订史用 _dsh_external_dsh_liubian_wiki action=get slug=... 取。']
         for (const r of wj.results) {
@@ -1690,23 +1623,22 @@ export async function memoryRetrieval(cfg, messages, ctx, agent) {
         wikiBlock = wl.join('\n')
         log?.info?.(`[dsh-liubian] wiki 注入 ${wj.results.length} 条（top1 ${wj.results[0].slug} score=${wj.results[0].score}）`)
       }
-    } catch (e) { log?.warn?.(`[dsh-liubian] wiki 注入失败（不影响日记注入）: ${e?.message || e}`) }
+    } catch (e) { log?.warn?.(`[dsh-liubian] wiki 注入失败: ${e?.message || e}`) }
   }
   log?.info?.(
-    `[dsh-liubian] 两级检索命中 ${final.length} 篇（主线 ${seeds.length} + 关联 ${relatedRows.length}）注入 ${block.length} 字`
-    + `（模型挑 tag：${tagSide.tags.join('|') || '无'}｜候选 ${picked.tags.length} 个/${picked.mode}`
-    + `｜tag 路 ${ranked.tagCandidates || 0} 篇、语义路 ${ranked.semCandidates || 0} 篇｜权重 tag ${ranked.wTag}`
-    + `｜top1 ${final[0].id}@${final[0].ws} score=${final[0].score}`
+    `[dsh-liubian] 记忆注入：wiki ${wikiResults.length} 条`
+    + (wikiResults.length ? `（top1 ${wikiResults[0].slug} score=${wikiResults[0].score}）` : '')
     + `｜技能命中 ${skillHits.length} 个${skillHits.length ? '：' + skillHits.map(h => `${h.skill}(${h.score.toFixed(2)})`).join('、') : ''}`
-    + `｜${Date.now() - t0}ms）`,
+    + `｜注入 ${wikiBlock.length + tail.length} 字｜${Date.now() - t0}ms`,
   )
-  const fullBlock = [wikiBlock, block, tail].filter(Boolean).join('\n\n')
+  const fullBlock = [wikiBlock, tail].filter(Boolean).join('\n\n')
+  if (!fullBlock) return null
   return {
     block: fullBlock,
-    results: final,
+    results: wikiResults,
     skills: skillHits,
-    tags: tagSide.tags,
-    mode: picked.mode,
+    tags: [],
+    mode: 'wiki',
   }
 }
 
