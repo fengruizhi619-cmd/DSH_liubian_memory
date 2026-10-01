@@ -13,11 +13,7 @@ window.__ModuleLoader__.load({
     var CSS = [
       // ── 根：与对话主区同底，毛玻璃通透 ──
       '.nts-panel{display:flex;flex-direction:column;min-width:0;height:100%;background:color-mix(in srgb, var(--dsw-alias-bg-base) 72%, transparent);-webkit-backdrop-filter:blur(18px) saturate(1.15);backdrop-filter:blur(18px) saturate(1.15);color:var(--dsw-alias-label-primary);font-size:14px;overflow:hidden;position:relative}',
-      '.nts-header{box-sizing:border-box;border-bottom:.5px solid var(--dsw-alias-border-l3);flex:none;min-height:52px;padding:10px 28px 10px 20px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
-      '.nts-crumb{color:var(--dsw-alias-label-primary);font-size:14px;font-weight:500;line-height:20px;white-space:nowrap}',
-      // 「跟对话走」的归属标记（取代原手动选池下拉）
-      '.nts-scope{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;border:.5px solid var(--dsw-alias-border-l2);border-radius:9px;padding:1px 8px}',
-      '.nts-stats{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;white-space:nowrap}',
+      // （原 .nts-header / .nts-crumb / .nts-scope / .nts-stats 已随表头一并删除——栏目标签由插槽提供，不再重复）
       // ── 卡片网格 ──
       '.nts-scroll{min-height:0;flex:auto;overflow-y:auto;scrollbar-gutter:stable;padding:18px 32px}',
       '.nts-grid{max-width:min(1180px,100%);width:100%;margin:0 auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}',
@@ -145,9 +141,6 @@ window.__ModuleLoader__.load({
         if (b.heatNow !== a.heatNow) return b.heatNow - a.heatNow
         return b.born_turn - a.born_turn
       })
-      var m = state.cfg ? state.cfg.heatRounds : '?'
-      var size = state.cfg ? state.cfg.poolSize : '?'
-
       var body
       if (!state.loaded) {
         body = React.createElement('div', { className: 'nts-empty' },
@@ -161,9 +154,6 @@ window.__ModuleLoader__.load({
         body = React.createElement('div', { className: 'nts-empty' },
           React.createElement('div', { className: 'nts-emptyDesc' }, '读不到本对话的池数据。'))
       } else {
-        var avg = pool.meta && pool.meta.rounds
-          ? Math.round((pool.meta.humanChars + pool.meta.assistantChars) / pool.meta.rounds)
-          : 0
         var cards = notes.length
           ? React.createElement('div', { className: 'nts-grid' },
               notes.map(function (n) { return React.createElement(NoteCard, { key: n.id, note: n }) }))
@@ -175,16 +165,9 @@ window.__ModuleLoader__.load({
           React.createElement('div', { className: 'nts-grid-wrap' }, cards))
       }
 
-      return React.createElement('div', { className: 'nts-panel' },
-        React.createElement('div', { className: 'nts-header' },
-          React.createElement('span', { className: 'nts-crumb' }, '流变·便签'),
-          React.createElement('span', { className: 'nts-scope' }, '本对话'),
-          React.createElement('span', { className: 'nts-stats' },
-            pool && !pool.empty
-              ? (pool.notes.length + '/' + size + ' 篇 · 待封存 ' + pool.sealed + ' 轮 · 人类轮 ' + ((pool.meta && pool.meta.humanRounds) || 0) + ' / 内容轮 ' + ((pool.meta && pool.meta.rounds) || 0)
-                + (avg ? '（均 ' + avg + ' 字/轮）' : '') + ' · 热度窗口 m=' + m)
-              : '本对话暂无池 · 卡片视图')),
-        body)
+      /* 面板不再自带表头：栏目标签已由插槽（conversation.view 的 label）提供，
+       * 内部再放一条「流变·便签 · 本对话 · 统计」是重复信息（管理员 2026-10-01 要求删掉）。 */
+      return React.createElement('div', { className: 'nts-panel' }, body)
     }
 
     /* 客户端服务声明（结构照 ui-trajectory 的 `const inject = [...]`）：
