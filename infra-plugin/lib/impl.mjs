@@ -59,10 +59,15 @@ export const DEFAULTS = {
   probeTimeoutMs: 3000,
   /** v0.2.0 挂牌迁移：服务所有权划归基建（与 embed 插件默认值一致，键名同名） */
   autoEnsureOnLoad: true,
-  /** 内存看门狗：llama-server 私有提交超限自动重启（泄漏史：5.5h→10.9GB，重启释放 9.2GB） */
+  /** 内存看门狗：llama-server 私有提交超限自动重启（泄漏史：5.5h→10.9GB，重启释放 9.2GB）
+   *  2026-10-01 阈值纠偏：实测本机空载稳态私有提交即 ~10.8GB（活体测量 privateCommitMb(监听PID)
+   *  = 10787MB），旧默认 4096MB 永远超限——旧 embed 看门狗因此全天击杀 80 次（凌晨无任务也
+   *  每 5 分钟杀一次），每次击杀 = 整模 GPU 重载尖峰，即「没任务也跑满 GPU」的根因。
+   *  新默认 12288MB = 稳态之上、真泄漏（历史泄漏终点 10.9GB 附近徘徊）可辨；仍可被 embed.json
+   *  的 watchdogLimitMb 键覆盖。 */
   watchdogEnabled: true,
   watchdogIntervalSec: 300,
-  watchdogLimitMb: 4096,
+  watchdogLimitMb: 12288,
 }
 
 export function configFile() {
@@ -436,6 +441,39 @@ export function listeningPid(port) {
   return 0
 }
 
+/** 某端口当前 ESTABLISHED 连接数（0 = 空闲）。看门狗顺延判据用。 */
+export function establishedOnPort(port) {
+  try {
+    const out = execFileSync('netstat', ['-ano', '-p', 'TCP'], {
+      encoding: 'utf-8', windowsHide: true, timeout: 20000, maxBuffer: 8 * 1024 * 1024,
+    })
+    let n = 0
+    for (const line of String(out).split(/\r?\n/)) {
+      const cols = line.trim().split(/\s+/)
+      if (cols.length >= 4 && cols[3] === 'ESTABLISHED' && (cols[1].endsWith(':' + port) || cols[2].endsWith(':' + port))) n++
+    }
+    return n
+  } catch { return 0 }
+}
+
+/** 按映像名列出存活 PID（tasklist CSV）。防重复拉起判据：进程在（哪怕还没监听）就不许再 spawn。 */
+export function serverPids(exe) {
+  try {
+    const image = String(exe || '').split(/[\\/]/).pop() || 'llama-server.exe'
+    const out = execFileSync('tasklist', ['/FI', `IMAGENAME eq ${image}`, '/FO', 'CSV', '/NH'], {
+      encoding: 'utf-8', windowsHide: true, timeout: 20000, maxBuffer: 1 << 20,
+    })
+    const pids = []
+    for (const line of String(out).split(/\r?\n/)) {
+      if (!line.includes(image)) continue
+      const cols = line.split('","')
+      const pid = Number((cols[1] || '').replace(/"/g, ''))
+      if (Number.isFinite(pid) && pid > 0) pids.push(pid)
+    }
+    return pids
+  } catch { return [] }
+}
+
 export function stopService(cfg) {
   const pid = listeningPid(cfg.embedPort)
   if (!pid) return { ok: true, pid: 0 }
@@ -467,36 +505,60 @@ export function privateCommitMb(pid) {
 }
 
 let lastEnsureAt = 0
-/** 插件加载 / 冷却带起：探活在线就不动作（fire-and-forget，不阻塞宿主）。 */
+/** 插件加载 / 冷却带起：探活在线就不动作（fire-and-forget，不阻塞宿主）。
+ *  2026-10-01 教训（GPU 空转满载排查）：churn 期本函数曾被每分钟触发一次、probe 一失败就
+ *  无脑 spawn → 一天 18 个 llama-server 实例抢 8082，每次 spawn 都是整模 GPU 载入。
+ *  现改为：冷却 180s + spawn 前先查存活进程——进程在（哪怕还在载入模型）就不许再拉一个。 */
 export function ensureInFlow(cfg, logger, { force = false } = {}) {
   if (!force && !cfg.autoEnsureOnLoad) return
-  if (!force && Date.now() - lastEnsureAt < 60000) return
+  if (!force && Date.now() - lastEnsureAt < 180000) return
   lastEnsureAt = Date.now()
   void (async () => {
     const before = await probe(cfg)
     if (before.ok) return
+    const exist = serverPids(cfg.serverExe)
+    if (exist.length) {
+      logger?.info?.(`[${PLUGIN_NAME}] /health 未就绪但已有 llama-server 进程（PID ${exist.join('/')}，可能在载入模型）——不重复拉起，等它自愈`)
+      return
+    }
     launch(cfg)
     logger?.info?.(`[${PLUGIN_NAME}] 向量服务离线，已在后台拉起（直起 exe，无窗）`)
   })().catch(() => {})
 }
 
 let lastWatchdogRestart = ''
+let overLimitStreak = 0
 
-/** 单次看门狗检查：在线 → 读私有提交 → 超限 stop+launch。失败只 warn，绝不抛。 */
+/** 单次看门狗检查：在线 → 读私有提交 → 连续两轮超限且空闲才 stop+launch。失败只 warn，绝不抛。
+ *  2026-10-01 教训（本日事故复盘）：旧 embed 看门狗「单次超限即杀」，同日击杀 80 次
+ *  （凌晨无任务时段也每 5 分钟杀一次）——每次击杀都是整模 GPU 重载尖峰。
+ *  现加两道闸：①连续 2 轮超限才动手（防抖，300s 间隔下 = 需持续超限 10 分钟）；
+ *  ②8082 有活动连接就顺延（不在批量向量化进行到一半时杀）。 */
 export async function watchdogTick(cfg, logger) {
   try {
     const up = await probe(cfg)
-    if (!up.ok) return
+    if (!up.ok) { overLimitStreak = 0; return }
     const pid = listeningPid(cfg.embedPort)
-    if (!pid) return
+    if (!pid) { overLimitStreak = 0; return }
     const mb = privateCommitMb(pid)
     if (!mb) return
     const limit = Math.max(512, Number(cfg.watchdogLimitMb) || 4096)
-    if (mb <= limit) return
-    logger?.warn?.(`[${PLUGIN_NAME}] 看门狗：llama-server(PID ${pid}) 私有提交 ${mb.toFixed(0)}MB 超过 ${limit}MB，自动重启`)
+    if (mb <= limit) { overLimitStreak = 0; return }
+    overLimitStreak++
+    if (overLimitStreak < 2) {
+      logger?.warn?.(`[${PLUGIN_NAME}] 看门狗：私有提交 ${mb.toFixed(0)}MB 超过 ${limit}MB（连续第 ${overLimitStreak} 轮，下轮仍超才重启）`)
+      return
+    }
+    const busy = establishedOnPort(cfg.embedPort)
+    if (busy > 0) {
+      logger?.warn?.(`[${PLUGIN_NAME}] 看门狗：私有提交 ${mb.toFixed(0)}MB 已连续 ${overLimitStreak} 轮超限，但有 ${busy} 条活动连接——顺延到空闲再重启`)
+      return
+    }
+    logger?.warn?.(`[${PLUGIN_NAME}] 看门狗：llama-server(PID ${pid}) 私有提交 ${mb.toFixed(0)}MB 连续 ${overLimitStreak} 轮超过 ${limit}MB 且已空闲，自动重启`)
     const stopped = stopService(cfg)
     await sleep(1500)
     const launched = launch(cfg)
+    overLimitStreak = 0
     lastWatchdogRestart =
       `${new Date().toLocaleString('zh-CN')}｜${mb.toFixed(0)}MB → 重启（stop=${stopped.ok ? 'ok' : 'fail'} launch=${launched}）`
     logger?.info?.(`[${PLUGIN_NAME}] 看门狗重启完成：${lastWatchdogRestart}`)
