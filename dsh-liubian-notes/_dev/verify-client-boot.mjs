@@ -58,18 +58,28 @@ say('★ factory 返回模块导出（根因判据）', !!returned && typeof ret
 say('导出含 inject', !!returned && Array.isArray(returned.inject) && returned.inject.includes('slots'), returned && JSON.stringify(returned.inject))
 say('导出含 apply 函数', !!returned && typeof returned.apply === 'function', returned && typeof returned.apply)
 
-// 运行期形态：apply 拿桩 ctx 应能注册槽位样式与 conversation.view
+// 运行期形态：apply 拿桩 ctx 应能注册槽位样式与 conversation.view，且**插槽带会话绑定**
 const registered = []
+let capturedDef = null
+let capturedComp = null
 const ctxStub = {
   effect: (fn) => { fn(); return () => {} },
   slots: {
     inject: (name, fn) => { const it = fn(); registered.push(name); return it },
-    register: (def, comp) => ({ def, comp }),
+    register: (def, comp) => { capturedDef = def; capturedComp = comp; return { def, comp } },
   },
 }
 let applyThrew = null
 try { returned.apply(ctxStub) } catch (e) { applyThrew = e }
 say('apply 可运行（注册 slots）', !applyThrew && registered.includes('conversation.view'), applyThrew ? String(applyThrew.message) : 'slots=' + registered.join(','))
+say('注册项声明 id/order/label', !!capturedDef && capturedDef.id === 'notes' && capturedDef.order === 20 && capturedDef.label === '流变便签',
+  capturedDef ? ('id=' + capturedDef.id + ' order=' + capturedDef.order + ' label=' + capturedDef.label) : 'undefined')
+say('★ 插槽带会话绑定 inject(sessionId)', !!capturedDef && typeof capturedDef.inject === 'function',
+  capturedDef ? typeof capturedDef.inject : 'undefined')
+say('inject 回传当前会话 id', !!capturedDef && typeof capturedDef.inject === 'function'
+  && capturedDef.inject('sess-x').sessionId === 'sess-x',
+  capturedDef && typeof capturedDef.inject === 'function' ? JSON.stringify(capturedDef.inject('sess-x')) : '-')
+say('组件是函数（可挂载）', typeof capturedComp === 'function', typeof capturedComp)
 
 const bad = out.filter((r) => !r.ok)
 for (const r of out) console.log((r.ok ? '  ✅ ' : '  ❌ ') + r.name + '   [' + r.detail + ']')

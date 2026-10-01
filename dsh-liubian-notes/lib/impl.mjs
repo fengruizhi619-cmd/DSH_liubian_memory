@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.4.2'
+export const PLUGIN_VERSION = '0.4.3'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -881,6 +881,57 @@ function sendJson(res, code, obj) {
   } catch { /* 客户端断开等，忽略 */ }
 }
 
+/** 单个池 → 面板载荷（op=pool 与 op=pools 共用；**纯读**，不改写 heat）。 */
+export function poolPayload(key, pool, cfg) {
+  const m = cfg.heatRounds
+  const lastTurn = Number(pool.lastTurn) || 0
+  return {
+    key,
+    sessionId: pool.sessionId || '',
+    updatedAt: pool.updatedAt,
+    lastTurn,
+    sealed: (pool.sealed || []).length,
+    meta: pool.meta || { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 },
+    notes: (pool.notes || []).filter(n => n.status !== 'retired').map(n => {
+      const l = heatCountAt(n, lastTurn, m)   // 只读计数：路由不得改写 heat（M2 修复）
+      return {
+        id: n.id,
+        head: n.head,
+        body: n.body,
+        status: n.status,
+        source: n.source,
+        gen: n.gen || null,
+        born_turn: n.born_turn,
+        created_at: n.created_at,
+        heatCount: (n.heat || []).length,
+        heatNow: +(l / m).toFixed(2),
+        hasVector: Array.isArray(n.vector),
+        diary_ref: n.diary_ref || null,
+      }
+    }),
+  }
+}
+
+/** 「跟对话走」：按会话 id 取该会话自己的池；会话尚无池时返回**空载荷**（empty=true）而非 404，
+ *  让面板能显示「本对话还没有便签」的准确空态而不是报错。 */
+export function poolPayloadForSession(sessionId, cfg) {
+  const key = sessionKeyFor(sessionId)
+  const pool = readJson(poolFile(key))
+  if (!pool || !Array.isArray(pool.notes)) {
+    return {
+      key,
+      sessionId: String(sessionId || ''),
+      updatedAt: null,
+      lastTurn: 0,
+      sealed: 0,
+      meta: { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 },
+      notes: [],
+      empty: true,
+    }
+  }
+  return poolPayload(key, pool, cfg)
+}
+
 /** 面板数据路由：/api/liubian-notes?op=pools——全池快照（卡片渲染用，只读）。
  *  webServer 获取走 ctx.reflect.get（免 inject 声明）——入口壳 main.mjs 被 ESM 缓存，
  *  热注入拿不到新声明的服务清单（checklist §3.1.3），reflect 层是官方豁免口。 */
@@ -909,6 +960,16 @@ export function mountPanelRoutes(ctx, cfg) {
       try {
         const url = new URL(req.url, 'http://local')
         const op = url.searchParams.get('op') || 'pools'
+        if (op === 'pool') {
+          /* 「跟对话走」：面板按当前会话 id 取该会话自己的池（会话尚无池时返回空载荷，不是 404）。 */
+          const sid = url.searchParams.get('session') || ''
+          if (!sid) { sendJson(res, 400, { error: 'op=pool 需要 session 参数' }); return }
+          sendJson(res, 200, {
+            pool: poolPayloadForSession(sid, cfg),
+            heatRounds: cfg.heatRounds, poolSize: cfg.poolSize, injectTop: cfg.injectTop, aggregateRounds: cfg.aggregateRounds,
+          })
+          return
+        }
         if (op !== 'pools') { sendJson(res, 400, { error: '未知 op：' + op }); return }
         const pools = []
         const files = existsSync(notesDir()) ? readdirSync(notesDir()).filter(x => x.endsWith('.json')) : []
@@ -919,33 +980,7 @@ export function mountPanelRoutes(ctx, cfg) {
            * 反向污染写路径。路由只读盘、不进缓存。 */
           const pool = readJson(join(notesDir(), f))
           if (!pool || !Array.isArray(pool.notes)) continue
-          const m = cfg.heatRounds
-          const lastTurn = Number(pool.lastTurn) || 0
-          pools.push({
-            key,
-            sessionId: pool.sessionId || '',
-            updatedAt: pool.updatedAt,
-            lastTurn,
-            sealed: (pool.sealed || []).length,
-            meta: pool.meta || { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 },
-            notes: (pool.notes || []).filter(n => n.status !== 'retired').map(n => {
-              const l = heatCountAt(n, lastTurn, m)   // 只读计数：路由不得改写 heat（M2 修复）
-              return {
-                id: n.id,
-                head: n.head,
-                body: n.body,
-                status: n.status,
-                source: n.source,
-                gen: n.gen || null,
-                born_turn: n.born_turn,
-                created_at: n.created_at,
-                heatCount: (n.heat || []).length,
-                heatNow: +(l / m).toFixed(2),
-                hasVector: Array.isArray(n.vector),
-                diary_ref: n.diary_ref || null,
-              }
-            }),
-          })
+          pools.push(poolPayload(key, pool, cfg))
         }
         pools.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
         sendJson(res, 200, { pools, heatRounds: cfg.heatRounds, poolSize: cfg.poolSize, injectTop: cfg.injectTop, aggregateRounds: cfg.aggregateRounds })
@@ -1146,5 +1181,6 @@ export const __test = {
   /* L157 `function quarantinePool(key)`（坏池隔离）、L683 `export function pendingHasId(...)`（promote 幂等） */
   pendingHasId, quarantinePool,
   injectionAlreadyDone, markInjectionDone, backfillVectors,
+  poolPayload, poolPayloadForSession,
   MEMORY_KEYS, DEFAULTS, notesDir,
 }

@@ -189,6 +189,28 @@ const cfg = T.resolveConfig({})
   }
 }
 
+/* 「跟对话走」：按会话 id 取池（op=pool 的数据源） */
+{
+  const session = 'sess-follow-conversation'
+  const key = K(session)
+  writePool(key, basePool(key, {
+    sessionId: session,
+    lastTurn: 4,
+    sealed: [{ turn: 1, human: ['a'], assistant: [] }, { turn: 2, human: ['b'], assistant: [] }],
+    notes: [{ id: 'NT-1', source: 'auto', gen: 'llm', status: 'active', head: '本对话的便签', body: 'b', born_turn: 1, heat: [3, 4], vector: [1, 0] }],
+  }))
+  const mine = T.poolPayloadForSession(session, cfg)
+  check('会话绑定：取到本会话的池', mine && mine.key === key && mine.notes.length === 1 && mine.empty !== true,
+    'key=' + (mine && mine.key) + ' notes=' + (mine && mine.notes.length))
+  check('会话绑定：载荷含热度分与封存轮数', mine && typeof mine.notes[0].heatNow === 'number' && mine.sealed === 2,
+    'heatNow=' + (mine && mine.notes[0] && mine.notes[0].heatNow) + ' sealed=' + (mine && mine.sealed))
+  check('会话绑定：载荷带 sessionId（供前端核对）', mine && mine.sessionId === session, mine && mine.sessionId)
+  const other = T.poolPayloadForSession('sess-never-existed', cfg)
+  check('会话绑定：无池会话返回空态而非 404 数据', other && other.empty === true && Array.isArray(other.notes) && other.notes.length === 0,
+    'empty=' + (other && other.empty) + ' key=' + (other && other.key))
+  check('会话绑定：空态 key 仍是该会话的池键', other && other.key === K('sess-never-existed'), other && other.key)
+}
+
 /* M4 回归：封存过滤与双口径 */
 {
   const p = { meta: { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 } }

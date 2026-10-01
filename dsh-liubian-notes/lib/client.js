@@ -1,7 +1,8 @@
 // 流变·便签 面板（client）：
 //  - 入口：conversation.view 槽位注册「流变便签」栏（与 chat / 对话上下文轨迹并排的栏）；
+//  - 归属：**跟对话走**——插槽 inject(sessionId) 取当前会话，只显示本对话自己的池（无手动选池）；
 //  - 内容：便签卡片网格——每张卡片显示 便签头/正文/热度分（l/m 滑动窗口）/状态/来源；
-//  - 数据：本插件宿主路由 /api/liubian-notes?op=pools（只读，4 秒轮询）。
+//  - 数据：本插件宿主路由 /api/liubian-notes?op=pool&session=<sessionId>（只读，4 秒轮询）。
 window.__ModuleLoader__.load({
   id: 'dsh-liubian-notes',
   factory: function (require) {
@@ -14,10 +15,8 @@ window.__ModuleLoader__.load({
       '.nts-panel{display:flex;flex-direction:column;min-width:0;height:100%;background:color-mix(in srgb, var(--dsw-alias-bg-base) 72%, transparent);-webkit-backdrop-filter:blur(18px) saturate(1.15);backdrop-filter:blur(18px) saturate(1.15);color:var(--dsw-alias-label-primary);font-size:14px;overflow:hidden;position:relative}',
       '.nts-header{box-sizing:border-box;border-bottom:.5px solid var(--dsw-alias-border-l3);flex:none;min-height:52px;padding:10px 28px 10px 20px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
       '.nts-crumb{color:var(--dsw-alias-label-primary);font-size:14px;font-weight:500;line-height:20px;white-space:nowrap}',
-      '.nts-poolBtn{display:inline-flex;align-items:center;gap:2px;background:0 0;border:none;cursor:pointer;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:20px;padding:4px 8px;border-radius:12px}',
-      '.nts-poolBtn:hover{background:var(--dsw-alias-interactive-bg-hover)}',
-      '.nts-poolBtn select{appearance:none;-webkit-appearance:none;background:transparent;border:none;color:inherit;font:inherit;font-size:13px;line-height:20px;cursor:pointer;max-width:260px;padding:0;outline:none}',
-      '.nts-poolBtn select option{background:var(--dsw-specific-menu);color:var(--dsw-alias-label-primary)}',
+      // 「跟对话走」的归属标记（取代原手动选池下拉）
+      '.nts-scope{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;border:.5px solid var(--dsw-alias-border-l2);border-radius:9px;padding:1px 8px}',
       '.nts-stats{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;white-space:nowrap}',
       // ── 卡片网格 ──
       '.nts-scroll{min-height:0;flex:auto;overflow-y:auto;scrollbar-gutter:stable;padding:18px 32px}',
@@ -88,8 +87,11 @@ window.__ModuleLoader__.load({
           fmtTime(n.created_at) ? React.createElement('span', null, fmtTime(n.created_at)) : null))
     }
 
-    function NotesApp() {
-      var st = React.useState({ pools: [], poolKey: null, loaded: false, cfg: null, error: null })
+    function NotesApp(props) {
+      /* 「跟对话走」：当前会话 id 由插槽的 inject(sessionId) 传入（与官方轨迹栏同一机制），
+       * 面板只显示**本对话自己的池**——不再有手动选池。 */
+      var sessionId = (props && props.sessionId) || ''
+      var st = React.useState({ pool: null, loaded: false, cfg: null, error: null })
       var state = st[0]
       var setState = st[1]
 
@@ -98,10 +100,14 @@ window.__ModuleLoader__.load({
         var seq = 0            // 请求序号：防慢响应乱序覆盖新状态
         var inflight = false   // 同一时刻只允许一个在飞请求
         function load() {
+          if (!sessionId) {
+            setState(function (s) { return Object.assign({}, s, { loaded: true, error: '未取到当前会话 id（插槽未传 sessionId）' }) })
+            return
+          }
           if (inflight) return
           inflight = true
           var mine = ++seq
-          fetch('/api/liubian-notes?op=pools')
+          fetch('/api/liubian-notes?op=pool&session=' + encodeURIComponent(sessionId))
             .then(function (r) {
               if (!r.ok) throw new Error('HTTP ' + r.status)   // 404/500 不得伪装成空态
               return r.json()
@@ -110,31 +116,26 @@ window.__ModuleLoader__.load({
               inflight = false
               if (!alive || mine !== seq) return   // 旧响应直接丢弃
               setState(function (s) {
-                var pools = j.pools || []
-                var key = s.poolKey
-                if (!key || !pools.some(function (x) { return x.key === key })) {
-                  // 默认选「有便签的最新池」，否则最新池
-                  var withNotes = pools.filter(function (x) { return (x.notes || []).length > 0 })
-                  key = (withNotes[0] || pools[0] || {}).key || null
-                }
-                return Object.assign({}, s, { pools: pools, poolKey: key, loaded: true, error: null, cfg: { heatRounds: j.heatRounds, poolSize: j.poolSize, injectTop: j.injectTop, aggregateRounds: j.aggregateRounds } })
+                return Object.assign({}, s, {
+                  pool: j.pool || null,
+                  loaded: true,
+                  error: null,
+                  cfg: { heatRounds: j.heatRounds, poolSize: j.poolSize, injectTop: j.injectTop, aggregateRounds: j.aggregateRounds },
+                })
               })
             })
             .catch(function (err) {
               inflight = false
-              // 失败时保留上一次成功数据，并把错误显式暴露（旧实现只置 loaded=true → 显示成"还没有任何便签池"）
+              // 失败时保留上一次成功数据，并把错误显式暴露（不得伪装成"本对话还没有便签"）
               if (alive && mine === seq) setState(function (s) { return Object.assign({}, s, { loaded: true, error: String((err && err.message) || err) }) })
             })
         }
         load()
         var t = window.setInterval(load, 4000)
         return function () { alive = false; window.clearInterval(t) }
-      }, [])
+      }, [sessionId])   // 切换对话立即重取（不等 4 秒轮询）
 
-      var pool = null
-      for (var i = 0; i < state.pools.length; i++) {
-        if (state.pools[i].key === state.poolKey) { pool = state.pools[i]; break }
-      }
+      var pool = state.pool
       var notes = pool ? (pool.notes || []).slice() : []
       // 排序：待固化 > 活跃；同级按热度降序，再按 born 新→旧
       notes.sort(function (a, b) {
@@ -151,18 +152,16 @@ window.__ModuleLoader__.load({
       if (!state.loaded) {
         body = React.createElement('div', { className: 'nts-empty' },
           React.createElement('div', { className: 'nts-emptyDesc' }, '加载中…'))
-      } else if (state.error && !state.pools.length) {
+      } else if (state.error) {
         // 路由不可用/报错必须显式呈现——旧实现把它伪装成「还没有任何便签池」，排障时会走错方向
         body = React.createElement('div', { className: 'nts-empty' },
           React.createElement('div', { className: 'nts-emptyTitle' }, '便签面板暂不可用'),
-          React.createElement('div', { className: 'nts-emptyDesc' }, '路由 /api/liubian-notes 请求失败：' + state.error))
-      } else if (!state.pools.length) {
+          React.createElement('div', { className: 'nts-emptyDesc' }, '本对话的便签池请求失败：' + state.error))
+      } else if (!pool) {
         body = React.createElement('div', { className: 'nts-empty' },
-          React.createElement('div', { className: 'nts-emptyTitle' }, '流变·便签'),
-          React.createElement('div', { className: 'nts-emptyDesc' },
-            '还没有任何便签池。正常对话即可：每 ' + (state.cfg ? state.cfg.aggregateRounds : 5) + ' 轮自动聚合一篇便签；智能体也可用 stick 主动挂起。'))
+          React.createElement('div', { className: 'nts-emptyDesc' }, '读不到本对话的池数据。'))
       } else {
-        var avg = pool && pool.meta && pool.meta.rounds
+        var avg = pool.meta && pool.meta.rounds
           ? Math.round((pool.meta.humanChars + pool.meta.assistantChars) / pool.meta.rounds)
           : 0
         var cards = notes.length
@@ -170,7 +169,8 @@ window.__ModuleLoader__.load({
               notes.map(function (n) { return React.createElement(NoteCard, { key: n.id, note: n }) }))
           : React.createElement('div', { className: 'nts-empty' },
               React.createElement('div', { className: 'nts-emptyDesc' },
-                '这个池还没有便签。' + (pool && pool.sealed ? '已封存 ' + pool.sealed + ' 轮，凑满 ' + (state.cfg ? state.cfg.aggregateRounds : 5) + ' 轮自动聚合；' : '') + '智能体可用 stick 主动挂起。'))
+                '本对话还没有便签。每 ' + (state.cfg ? state.cfg.aggregateRounds : 5) + ' 轮人类对话自动聚合一篇'
+                + (pool.sealed ? '（已封存 ' + pool.sealed + ' 轮）' : '') + '；智能体也可用 stick 主动挂起。'))
         body = React.createElement('div', { className: 'nts-scroll' },
           React.createElement('div', { className: 'nts-grid-wrap' }, cards))
       }
@@ -178,25 +178,12 @@ window.__ModuleLoader__.load({
       return React.createElement('div', { className: 'nts-panel' },
         React.createElement('div', { className: 'nts-header' },
           React.createElement('span', { className: 'nts-crumb' }, '流变·便签'),
-          state.pools.length
-            ? React.createElement('span', { className: 'nts-poolBtn' },
-                React.createElement('select', {
-                  value: state.poolKey || '',
-                  'aria-label': '切换便签池',
-                  onChange: function (e) { setState(function (s) { return Object.assign({}, s, { poolKey: e.target.value }) }) },
-                },
-                  state.pools.map(function (p) {
-                    var tail = String(p.sessionId || '').slice(-6)
-                    return React.createElement('option', { key: p.key, value: p.key },
-                      '池 ' + p.key + (tail ? ' · …' + tail : '') + '（' + (p.notes || []).length + ' 篇）')
-                  })),
-                React.createElement('span', { style: { color: 'var(--dsw-alias-label-caption)' } }, '▾'))
-            : null,
+          React.createElement('span', { className: 'nts-scope' }, '本对话'),
           React.createElement('span', { className: 'nts-stats' },
-            pool
-              ? (pool.notes.length + '/' + size + ' 篇 · 待封存 ' + pool.sealed + ' 轮 · 人类轮 ' + (pool.meta.humanRounds || 0) + ' / 内容轮 ' + pool.meta.rounds
+            pool && !pool.empty
+              ? (pool.notes.length + '/' + size + ' 篇 · 待封存 ' + pool.sealed + ' 轮 · 人类轮 ' + ((pool.meta && pool.meta.humanRounds) || 0) + ' / 内容轮 ' + ((pool.meta && pool.meta.rounds) || 0)
                 + (avg ? '（均 ' + avg + ' 字/轮）' : '') + ' · 热度窗口 m=' + m)
-              : '短期记忆池 · 卡片视图')),
+              : '本对话暂无池 · 卡片视图')),
         body)
     }
 
@@ -211,12 +198,14 @@ window.__ModuleLoader__.load({
       }, 'liubian-notes: styles')
 
       // 入口：对话视图栏（与 对话 / 对话上下文轨迹 并排的「流变便签」栏）
+      // inject(sessionId) 由插槽框架传入当前会话 id → 面板据此显示**本对话自己的池**（跟对话走）。
       ctx.slots.inject('conversation.view', function () {
         return ctx.slots.register({
           name: 'conversation.view',
           id: 'notes',
           order: 20,
           label: '流变便签',
+          inject: function (sessionId) { return { sessionId: sessionId } },
         }, NotesApp)
       })
     }
