@@ -1735,9 +1735,12 @@ export function mountContextInjection(ctx, cfg) {
         const reminder = buildTurnReminder(cfg)
         if (reminder) additions.push(pluginMessage(reminder, 'recall'))
       }
-      // 自动日记：**只在"新一轮的第一步"**触发（同一轮内的后续步 currentPrompt 为空），
-      // 写的是上一轮，且 fire-and-forget —— API 调用耗时几秒，绝不能卡住本轮。
-      if (currentPrompt(decision.messages)) scheduleDiaryFlush(ctx, cfg, agent)
+      // 自动日记**已退役**（2026-10-01 管理员指令：信息源切换为 便签升格 → wiki 条目）。
+      // 原先这里每轮调 scheduleDiaryFlush(ctx, cfg, agent)（fire-and-forget 写上一轮）。
+      // **故意整条摘除**，而不是依赖 diaryConfig() 的「读不到配置就 return」软开关——
+      // 软开关等于把退役功能留在武装状态：谁哪天补回 ~/.dsh/liubian/diary.json（含
+      // enabled + apiKey），它会静默复活并开始往记忆库写日记，与新架构冲突，且不报错。
+      // 死代码＝下一个地雷（2026-10-01 家族教训）。
       if (additions.length === 0 || signal?.aborted) return decision
       return { kind: 'enter', messages: [...decision.messages, ...additions] }
     } catch (err) {
