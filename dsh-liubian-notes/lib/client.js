@@ -13,12 +13,8 @@ window.__ModuleLoader__.load({
     var CSS = [
       // ── 根：与对话主区同底，毛玻璃通透 ──
       '.nts-panel{display:flex;flex-direction:column;min-width:0;height:100%;background:color-mix(in srgb, var(--dsw-alias-bg-base) 72%, transparent);-webkit-backdrop-filter:blur(18px) saturate(1.15);backdrop-filter:blur(18px) saturate(1.15);color:var(--dsw-alias-label-primary);font-size:14px;overflow:hidden;position:relative}',
-      // 便签视图激活时盖住输入条区域（机制同 dsh-context 的 conversation.input.overlay）。
-      // ⚠ 宿主的 overlayAnchor 是 `position:absolute; inset:0 0 auto; height:0`——
-      //   overlay 必须自己撑高度；v0.4.6 用 inset:0 在 0 高父级里 = 不可见（这就是"还是会出现输入框"的根因）。
-      '.nts-inputOverlay{position:absolute;top:0;left:0;right:0;height:280px;z-index:5;background:var(--dsw-alias-bg-base);display:flex;align-items:center;justify-content:center;border-radius:0 0 18px 18px}',
-      '.nts-inputOverlayHint{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;user-select:none}',
       // （原 .nts-header / .nts-crumb / .nts-scope / .nts-stats 已随表头一并删除——栏目标签由插槽提供，不再重复）
+      // （v0.4.6/v0.4.7 的输入框遮挡 overlay 已整体撤除——管理员定夺：保持原生输入框，不做花活）
       // ── 卡片网格 ──
       '.nts-scroll{min-height:0;flex:auto;overflow-y:auto;scrollbar-gutter:stable;padding:18px 32px}',
       '.nts-grid{max-width:min(1180px,100%);width:100%;margin:0 auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}',
@@ -88,22 +84,7 @@ window.__ModuleLoader__.load({
           fmtTime(n.created_at) ? React.createElement('span', null, fmtTime(n.created_at)) : null))
     }
 
-    /* 便签视图激活状态（工厂闭包内共享：NotesApp 与 InputOverlay 同一次 load 的两个组件）。
-     * 机制：conversation.view 的插槽框架只挂载**当前激活视图**的组件——
-     * NotesApp 挂载 ⇔ 便签是激活视图；卸载 ⇔ 切走了。据此驱动 input overlay 显隐。 */
-    var viewLiveStore = { bySession: {}, listeners: new Set() }
-    function setViewLive(sessionId, on) {
-      var had = !!viewLiveStore.bySession[sessionId]
-      var now = !!on
-      if (had === now) return
-      if (now) viewLiveStore.bySession[sessionId] = true
-      else delete viewLiveStore.bySession[sessionId]
-      viewLiveStore.listeners.forEach(function (fn) { try { fn(sessionId, now) } catch (e) {} })
-    }
-    function onViewLive(fn) {
-      viewLiveStore.listeners.add(fn)
-      return function () { viewLiveStore.listeners.delete(fn) }
-    }
+    /* （v0.4.6/v0.4.7 的输入框遮挡 overlay 已按管理员指示整体撤除——不做花活，输入框保持原生行为。） */
 
     function NotesApp(props) {
       /* 「跟对话走」：当前会话 id 由插槽的 inject(sessionId) 传入（与官方轨迹栏同一机制），
@@ -153,13 +134,6 @@ window.__ModuleLoader__.load({
         return function () { alive = false; window.clearInterval(t) }
       }, [sessionId])   // 切换对话立即重取（不等 4 秒轮询）
 
-      // 本组件挂载 ⇔ 便签视图是当前激活视图（插槽框架只挂激活视图）——驱动输入区 overlay 显隐
-      React.useEffect(function () {
-        if (!sessionId) return
-        setViewLive(sessionId, true)
-        return function () { setViewLive(sessionId, false) }
-      }, [sessionId])
-
       var pool = state.pool
       var notes = pool ? (pool.notes || []).slice() : []
       // 排序：待固化 > 活跃；同级按热度降序，再按 born 新→旧
@@ -199,23 +173,6 @@ window.__ModuleLoader__.load({
       return React.createElement('div', { className: 'nts-panel' }, body)
     }
 
-    /** 输入条区 overlay：便签视图激活时盖住对话输入框（机制同 dsh-context 的 context-modal，
-     *  槽位 = conversation.input.overlay）。viewLiveStore 由 NotesApp 的挂载/卸载驱动。 */
-    function InputOverlay(props) {
-      var sessionId = (props && props.sessionId) || ''
-      var st = React.useState(!!viewLiveStore.bySession[sessionId])
-      var live = st[0]
-      var setLive = st[1]
-      React.useEffect(function () {
-        if (!sessionId) return
-        setLive(!!viewLiveStore.bySession[sessionId])
-        return onViewLive(function (sid, on) { if (sid === sessionId) setLive(on) })
-      }, [sessionId])
-      if (!live) return null
-      return React.createElement('div', { className: 'nts-inputOverlay' },
-        React.createElement('span', { className: 'nts-inputOverlayHint' }, '便签视图 · 切回「对话」栏发消息'))
-    }
-
     /* 客户端服务声明（结构照 ui-trajectory 的 `const inject = [...]`）：
      * 只声明真正用到的——slots（插槽注册）+ sessions（在 inject(sessionId) 里解析会话绑定）。 */
     exports.inject = ['slots', 'sessions']
@@ -252,17 +209,6 @@ window.__ModuleLoader__.load({
             return { sessionId: sessionId, sessionLive: live }
           },
         }, NotesApp)
-      })
-
-      /* 输入条区 overlay（机制同 dsh-context 的 context-modal）：便签视图激活时盖住对话输入框。
-       * hookContext 说明：conversation.input.overlay 的会话作用域由框架按 sessionId 解析。 */
-      ctx.slots.inject('conversation.input.overlay', function () {
-        return ctx.slots.register({
-          name: 'conversation.input.overlay',
-          id: 'notes-input-overlay',
-          order: 10,
-          inject: function (sessionId) { return { sessionId: sessionId } },
-        }, InputOverlay)
       })
     }
 

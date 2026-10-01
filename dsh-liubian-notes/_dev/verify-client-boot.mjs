@@ -90,26 +90,10 @@ say('取不到绑定时不抛错（降级）', !!viewDef && typeof viewDef.injec
   viewDef && typeof viewDef.inject === 'function' ? JSON.stringify(viewDef.inject('sess-dead')) : '-')
 say('组件是函数（可挂载）', typeof comps['conversation.view'] === 'function', typeof comps['conversation.view'])
 
-/* 输入条 overlay：便签视图激活时盖住对话输入框（机制同 dsh-context 的 context-modal） */
-const overlayDef = defs['conversation.input.overlay']
-say('★ 注册 conversation.input.overlay', !!overlayDef && overlayDef.id === 'notes-input-overlay',
-  overlayDef ? 'id=' + overlayDef.id : '（未注册）')
-say('overlay inject 回传会话 id', !!(overlayDef && typeof overlayDef.inject === 'function')
-  && overlayDef.inject('sess-live').sessionId === 'sess-live',
-  overlayDef && typeof overlayDef.inject === 'function' ? JSON.stringify(overlayDef.inject('sess-live')) : '-')
-say('overlay 组件是函数', typeof comps['conversation.input.overlay'] === 'function', typeof comps['conversation.input.overlay'])
-
-/* overlay CSS 回归护栏（v0.4.6 的静默失败）：宿主 overlayAnchor 是 height:0 的定位锚点，
- * overlay 若用 inset:0 或不显式撑高度 = 渲染了但 0 高不可见。规则里必须有正高度、不得用 inset:0。 */
-{
-  const src = fs.readFileSync(FILE, 'utf8')
-  const m = src.match(/'\.nts-inputOverlay\{([^}]*)\}'/)
-  const css = m ? m[1] : ''
-  const hasHeight = /height:\s*(?!0[;}%])/.test(css)
-  const noInset0 = !/inset:\s*0/.test(css)
-  say('overlay CSS 显式撑高度（v0.4.6 回归护栏）', !!m && hasHeight && noInset0,
-    m ? css.slice(0, 80) : '（找不到 .nts-inputOverlay 规则）')
-}
+/* 输入条 overlay 已撤除（管理员 2026-10-01 定夺：保持原生输入框，不做花活）——防回归断言 */
+say('★ 不再注册输入框遮挡 overlay（已撤除）',
+  !defs['conversation.input.overlay'] && registered.indexOf('conversation.input.overlay') < 0,
+  defs['conversation.input.overlay'] ? '仍注册（应删除）' : '未注册 ✓')
 
 const bad = out.filter((r) => !r.ok)
 for (const r of out) console.log((r.ok ? '  ✅ ' : '  ❌ ') + r.name + '   [' + r.detail + ']')
