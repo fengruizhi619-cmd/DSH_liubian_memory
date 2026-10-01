@@ -17,7 +17,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -68,6 +68,10 @@ export const DEFAULTS = {
   watchdogEnabled: true,
   watchdogIntervalSec: 300,
   watchdogLimitMb: 12288,
+  /** 子进程输出落盘（2026-10-01 事故后新增）：旧版 `stdio:'ignore'` 把 llama-server 的
+   *  stdout/stderr 全丢了——服务当晚静默死亡 ≥90 分钟，**死因无从查起**。
+   *  追加写，不经轮转；文件不存在即创建。置空字符串可退回"丢弃输出"的旧行为。 */
+  serverLogFile: 'C:/Users/Feng/.dsh/liubian-infra/llama-server.log',
 }
 
 export function configFile() {
@@ -691,15 +695,30 @@ export function launch(cfg) {
     const exe = String(cfg.serverExe || '')
     if (!exe || !existsSync(exe)) return `[错误] 未找到 llama-server：${exe}`
     const args = Array.isArray(cfg.serverArgs) ? cfg.serverArgs.map(String) : []
+    // 子进程输出落盘（2026-10-01 事故后新增）：旧版 stdio:'ignore' 把 llama-server 的输出全丢了，
+    // 服务当晚静默死亡 ≥90 分钟而**死因无从查起**。落盘之后"为什么死"才有据可查。
+    // 落盘失败一律退回旧行为——绝不因为写日志而拉不起服务。
+    let stdio = 'ignore'
+    let outFd = null
+    const logFile = String(cfg.serverLogFile || '').trim()
+    if (logFile) {
+      try {
+        mkdirSync(dirname(logFile), { recursive: true })
+        appendFileSync(logFile, `\n===== launch @ ${new Date().toISOString()} =====\n`)
+        outFd = openSync(logFile, 'a')
+        stdio = ['ignore', outFd, outFd]
+      } catch { outFd = null; stdio = 'ignore' }
+    }
     // detached 故意为 false（embed 插件实测：true 会被 Node 升级成 CREATE_NEW_CONSOLE 冒黑框）
     const child = spawn(exe, args, {
       cwd: existsSync(String(cfg.serverCwd || '')) ? cfg.serverCwd : undefined,
-      stdio: 'ignore',
+      stdio,
       windowsHide: true,
     })
+    if (outFd !== null) { try { closeSync(outFd) } catch { /* 父端关掉，子进程仍持有 */ } }
     child.unref()
     explicitStop = false   // 任何一次拉起都表示"我们要它活着"——清掉显式停止标记
-    return '已启动（直起 exe，无窗）'
+    return `已启动（直起 exe，无窗${outFd !== null ? `，输出→${logFile}` : '，输出已丢弃'}）`
   } catch (err) {
     return '[错误] ' + ((err && err.message) || String(err))
   }
@@ -939,6 +958,23 @@ export function callerSessionOf(exec) {
   return { id: String(s.id), cwd: String((s.header && s.header.cwd) || '') }
 }
 
+/**
+ * 账目 actor 解析：**显式 actor > 调用方会话绑定的身份名 > null**。
+ * v0.4.0 补齐（拾遗 2026-10-01 实测）：`forget` 原样取 `args.actor || null`，调用方不写 actor
+ * 时账目里"**谁删的**"就丢了（三条墓碑 actor=null）——"做了什么"和"谁做的"在账号体系里同等重要。
+ * 与 register/bind 的归属推导同源（callerSessionOf + sessionHashFor + bindings）。
+ */
+export function resolveActor(db, { actor, exec } = {}) {
+  const explicit = String(actor || '').trim()
+  if (explicit) return explicit
+  const caller = callerSessionOf(exec)
+  if (!caller) return null
+  try {
+    const b = bindingFor(db, sessionHashFor(caller.id))
+    return b ? b.name : null
+  } catch { return null }
+}
+
 export function mountBindingInjection(ctx, cfg, state) {
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
@@ -1007,7 +1043,7 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       },
       name: { type: 'string', description: 'register/verify/lookup/rename/retire/attribute/bind/unbind/binding 用：独特名（rename 时为旧名）' },
       new: { type: 'string', description: 'rename 用：新名（全局独热；hash 不变，只换展示名）' },
-      actor: { type: 'string', description: 'rename/forget/revive 用：发起者（独特名，可选，落账目）' },
+      actor: { type: 'string', description: 'rename/forget/revive 用：发起者（独特名，可选；省略则按调用方会话绑定的身份名落账目——账目里"谁做的"与"做了什么"同等重要）' },
       id: { type: 'string', description: 'lookup 用：短或全 hash（8~64 位十六进制）' },
       session: { type: 'string', description: 'bind/unbind/binding/forget/revive 用：会话哈希（8 位十六进制，注入提示里给的）' },
       retire: { type: 'string', description: "forget 用：传 'true' 才同时注销持久名（默认只解绑不烧名字；名字独热不回收，烧了不可逆）" },
@@ -1081,7 +1117,7 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       if (action === 'forget') {
         const db = state.getDb()
         const retireName = String(args.retire || '').toLowerCase() === 'true'
-        const r = forgetSession(db, { sessionHash: args.session, actor: args.actor || null, reason: args.note || null, retireName })
+        const r = forgetSession(db, { sessionHash: args.session, actor: resolveActor(db, { actor: args.actor, exec }), reason: args.note || null, retireName })
         return `[OK] 已删除会话运行身份：${r.sessionHash}`
           + `\n  └─ 解绑 ${r.unbound} 条｜墓碑已写${r.alreadyForgotten ? '（此前已在墓碑中，幂等未重复记账）' : ''}`
           + `｜名字「${r.name || '(无绑定)'}」${r.retired === 'retired' ? '**已注销**（独热保留、不回收）' : r.retired === 'already-retired' ? '此前已注销' : '保持 active（未烧名字）'}`
@@ -1089,7 +1125,7 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       }
       if (action === 'revive') {
         const db = state.getDb()
-        const r = liftTombstone(db, { sessionHash: args.session, actor: args.actor || null, reason: args.note || null })
+        const r = liftTombstone(db, { sessionHash: args.session, actor: resolveActor(db, { actor: args.actor, exec }), reason: args.note || null })
         return r.lifted
           ? `[OK] 已复活会话 ${r.sessionHash}（墓碑留痕 'lift'，历史不删）。`
             + `\n  └─ 消费方（被炉等）按 changes(since) 消费到这条 lift 事件后解除本地墓碑；这是**唯一**的复活通道。`
@@ -1097,7 +1133,7 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       }
       if (action === 'rename') {
         const db = state.getDb()
-        const r = renameIdentity(db, args.name, args.new, args.actor, args.note)
+        const r = renameIdentity(db, args.name, args.new, resolveActor(db, { actor: args.actor, exec }), args.note)
         if (r.noop) return `[OK] 新旧同名（幂等）：「${r.name}」#${r.short_id}，未产生变更与账目。`
         const rev = db.prepare('SELECT COUNT(*) AS c FROM renames WHERE hash = ?').get(r.hash).c
         return `[OK] 改名成功：「${args.name}」→「${r.name}」（#${r.short_id}）`
@@ -1302,6 +1338,7 @@ export const __test = {
   seenWorkspaceFor,
   deriveSessionWorkspace,
   callerSessionOf,
+  resolveActor,
   probe,
   launch,
   ensureReady,

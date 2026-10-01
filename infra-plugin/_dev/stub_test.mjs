@@ -16,6 +16,7 @@ import {
   shouldRecoverLiveness,
   attributeWorkspace, noteSession, seenWorkspaceFor,
   callerSessionOf,
+  resolveActor,
   resolveConfig,
 } from '../lib/impl.mjs'
 
@@ -467,6 +468,23 @@ t('配置关了自动拉起 → 不抢', () =>
 t('空参数防御：不抛、默认不动作', () => eq(shouldRecoverLiveness(), false))
 t('2026-10-01 事故回放：崩了（无进程）且没人显式停 → 必须恢复', () =>
   eq(shouldRecoverLiveness({ probeOk: false, pids: [], explicitStop: false, autoEnsureOnLoad: true }), true))
+
+console.log('== 账目 actor 解析（v0.4.0 补齐：调用方不写 actor 时不能丢"谁做的"） ==')
+const actorSid = 'session-actor-case'
+const actorSh = sessionHashFor(actorSid)
+registerIdentity(db, '账目测试员', 'actor 用例')
+bindSession(db, actorSh, '账目测试员')
+
+t('显式 actor 优先（调用方身份不夺权）', () =>
+  eq(resolveActor(db, { actor: '手写方', exec: { agent: { session: { id: actorSid } } } }), '手写方'))
+t('未传 actor → 按调用方会话绑定的身份名落账（拾遗实测的那格）', () =>
+  eq(resolveActor(db, { actor: null, exec: { agent: { session: { id: actorSid } } } }), '账目测试员'))
+t('无 exec（面板/程序化调用）→ null，不抛', () =>
+  eq(resolveActor(db, { actor: null }), null))
+t('有 exec 但该会话未绑定 → null，不抛', () =>
+  eq(resolveActor(db, { actor: null, exec: { agent: { session: { id: 'session-unbound-xyz' } } } }), null))
+t('空白 actor 视为未传（不让空格落进账目）', () =>
+  eq(resolveActor(db, { actor: '   ', exec: { agent: { session: { id: actorSid } } } }), '账目测试员'))
 
 db.close()
 try { rmSync(dir, { recursive: true, force: true }) } catch {}
