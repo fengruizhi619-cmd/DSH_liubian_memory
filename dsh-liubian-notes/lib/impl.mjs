@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.5.3'
+export const PLUGIN_VERSION = '0.5.4'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -355,7 +355,7 @@ export function heatCountAt(note, nowTurn, m) {
  *  入口壳每次 apply 都 `?t=` 新 import → 每次装配都是独立模块实例，各有一份模块级 Map；
  *  于是「旧实例的聚合 + 新实例的工具写」可同时对同一池「读快照→算 ID→写盘」，
  *  M1 的丢单/撞号会以跨实例形态回归。进程内共享一份即可消除该维度。 */
-const SHARED = (globalThis.__liubianNotesShared ||= { locks: new Map(), aggregateInFlight: new Set(), lastInjectedTurn: new Map() })
+const SHARED = (globalThis.__liubianNotesShared ||= { locks: new Map(), aggregateInFlight: new Set(), lastInjectedTurn: new Map(), routeOff: null })
 const poolLocks = SHARED.locks
 
 export function withPoolLock(key, fn) {
@@ -1076,7 +1076,17 @@ export function mountPanelRoutes(ctx, cfg) {
         else ctx.logger?.warn?.(`[dsh-liubian-notes] webServer 重试 ${attempts} 次仍不可得，面板路由放弃挂载（重启/重载后恢复）`)
         return
       }
-      off = webServer.register({
+      /* 🟠-7 跨代接管（v0.5.4）：DSH 重激活时新代可能**先于**旧代释放就尝试注册，
+       * 直接 register 会抛 `webserver: duplicate exact route`。旧实现让异常冒泡 →
+       * 整次激活失败 → 事件钩子留在一个 disposed 实例上：它照常收 session/event、照常打印
+       * 「轮封存」，但 savePool/saveRetired 被 disposed 守卫拒绝 → 便签长时间不落盘而日志无异常。
+       * 现在：先释放上一代持有的注册（共享表），再注册；注册失败也不再冒泡（重试 + 告警）。 */
+      if (typeof SHARED.routeOff === 'function') {
+        try { SHARED.routeOff() } catch { /* 上一代可能已自行释放 */ }
+        SHARED.routeOff = null
+      }
+      try {
+        off = webServer.register({
     kind: 'exact',
     path: '/api/liubian-notes',
     async handler(req, res) {
@@ -1133,14 +1143,28 @@ export function mountPanelRoutes(ctx, cfg) {
         sendJson(res, 200, { pools, heatRounds: cfg.heatRounds, poolSize: cfg.poolSize, injectTop: cfg.injectTop, aggregateRounds: cfg.aggregateRounds })
       } catch (err) { sendJson(res, 500, { error: (err && err.message) || String(err) }) }
     },
-      })
+        })
+      } catch (err) {
+        const msg = (err && err.message) || String(err)
+        if (attempts < 8) {
+          ctx.logger?.warn?.(`[dsh-liubian-notes] 面板路由挂载失败（第 ${attempts} 次）：${msg}——2s 后重试`
+            + '（不冒泡：冒泡会打挂整次激活，把钩子留在死实例上）')
+          timer = setTimeout(tryMount, 2000)
+        } else {
+          ctx.logger?.warn?.(`[dsh-liubian-notes] 面板路由挂载失败 ${attempts} 次，放弃挂载：${msg}`)
+        }
+        return
+      }
+      SHARED.routeOff = off
       ctx.logger?.info?.(`[dsh-liubian-notes] 面板路由已挂载 /api/liubian-notes（第 ${attempts} 次尝试）`)
     }
     tryMount()
     return () => {
       disposed = true
       if (timer) clearTimeout(timer)
-      if (typeof off === 'function') off()
+      if (typeof off === 'function') { try { off() } catch { /* 已释放 */ } }
+      /* 接管表只在仍指向本代时清空（避免把新代的注册抹掉） */
+      if (SHARED.routeOff === off) SHARED.routeOff = null
     }
   }, 'dsh-liubian-notes.panel-routes')
 }
@@ -1202,8 +1226,14 @@ export function apply(ctx, input = {}) {
     },
   })
 
+  /* 🟠-7（v0.5.4）：钩子释放器**显式收集**。事故里一条激活失败路径没有清掉监听，
+   * 于是「已卸载实例」继续收 session/event：照常打「轮封存」、落盘却全被 disposed 拒绝
+   * （日志看起来一切正常，便签却几小时不落盘）。卸载时手动摘掉，不再指望框架替我清。 */
+  const hookOffs = []
+  const keepHook = (off) => { if (typeof off === 'function') hookOffs.push(off); return off }
+
   // 采集：session/event——封存窗口与进行中轮次直接持久化进池文件（v0.3.0：废除内存缓冲）
-  ctx.on('session/event', (session, event) => {
+  keepHook(ctx.on('session/event', (session, event) => {
     try {
       if (!session || !event) return
       /* 🟠-6（v0.5.3）：**已卸载实例仍被回调时不得静默**。
@@ -1262,10 +1292,10 @@ export function apply(ctx, input = {}) {
         default: break
       }
     } catch { /* 采集失败不影响对话 */ }
-  })
+  }))
 
   // 注入 + 聚合触发：agent/pre-step（普通注册——排在 dsh-liubian 之后，我们的块离生成点最近）
-  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
+  keepHook(ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
     const decision = await next()
     // 整段兜住：便签只是附带功能，绝不拖垮用户这一轮
     try {
@@ -1300,7 +1330,7 @@ export function apply(ctx, input = {}) {
       ctx.logger?.warn?.(`[dsh-liubian-notes] 本轮注入失败（已忽略，不影响对话）: ${(err && err.message) || err}`)
       return decision
     }
-  })
+  }))
 
   ctx.effect(() => {
     /* 🟠-3：卸载本实例时置 disposed —— 在途异步闭包（聚合最长 120s）此后不得再 savePool，
@@ -1309,6 +1339,9 @@ export function apply(ctx, input = {}) {
      * 它们属于进程内其它仍存活的实例。 */
     disposed = true
     poolCache.clear()
+    /* 🟠-7：显式摘掉本实例的钩子——否则「已卸载实例继续收 session/event」会重演 */
+    for (const offFn of hookOffs) { try { offFn() } catch { /* 已摘 */ } }
+    hookOffs.length = 0
   }, 'dsh-liubian-notes: 标记实例已卸载并清理本实例池缓存')
 
   ctx.logger?.info?.(

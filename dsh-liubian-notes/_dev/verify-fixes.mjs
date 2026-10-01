@@ -274,6 +274,30 @@ const cfg = T.resolveConfig({})
   check('设置写失败回传精确 error', /sendJson\(res, 500, \{ error: '写入失败：'/.test(implSrc), '路由含精确 error 回传')
 }
 
+/* 🟠-7 跨代接管：重激活时先释放上一代持有的路由；注册抛 duplicate 也不冒泡（冒泡会打挂整次激活） */
+{
+  const calls = []
+  let oldReleased = false
+  globalThis.__liubianNotesShared = globalThis.__liubianNotesShared
+    || { locks: new Map(), aggregateInFlight: new Set(), lastInjectedTurn: new Map(), routeOff: null }
+  globalThis.__liubianNotesShared.routeOff = () => { oldReleased = true }
+  const fakeWs = { register: () => { calls.push('register'); return () => { calls.push('off') } } }
+  const mkCtx = (ws) => ({
+    /* effect 立即执行并立即清理：清掉重试定时器，测试不必等待 */
+    effect: (fn) => { const c = fn(); if (typeof c === 'function') c(); return () => {} },
+    logger: { info() {}, warn() {} },
+    reflect: { get: () => ws },
+  })
+  let threw = null
+  try { impl.mountPanelRoutes(mkCtx(fakeWs), cfg) } catch (e) { threw = e }
+  check('跨代接管：先释放上一代持有的路由再注册', oldReleased === true && calls[0] === 'register', 'calls=' + calls.join(','))
+  check('路由挂载不抛（异常不再打挂整次激活）', !threw, threw ? String(threw.message) : '无异常 ✓')
+  const dupWs = { register: () => { throw new Error('webserver: duplicate exact route "/api/liubian-notes"') } }
+  let threw2 = null
+  try { impl.mountPanelRoutes(mkCtx(dupWs), cfg) } catch (e) { threw2 = e }
+  check('duplicate 路由异常被吞（改为重试+告警）', !threw2, threw2 ? String(threw2.message) : '已吞 ✓')
+}
+
 /* M4 回归：封存过滤与双口径 */
 {
   const p = { meta: { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 } }
