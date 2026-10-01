@@ -420,11 +420,8 @@ export function registerTools(ctx, cfg) {
         timeoutMs: Math.max(15000, Number(cfg.memoryTimeoutMs) || 60000),
         stdin: JSON.stringify(req),
       })
-      try {
-        return JSON.parse(String(raw || '').trim())
-      } catch {
-        return String(raw || '').slice(0, 800) || '[错误] wiki_store 无输出'
-      }
+      // 家族工具返回约定：字符串（OUT schema type=string）——返回 JSON 原文，消费方自行解析
+      return String(raw || '').trim() || '[错误] wiki_store 无输出'
     },
   })
 
