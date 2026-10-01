@@ -682,6 +682,64 @@ export async function noteToolAction(cfg, args = {}, logger) {
  * 11. 接线
  * ────────────────────────────────────────────────────────────────────────── */
 
+function sendJson(res, code, obj) {
+  try {
+    res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(JSON.stringify(obj))
+  } catch { /* 客户端断开等，忽略 */ }
+}
+
+/** 面板数据路由：/api/liubian-notes?op=pools——全池快照（卡片渲染用，只读）。 */
+export function mountPanelRoutes(ctx, cfg) {
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/api/liubian-notes',
+    async handler(req, res) {
+      try {
+        const url = new URL(req.url, 'http://local')
+        const op = url.searchParams.get('op') || 'pools'
+        if (op !== 'pools') { sendJson(res, 400, { error: '未知 op：' + op }); return }
+        const pools = []
+        const files = existsSync(notesDir()) ? readdirSync(notesDir()).filter(x => x.endsWith('.json')) : []
+        for (const f of files) {
+          const key = f.replace(/\.json$/, '')
+          const pool = loadPool(key)
+          if (!pool) continue
+          const m = cfg.heatRounds
+          const lastTurn = Number(pool.lastTurn) || 0
+          pools.push({
+            key,
+            sessionId: pool.sessionId || '',
+            updatedAt: pool.updatedAt,
+            lastTurn,
+            sealed: (pool.sealed || []).length,
+            meta: pool.meta || { rounds: 0, humanChars: 0, assistantChars: 0 },
+            notes: (pool.notes || []).filter(n => n.status !== 'retired').map(n => {
+              const l = pruneHeat(n, lastTurn, m)
+              return {
+                id: n.id,
+                head: n.head,
+                body: n.body,
+                status: n.status,
+                source: n.source,
+                gen: n.gen || null,
+                born_turn: n.born_turn,
+                created_at: n.created_at,
+                heatCount: (n.heat || []).length,
+                heatNow: +(l / m).toFixed(2),
+                hasVector: Array.isArray(n.vector),
+                diary_ref: n.diary_ref || null,
+              }
+            }),
+          })
+        }
+        pools.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+        sendJson(res, 200, { pools, heatRounds: cfg.heatRounds, poolSize: cfg.poolSize, injectTop: cfg.injectTop, aggregateRounds: cfg.aggregateRounds })
+      } catch (err) { sendJson(res, 500, { error: (err && err.message) || String(err) }) }
+    },
+  }), 'dsh-liubian-notes.panel-routes')
+}
+
 function register(ctx, def) {
   // name / output 放在展开之后（防 def.name 覆盖成裸名撞内置工具——家族教训）
   const full = { ...def, name: TOOL_PREFIX + def.name, output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: String(v) }] } }
@@ -706,6 +764,9 @@ export function apply(ctx, input = {}) {
     ctx.logger?.info?.('[dsh-liubian-notes] 已通过配置停用（enabled=false），本轮不挂载任何钩子与工具')
     return
   }
+
+  // 面板数据路由：/api/liubian-notes（对话内「流变便签」栏的卡片数据源）
+  mountPanelRoutes(ctx, cfg)
 
   register(ctx, {
     name: 'note',
@@ -784,6 +845,8 @@ export function apply(ctx, input = {}) {
       const humanCount = (decision.messages || []).filter(isHumanMessage).length
       const prompt = currentPrompt(decision.messages)
       if (!prompt) return decision   // 同轮后续步不重复注入
+      // 记录当前回合号（面板热度分按它算 l/m；lastTurn 持久化在池文件里）
+      if (pool.lastTurn !== humanCount) { pool.lastTurn = humanCount; savePool(pool) }
       // ① 自动聚合（fire-and-forget，LLM 调用耗时绝不能卡本轮）
       scheduleAggregate(ctx, cfg, sessionId, pool, humanCount)
       // ② 向量注入：该轮对话 + 上一轮完整问答 作查询
