@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.3.0'
+export const PLUGIN_VERSION = '0.3.1'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -244,6 +244,36 @@ export function heatScore(note, nowTurn, m) {
   return l / Math.max(1, Number(m) || 1)
 }
 
+/** 只读热度计数（**无副作用**）：旁路查询（面板路由）专用。
+ *  为什么不用 pruneHeat：它会改写 note.heat；当 nowTurn 缺失或过旧（如池的 lastTurn=0）时
+ *  `nowTurn - t < 0` 会让全部记录判过期并**永久删除**——一次面板轮询即可抹掉该池热度。 */
+export function heatCountAt(note, nowTurn, m) {
+  const list = Array.isArray(note.heat) ? note.heat : []
+  let l = 0
+  for (const t of list) {
+    const d = Number(nowTurn) - Number(t)
+    if (d >= 0 && d < m) l += 1
+  }
+  return l
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * 3b. 池级互斥（M1 修复）：堵并发写入的丢单竞态。
+ *  实测事故：三个并发 stick 各自读到同一快照 → 各自算 ID → 后写覆盖前写，
+ *  丢了一张便签且两张撞号（都算成 NT-3）。
+ *  设计：只锁「同步临界区」（读快照→算 ID→判重→赛马→写盘）；
+ *  LLM 生成等长耗时段**不持锁**，否则会卡住本轮 pre-step。
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const poolLocks = new Map()
+
+export function withPoolLock(key, fn) {
+  const prev = poolLocks.get(key) || Promise.resolve()
+  const run = prev.then(fn, fn)   // 前序事务失败也要继续，不吞后续
+  poolLocks.set(key, run.then(() => {}, () => {}))
+  return run
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
  * 4. 便签构造
  * ────────────────────────────────────────────────────────────────────────── */
@@ -442,7 +472,7 @@ export async function maybeAggregate(pool, cfg, nowTurn, logger) {
     const draft = llm
       ? { head: llm.head, body: llm.body, source: 'auto', gen: 'llm' }
       : { head: buildAutoHead(window), body: buildNoteBody(window), source: 'auto', gen: 'concat' }
-    const res = await addNoteToPool(pool, draft, cfg, nowTurn)
+    const res = await withPoolLock(pool.sessionKey, () => addNoteToPool(pool, draft, cfg, nowTurn))
     made += 1
     logger?.info?.(
       `[dsh-liubian-notes] 自动聚合入池 ${res.ok ? `${res.note.id}「${firstLine(res.note.head, 30)}」(${draft.gen})` : `被拒（${res.reason}）`}` +
@@ -610,10 +640,12 @@ export async function noteToolAction(cfg, args = {}, logger) {
     const head = String(args.head || '').trim()
     const body = String(args.body || '').trim()
     if (!head || !body) return '[错误] stick 需要 head（一句话简介，将作为向量来源）与 body（便签正文）。'
-    const res = await addNoteToPool(pool, { head, body, source: 'manual' }, cfg, Number(args.nowTurn) || pool.meta.rounds)
-    if (!res.ok) return `[拒收] ${res.reason}`
-    return `已挂起 ${res.note.id}「${firstLine(res.note.head, 40)}」入池（${racableNotes(pool).length}/${cfg.poolSize}）` +
-      (res.evicted ? `；赛马淘汰 ${res.evicted.id}（入回收站，可 restore）` : '')
+    return withPoolLock(pool.sessionKey, async () => {
+      const res = await addNoteToPool(pool, { head, body, source: 'manual' }, cfg, Number(args.nowTurn) || pool.meta.rounds)
+      if (!res.ok) return `[拒收] ${res.reason}`
+      return `已挂起 ${res.note.id}「${firstLine(res.note.head, 40)}」入池（${racableNotes(pool).length}/${cfg.poolSize}）` +
+        (res.evicted ? `；赛马淘汰 ${res.evicted.id}（入回收站，可 restore）` : '')
+    })
   }
 
   if (action === 'show') {
@@ -627,52 +659,58 @@ export async function noteToolAction(cfg, args = {}, logger) {
   if (action === 'promote') {
     // 晋级缓存制（管理员 2026-10-01）：固化通道暂缓，先入 pending 队列，
     // 将来经被炉 P2P + 独特名系统提交 wiki。
-    const note = pool.notes.find(n => n.id === String(args.id || ''))
-    if (!note) return `[未找到] 便签 ${args.id}。`
-    if (note.status === 'queued') return `[跳过] ${note.id} 已在待固化缓存里。`
-    if (note.status === 'submitted') return `[跳过] ${note.id} 已固化（${note.diary_ref}）。`
-    const ws = String(args.workspace || cfg.workspace || '工作组').trim()
-    const entry = {
-      queued_at: new Date().toISOString(),
-      session_key: pool.sessionKey,
-      id: note.id,
-      head: note.head,
-      body: note.body,
-      born_turn: note.born_turn,
-      source: note.source,
-      workspace: ws,
-      tags: buildPromoteTags(note.head, ws),
-    }
-    if (!appendPending(entry)) return '[失败] 写入 pending_promotions.jsonl 未成功（便签保持原状态，可重试）。'
-    note.status = 'queued'
-    savePool(pool)
-    return `已缓存待固化：${note.id} → pending_promotions.jsonl（标签 ${entry.tags.join('/')}）。通道就绪（被炉 P2P + 独特名）前只累积不提交。`
+    return withPoolLock(pool.sessionKey, async () => {
+      const note = pool.notes.find(n => n.id === String(args.id || ''))
+      if (!note) return `[未找到] 便签 ${args.id}。`
+      if (note.status === 'queued') return `[跳过] ${note.id} 已在待固化缓存里。`
+      if (note.status === 'submitted') return `[跳过] ${note.id} 已固化（${note.diary_ref}）。`
+      const ws = String(args.workspace || cfg.workspace || '工作组').trim()
+      const entry = {
+        queued_at: new Date().toISOString(),
+        session_key: pool.sessionKey,
+        id: note.id,
+        head: note.head,
+        body: note.body,
+        born_turn: note.born_turn,
+        source: note.source,
+        workspace: ws,
+        tags: buildPromoteTags(note.head, ws),
+      }
+      if (!appendPending(entry)) return '[失败] 写入 pending_promotions.jsonl 未成功（便签保持原状态，可重试）。'
+      note.status = 'queued'
+      savePool(pool)
+      return `已缓存待固化：${note.id} → pending_promotions.jsonl（标签 ${entry.tags.join('/')}）。通道就绪（被炉 P2P + 独特名）前只累积不提交。`
+    })
   }
 
   if (action === 'drop') {
-    const idx = pool.notes.findIndex(n => n.id === String(args.id || ''))
-    if (idx < 0) return `[未找到] 便签 ${args.id}。`
-    const [note] = pool.notes.splice(idx, 1)
-    note.status = 'retired'
-    const retired = loadRetired(pool.sessionKey)
-    retired.push(note)
-    saveRetired(pool.sessionKey, retired)
-    savePool(pool)
-    return `已移入回收站：${note.id}（restore 可救回）。`
+    return withPoolLock(pool.sessionKey, async () => {
+      const idx = pool.notes.findIndex(n => n.id === String(args.id || ''))
+      if (idx < 0) return `[未找到] 便签 ${args.id}。`
+      const [note] = pool.notes.splice(idx, 1)
+      note.status = 'retired'
+      const retired = loadRetired(pool.sessionKey)
+      retired.push(note)
+      saveRetired(pool.sessionKey, retired)
+      savePool(pool)
+      return `已移入回收站：${note.id}（restore 可救回）。`
+    })
   }
 
   if (action === 'restore') {
-    const retired = loadRetired(pool.sessionKey)
-    const idx = retired.findIndex(n => n.id === String(args.id || ''))
-    if (idx < 0) return `[未找到] 回收站里没有 ${args.id}。`
-    const [note] = retired.splice(idx, 1)
-    saveRetired(pool.sessionKey, retired)
-    const res = await addNoteToPool(pool, note, cfg, Number(args.nowTurn) || pool.meta.rounds)
-    if (!res.ok) {
-      const back = loadRetired(pool.sessionKey); back.push(note); saveRetired(pool.sessionKey, back)
-      return `[拒收] 恢复失败：${res.reason}（便签已放回回收站）`
-    }
-    return `已恢复：${note.id} 重新入池${res.evicted ? `（赛马淘汰 ${res.evicted.id}）` : ''}。`
+    return withPoolLock(pool.sessionKey, async () => {
+      const retired = loadRetired(pool.sessionKey)
+      const idx = retired.findIndex(n => n.id === String(args.id || ''))
+      if (idx < 0) return `[未找到] 回收站里没有 ${args.id}。`
+      const [note] = retired.splice(idx, 1)
+      saveRetired(pool.sessionKey, retired)
+      const res = await addNoteToPool(pool, note, cfg, Number(args.nowTurn) || pool.meta.rounds)
+      if (!res.ok) {
+        const back = loadRetired(pool.sessionKey); back.push(note); saveRetired(pool.sessionKey, back)
+        return `[拒收] 恢复失败：${res.reason}（便签已放回回收站）`
+      }
+      return `已恢复：${note.id} 重新入池${res.evicted ? `（赛马淘汰 ${res.evicted.id}）` : ''}。`
+    })
   }
 
   return '[错误] 未知 action：' + action + '（可用 list/show/stick/promote/drop/restore）'
@@ -694,14 +732,23 @@ function sendJson(res, code, obj) {
  *  热注入拿不到新声明的服务清单（checklist §3.1.3），reflect 层是官方豁免口。 */
 export function mountPanelRoutes(ctx, cfg) {
   ctx.effect(() => {
-    const webServer = (ctx.reflect && typeof ctx.reflect.get === 'function')
-      ? ctx.reflect.get('webServer', false)
-      : ctx.webServer
-    if (!webServer || typeof webServer.register !== 'function') {
-      ctx.logger?.warn?.('[dsh-liubian-notes] webServer 服务不可得，面板路由未挂载（下次重载重试）')
-      return
-    }
-    return webServer.register({
+    let disposed = false
+    let timer = null
+    let off = null
+    let attempts = 0
+    // M3 修复：webServer 在 apply 时可能尚未就绪——有限次重试（8×2s），不再"一次失败永久不挂"
+    const tryMount = () => {
+      if (disposed) return
+      attempts += 1
+      const webServer = (ctx.reflect && typeof ctx.reflect.get === 'function')
+        ? ctx.reflect.get('webServer', false)
+        : ctx.webServer
+      if (!webServer || typeof webServer.register !== 'function') {
+        if (attempts < 8) timer = setTimeout(tryMount, 2000)
+        else ctx.logger?.warn?.(`[dsh-liubian-notes] webServer 重试 ${attempts} 次仍不可得，面板路由放弃挂载（重启/重载后恢复）`)
+        return
+      }
+      off = webServer.register({
     kind: 'exact',
     path: '/api/liubian-notes',
     async handler(req, res) {
@@ -725,7 +772,7 @@ export function mountPanelRoutes(ctx, cfg) {
             sealed: (pool.sealed || []).length,
             meta: pool.meta || { rounds: 0, humanChars: 0, assistantChars: 0 },
             notes: (pool.notes || []).filter(n => n.status !== 'retired').map(n => {
-              const l = pruneHeat(n, lastTurn, m)
+              const l = heatCountAt(n, lastTurn, m)   // 只读计数：路由不得改写 heat（M2 修复）
               return {
                 id: n.id,
                 head: n.head,
@@ -747,7 +794,15 @@ export function mountPanelRoutes(ctx, cfg) {
         sendJson(res, 200, { pools, heatRounds: cfg.heatRounds, poolSize: cfg.poolSize, injectTop: cfg.injectTop, aggregateRounds: cfg.aggregateRounds })
       } catch (err) { sendJson(res, 500, { error: (err && err.message) || String(err) }) }
     },
-    })
+      })
+      ctx.logger?.info?.(`[dsh-liubian-notes] 面板路由已挂载 /api/liubian-notes（第 ${attempts} 次尝试）`)
+    }
+    tryMount()
+    return () => {
+      disposed = true
+      if (timer) clearTimeout(timer)
+      if (typeof off === 'function') off()
+    }
   }, 'dsh-liubian-notes.panel-routes')
 }
 
@@ -888,7 +943,8 @@ export function apply(ctx, input = {}) {
 /* ── 纯函数测试缝（dev_stage_add 挂 staging 工具 import 本文件调 __test）── */
 export const __test = {
   resolveConfig, configFile, memoryConfigFile, diaryApiConfigFile, sessionKeyFor,
-  cosine, pruneHeat, heatScore, buildNoteBody, buildAutoHead, composeQueryText,
+  cosine, pruneHeat, heatScore, heatCountAt, withPoolLock,
+  buildNoteBody, buildAutoHead, composeQueryText,
   previousQAPair, buildNotesBlock, buildPackPrompt, generateNoteViaLlm,
   addNoteToPool, loadPool, savePool, loadRetired, saveRetired, injectionBlock,
   maybeAggregate, noteToolAction, embedTexts, pluginMessage, messageText,
