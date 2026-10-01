@@ -12,6 +12,7 @@ import {
   openDb, registerIdentity, verifyName, lookupIdentity, listIdentities, retireIdentity,
   bindSession, unbindSession, bindingFor, listBindings,
   attributeWorkspace, noteSession, seenWorkspaceFor,
+  callerSessionOf,
   resolveConfig,
 } from '../lib/impl.mjs'
 
@@ -202,6 +203,18 @@ t('身份无归属 → 不拦', () => {
   eq(r.name, '无归属者')
 })
 t('attribute 空工作区拒绝', () => throws(() => attributeWorkspace(db, '归属测试员', '  '), '不能为空'))
+
+console.log('== callerSessionOf（注册主动归属的数据源） ==')
+t('正常 exec → 会话 id + cwd', () => {
+  const c = callerSessionOf({ agent: { session: { id: 'sess-1', header: { cwd: 'E:/DSH_data/中枢' } } } })
+  eq(c.id, 'sess-1'); eq(c.cwd, 'E:/DSH_data/中枢')
+})
+t('无会话 → null（面板调用）', () => eq(callerSessionOf({}), null))
+t('exec 缺失 → null', () => eq(callerSessionOf(undefined), null))
+t('与 sessionHashFor 闭环：caller.id 可直接派生会话哈希', () => {
+  const c = callerSessionOf({ agent: { session: { id: 'sess-1', header: {} } } })
+  eq(sessionHashFor(c.id), sessionHashFor('sess-1'))
+})
 
 db.close()
 try { rmSync(dir, { recursive: true, force: true }) } catch {}

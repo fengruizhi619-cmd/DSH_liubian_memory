@@ -24,7 +24,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const PLUGIN_NAME = 'dsh-liubian-infra'
-export const PLUGIN_VERSION = '0.2.1'
+export const PLUGIN_VERSION = '0.2.2'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
@@ -532,6 +532,13 @@ export function deriveSessionWorkspace(cfg, agent) {
   return String(cfg.workspace || '') || null
 }
 
+/** 从工具执行上下文取调用方会话（exec.agent.session）——注册/绑定时主动完成归属的数据源。 */
+export function callerSessionOf(exec) {
+  const s = exec && exec.agent && exec.agent.session
+  if (!s || !s.id) return null
+  return { id: String(s.id), cwd: String((s.header && s.header.cwd) || '') }
+}
+
 export function mountBindingInjection(ctx, cfg, state) {
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
@@ -604,14 +611,28 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       note: { type: 'string', description: 'register/retire/bind 用：备注（归属、用途等）' },
     },
     output: OUT,
-    async execute(args) {
+    async execute(args, exec) {
       const action = String(args.action || 'status').toLowerCase()
+      // 调用方会话（v0.2.2 注册/绑定主动完成归属的数据源；面板/无会话调用为 null）
+      const caller = callerSessionOf(exec)
+      const noteCaller = (db) => {
+        if (!caller) return null
+        const sh = sessionHashFor(caller.id)
+        const ws = deriveSessionWorkspace(cfg, { session: { header: { cwd: caller.cwd } } })
+        try { noteSession(db, sh, ws) } catch { /* 登记失败不阻塞 */ }
+        return { hash: sh, workspace: ws }
+      }
 
       /* ── 注册中心 ── */
       if (action === 'register') {
         const db = state.getDb()
-        const row = registerIdentity(db, args.name, args.note, args.workspace)
-        return fmtRow(row) + `\n  └─ 注册表现有 ${listIdentities(db).length} 个身份`
+        const seen = noteCaller(db)
+        // 主动完成归属（管理员 2026-10-01）：显式 workspace > 调用方会话自动推导 > 未登记
+        const autoWs = seen ? seen.workspace : null
+        const ws = String(args.workspace ?? '').trim() || autoWs
+        const row = registerIdentity(db, args.name, args.note, ws)
+        const src = String(args.workspace ?? '').trim() ? '调用方指定' : (ws ? '自动推导自调用会话' : '未登记（无会话上下文）')
+        return fmtRow(row) + `\n  └─ 归属来源：${src}｜注册表现有 ${listIdentities(db).length} 个身份`
       }
       if (action === 'attribute') {
         const db = state.getDb()
@@ -652,6 +673,7 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       /* ── 会话绑定（v0.2.0） ── */
       if (action === 'bind') {
         const db = state.getDb()
+        noteCaller(db)   // 绑定前刷新调用方会话登记（归属校验数据源）
         const r = bindSession(db, args.session, args.name, args.note)
         if (r.already) return `[OK] 已绑定（幂等）：${fmtBindingRow(r)}`
         return `[OK] 已绑定：${fmtBindingRow(r)}\n  └─ 独热配对成立，本会话身份归因「${r.name}」。`
@@ -811,6 +833,7 @@ export const __test = {
   noteSession,
   seenWorkspaceFor,
   deriveSessionWorkspace,
+  callerSessionOf,
   probe,
   launch,
   ensureReady,
