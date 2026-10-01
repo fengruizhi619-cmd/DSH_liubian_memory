@@ -11,6 +11,7 @@ import {
   normalizeName, deriveHash, computeShortIds, recomputeShortIds, sessionHashFor,
   openDb, registerIdentity, verifyName, lookupIdentity, listIdentities, retireIdentity,
   bindSession, unbindSession, bindingFor, listBindings,
+  attributeWorkspace, noteSession, seenWorkspaceFor,
   resolveConfig,
 } from '../lib/impl.mjs'
 
@@ -162,6 +163,45 @@ t('bindings 计数', () => {
   if (listBindings(db).length < 1) throw new Error('应有绑定行')
   unbindSession(db, { name: '绑定甲' })
 })
+
+console.log('== 工作区归属（v0.2.1 管理员钉） ==')
+t('注册带归属 → 落库', () => {
+  const row = registerIdentity(db, '归属测试员', '归属测试', '中枢')
+  eq(row.workspace, '中枢')
+})
+t('attribute 修正归属', () => {
+  const row = attributeWorkspace(db, '归属测试员', '工作组')
+  eq(row.workspace, '工作组')
+})
+t('verify 输出带归属', () => {
+  const r = verifyName(db, '归属测试员')
+  eq(r.workspace, '工作组')
+})
+t('会话登记 → seen 工作区', () => {
+  noteSession(db, 'aa000000', '中枢')
+  eq(seenWorkspaceFor(db, 'aa000000'), '中枢')
+})
+t('bind 归属不符 → 拒绝', () => {
+  noteSession(db, 'bb000000', '银砂纪年')
+  throws(() => bindSession(db, 'bb000000', '归属测试员'), '归属不符')
+})
+t('bind 归属一致 → 通过', () => {
+  noteSession(db, 'cc000000', '工作组')
+  const r = bindSession(db, 'cc000000', '归属测试员')
+  eq(r.name, '归属测试员')
+  unbindSession(db, { session: 'cc000000' })
+})
+t('会话未见登记（无工作区）→ 不拦（无法判定时不误伤）', () => {
+  const r = bindSession(db, 'dd000000', '归属测试员')
+  eq(r.name, '归属测试员')
+})
+t('身份无归属 → 不拦', () => {
+  registerIdentity(db, '无归属者', '未登记归属')
+  noteSession(db, 'ee000000', '随便哪里')
+  const r = bindSession(db, 'ee000000', '无归属者')
+  eq(r.name, '无归属者')
+})
+t('attribute 空工作区拒绝', () => throws(() => attributeWorkspace(db, '归属测试员', '  '), '不能为空'))
 
 db.close()
 try { rmSync(dir, { recursive: true, force: true }) } catch {}

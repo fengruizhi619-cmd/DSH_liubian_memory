@@ -24,7 +24,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const PLUGIN_NAME = 'dsh-liubian-infra'
-export const PLUGIN_VERSION = '0.2.0'
+export const PLUGIN_VERSION = '0.2.1'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
@@ -41,6 +41,10 @@ export const DEFAULTS = {
   dbPath: join(DSH_HOME, 'liubian-infra', 'registry.db'),
   /** 会话绑定提示（管理员 2026-10-01：未绑定会话注入一条注册提示） */
   bindNag: true,
+  /** 家族根（工作区归属推导用：会话 cwd 末段目录在 liubianRoot 下才算有效工作区） */
+  liubianRoot: 'E:/DSH_data',
+  /** 默认工作区（cwd 推导失败时回落；与家族共享键同名） */
+  workspace: '中枢',
   /* ── 向量服务（与 dsh-liubian-embed 同一份配置源 ~/.dsh/liubian/embed.json，共享键同名）── */
   embedUrl: 'http://127.0.0.1:8082',
   embedPort: 8082,
@@ -77,6 +81,8 @@ function readJson(file) {
 export function resolveConfig(input = {}) {
   const merged = {
     ...DEFAULTS,
+    // 家族共享键（~/.dsh/liubian/config.json：liubianRoot / workspace 等，标准 §5 同名共享）
+    ...readJson(join(DSH_HOME, 'liubian', 'config.json')),
     // embed 键从家族共享配置源读（embed.json），缺省回落 DEFAULTS
     ...readJson(join(DSH_HOME, 'liubian', 'embed.json')),
     ...readJson(configFile()),
@@ -149,6 +155,7 @@ CREATE TABLE IF NOT EXISTS identities (
   hash        TEXT NOT NULL UNIQUE,
   short_id    TEXT NOT NULL,
   status      TEXT NOT NULL DEFAULT 'active',
+  workspace   TEXT,
   note        TEXT,
   created_at  TEXT NOT NULL,
   retired_at  TEXT,
@@ -161,6 +168,11 @@ CREATE TABLE IF NOT EXISTS bindings (
   note         TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_name ON bindings(name);
+CREATE TABLE IF NOT EXISTS session_seen (
+  session_hash TEXT PRIMARY KEY,
+  workspace    TEXT,
+  last_seen    TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 `
 
@@ -170,6 +182,8 @@ export function openDb(dbPath) {
   db.exec('PRAGMA journal_mode=WAL')
   db.exec('PRAGMA busy_timeout=5000')
   db.exec(SCHEMA)
+  // 既有库迁移：v0.2.0 建的 identities 无 workspace 列（duplicate column 错误即已迁移）
+  try { db.exec('ALTER TABLE identities ADD COLUMN workspace TEXT') } catch { /* 列已存在 */ }
   return db
 }
 
@@ -180,12 +194,13 @@ export function recomputeShortIds(db) {
   for (const r of rows) upd.run(map[r.hash], r.hash)
 }
 
-/** 注册。名字全局独热：占用即拒绝（含已停用名——独热保留不回收）。 */
-export function registerIdentity(db, rawName, note) {
+/** 注册。名字全局独热：占用即拒绝（含已停用名——独热保留不回收）。workspace = 归属工作区（管理员 2026-10-01：名字按工作区归属）。 */
+export function registerIdentity(db, rawName, note, workspace) {
   const norm = normalizeName(rawName)
   if (!norm.ok) throw new Error(`[拒绝] ${norm.error}`)
   const { name, key } = norm
   const hash = deriveHash(name)
+  const ws = String(workspace ?? '').trim() || null
   const dup = db.prepare('SELECT name, status, short_id, created_at FROM identities WHERE name_key = ?').get(key)
   if (dup) {
     const st = dup.status === 'retired' ? `已停用于 ${dup.retired_at || '?'}（独热保留，不回收）` : '在册'
@@ -194,16 +209,47 @@ export function registerIdentity(db, rawName, note) {
   const byHash = db.prepare('SELECT name FROM identities WHERE hash = ?').get(hash)
   if (byHash) throw new Error(`[拒绝] 哈希与在册条目「${byHash.name}」碰撞（SHA-256 碰撞属异常，请核查派生函数是否一致）`)
   const now = new Date().toISOString()
-  db.prepare('INSERT INTO identities (name, name_key, hash, short_id, status, note, created_at) VALUES (?,?,?,?,?,?,?)')
-    .run(name, key, hash, hash.slice(0, 8), 'active', note ? String(note) : null, now)
+  db.prepare('INSERT INTO identities (name, name_key, hash, short_id, status, workspace, note, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run(name, key, hash, hash.slice(0, 8), 'active', ws, note ? String(note) : null, now)
   recomputeShortIds(db)
   return db.prepare('SELECT * FROM identities WHERE name_key = ?').get(key)
+}
+
+/** 设置/更新归属工作区（名字独热不可重注册，归属修正走这里）。 */
+export function attributeWorkspace(db, rawName, workspace) {
+  const norm = normalizeName(rawName)
+  if (!norm.ok) throw new Error(norm.error)
+  const row = db.prepare('SELECT name FROM identities WHERE name_key = ?').get(norm.key)
+  if (!row) throw new Error(`[错误] 名字「${norm.name}」不在册`)
+  const ws = String(workspace ?? '').trim()
+  if (!ws) throw new Error('[错误] workspace 不能为空')
+  db.prepare('UPDATE identities SET workspace = ? WHERE name_key = ?').run(ws, norm.key)
+  return db.prepare('SELECT * FROM identities WHERE name_key = ?').get(norm.key)
+}
+
+/** 会话出现登记（注入钩子每回合记录会话→工作区，bind 时做归属校验）。 */
+export function noteSession(db, sessionHash, workspace) {
+  const sh = normSessionHash(sessionHash)
+  const now = new Date().toISOString()
+  db.prepare(`
+    INSERT INTO session_seen (session_hash, workspace, last_seen) VALUES (?,?,?)
+    ON CONFLICT(session_hash) DO UPDATE SET workspace = excluded.workspace, last_seen = excluded.last_seen
+  `).run(sh, workspace || null, now)
+}
+
+/** 会话的实际工作区（session_seen 里登记的）。 */
+export function seenWorkspaceFor(db, sessionHash) {
+  try {
+    const sh = normSessionHash(sessionHash)
+    const row = db.prepare('SELECT workspace FROM session_seen WHERE session_hash = ?').get(sh)
+    return row ? row.workspace : null
+  } catch { return null }
 }
 
 export function verifyName(db, rawName) {
   const norm = normalizeName(rawName)
   if (!norm.ok) return { ok: false, available: false, error: norm.error }
-  const row = db.prepare('SELECT name, status, short_id, created_at, retired_at FROM identities WHERE name_key = ?').get(norm.key)
+  const row = db.prepare('SELECT name, status, short_id, created_at, retired_at, workspace FROM identities WHERE name_key = ?').get(norm.key)
   if (!row) return { ok: true, available: true, name: norm.name, hash: deriveHash(norm.name) }
   return {
     ok: true,
@@ -211,6 +257,7 @@ export function verifyName(db, rawName) {
     name: row.name,
     status: row.status,
     shortId: row.short_id,
+    workspace: row.workspace || undefined,
     registeredAt: row.created_at,
     retiredAt: row.retired_at || undefined,
     reason: row.status === 'retired' ? '已停用（独热保留，不回收）' : '在册',
@@ -238,7 +285,7 @@ export function lookupIdentity(db, { name, id } = {}) {
 }
 
 export function listIdentities(db) {
-  return db.prepare('SELECT name, hash, short_id, status, note, created_at, retired_at FROM identities ORDER BY created_at').all()
+  return db.prepare('SELECT name, hash, short_id, status, workspace, note, created_at, retired_at FROM identities ORDER BY created_at').all()
 }
 
 export function retireIdentity(db, rawName, note) {
@@ -267,9 +314,14 @@ export function bindSession(db, rawSessionHash, rawName, note) {
   const sh = normSessionHash(rawSessionHash)
   const norm = normalizeName(rawName)
   if (!norm.ok) throw new Error(`[拒绝] ${norm.error}`)
-  const ident = db.prepare('SELECT name, short_id, status FROM identities WHERE name_key = ?').get(norm.key)
+  const ident = db.prepare('SELECT name, short_id, status, workspace FROM identities WHERE name_key = ?').get(norm.key)
   if (!ident) throw new Error(`[拒绝] 名字「${norm.name}」尚未注册——先 register 再 bind。`)
   if (ident.status === 'retired') throw new Error(`[拒绝] 名字「${norm.name}」已停用，不能绑定。`)
+  // 归属校验（管理员 2026-10-01：名字按工作区归属）——会话实际工作区（注入钩子登记）与身份归属不一致即拒
+  const seen = seenWorkspaceFor(db, sh)
+  if (ident.workspace && seen && seen !== ident.workspace) {
+    throw new Error(`[拒绝] 归属不符：本会话实际工作区「${seen}」，而「${ident.name}」归属「${ident.workspace}」。名字按工作区归属，请注册/绑定本工作区的身份（或找基石核对归属登记）。`)
+  }
   const existing = db.prepare('SELECT * FROM bindings WHERE session_hash = ?').get(sh)
   if (existing && existing.name === ident.name) return { ...existing, short_id: ident.short_id, already: true }
   if (existing) throw new Error(`[拒绝] 会话 ${sh} 已绑定「${existing.name}」（唯一绑定）。要改绑先 action=unbind 释放。`)
@@ -300,11 +352,11 @@ export function unbindSession(db, { session, name } = {}) {
   throw new Error('[错误] unbind 需要 session 或 name 之一')
 }
 
-/** 查绑定（带身份短 ID）。 */
+/** 查绑定（带身份短 ID 与归属工作区）。 */
 export function bindingFor(db, rawSessionHash) {
   const sh = normSessionHash(rawSessionHash)
   return db.prepare(`
-    SELECT b.session_hash, b.name, b.bound_at, b.note, i.short_id, i.status
+    SELECT b.session_hash, b.name, b.bound_at, b.note, i.short_id, i.status, i.workspace
     FROM bindings b LEFT JOIN identities i ON i.name = b.name
     WHERE b.session_hash = ?
   `).get(sh) || null
@@ -312,7 +364,7 @@ export function bindingFor(db, rawSessionHash) {
 
 export function listBindings(db) {
   return db.prepare(`
-    SELECT b.session_hash, b.name, b.bound_at, b.note, i.short_id
+    SELECT b.session_hash, b.name, b.bound_at, b.note, i.short_id, i.workspace
     FROM bindings b LEFT JOIN identities i ON i.name = b.name
     ORDER BY b.bound_at
   `).all()
@@ -469,6 +521,17 @@ export function mountWatchdog(ctx, cfg) {
 
 /* ══ 注入钩子：未绑定会话注入一条注册提示（v0.2.0，管理员钉；已绑定不注入） ══ */
 
+/** 会话归属工作区推导：cwd 末段目录名（且在 liubianRoot 下才有效），与记忆系统 resolveDiaryWorkspace 同源。 */
+export function deriveSessionWorkspace(cfg, agent) {
+  const cwd = String((agent && agent.session && agent.session.header && agent.session.header.cwd) || '')
+  if (cwd) {
+    const base = cwd.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || ''
+    const root = String(cfg.liubianRoot || '').replace(/[\\/]+$/, '')
+    if (base && root && existsSync(join(root, base))) return base
+  }
+  return String(cfg.workspace || '') || null
+}
+
 export function mountBindingInjection(ctx, cfg, state) {
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
@@ -480,8 +543,10 @@ export function mountBindingInjection(ctx, cfg, state) {
       const db = state.tryDb()
       if (!db) return decision                      // 注册中心不可用 → 静默降级（门禁③）
       const sh = sessionHashFor(sessionId)
+      const ws = deriveSessionWorkspace(cfg, agent)
+      try { noteSession(db, sh, ws) } catch { /* 登记失败不影响注入 */ }
       if (bindingFor(db, sh)) return decision       // 已绑定：不注入（管理员只规定未绑定分支）
-      const text = `【流变·基建｜独特名注册】本会话尚未绑定身份（会话哈希 ${sh}）。请两步完成：① _dsh_external_dsh_liubian_infra action=register 注册一个全局独热名字（规范：非空、≤64 字符、不以 @/# 开头、注册即永久保留）；② action=bind 以会话哈希 ${sh} 绑定该名字。绑定后会话与身份独热配对，后续署名/贡献者归因此身份。`
+      const text = `【流变·基建｜独特名注册】本会话尚未绑定身份（会话哈希 ${sh}｜工作区 ${ws || '未知'}）。请两步完成：① _dsh_external_dsh_liubian_infra action=register 注册一个全局独热名字并带 workspace=${ws || '你的工作区名'}（名字按工作区归属；规范：非空、≤64 字符、不以 @/# 开头、注册即永久保留）；② action=bind 以会话哈希 ${sh} 绑定该名字。绑定后会话与身份独热配对，后续署名/贡献者归因此身份。`
       return { kind: 'enter', messages: [...decision.messages, {
         id: randomUUID(),
         role: 'user',
@@ -507,12 +572,13 @@ function fmtRow(r) {
     `[OK] ${r.status === 'retired' ? '（已停用）' : ''}「${r.name}」`,
     `  短ID   ${r.short_id}`,
     `  全hash ${r.hash}`,
+    `  归属   ${r.workspace || '（未登记）'}`,
     `  注册   ${r.created_at}${r.retired_at ? `｜停用 ${r.retired_at}${r.retired_note ? `（${r.retired_note}）` : ''}` : ''}`,
     r.note ? `  说明   ${r.note}` : '',
   ].filter(Boolean).join('\n')
 }
 
-const REGISTRY_ACTIONS = 'register / verify / lookup / list / retire / bind / unbind / binding / bindings / status'
+const REGISTRY_ACTIONS = 'register / verify / lookup / list / retire / attribute / bind / unbind / binding / bindings / status'
 const EMBED_ACTIONS = 'embed-status / embed-ensure / embed-stop / embed-restart'
 
 function fmtBindingRow(r) {
@@ -523,7 +589,7 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
   return defineTool({
     name,
     description: descriptionNote + '独特名注册中心：全局独热唯一的智能体名，注册时自动派生 SHA-256 哈希作为身份唯一标识符，'
-      + '全家族插件统一查询注册表（契约 v1.0）；会话↔身份独热绑定：未绑定会话每回合收到一条注册提示；'
+      + '名字按工作区归属（register 带 workspace）；会话↔身份独热绑定：未绑定会话每回合收到一条注册提示；'
       + '向量服务控制面（挂牌迁移后服务所有权归基建）。'
       + `action: ${REGISTRY_ACTIONS}｜${EMBED_ACTIONS}`,
     parameters: {
@@ -531,9 +597,10 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
         type: 'string', required: true,
         description: `操作：${REGISTRY_ACTIONS}｜${EMBED_ACTIONS}`,
       },
-      name: { type: 'string', description: 'register/verify/lookup/retire/bind/unbind/binding 用：独特名' },
+      name: { type: 'string', description: 'register/verify/lookup/retire/attribute/bind/unbind/binding 用：独特名' },
       id: { type: 'string', description: 'lookup 用：短或全 hash（8~64 位十六进制）' },
       session: { type: 'string', description: 'bind/unbind/binding 用：会话哈希（8 位十六进制，注入提示里给的）' },
+      workspace: { type: 'string', description: 'register/attribute 用：归属工作区名（名字按工作区归属）' },
       note: { type: 'string', description: 'register/retire/bind 用：备注（归属、用途等）' },
     },
     output: OUT,
@@ -543,8 +610,13 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       /* ── 注册中心 ── */
       if (action === 'register') {
         const db = state.getDb()
-        const row = registerIdentity(db, args.name, args.note)
+        const row = registerIdentity(db, args.name, args.note, args.workspace)
         return fmtRow(row) + `\n  └─ 注册表现有 ${listIdentities(db).length} 个身份`
+      }
+      if (action === 'attribute') {
+        const db = state.getDb()
+        const row = attributeWorkspace(db, args.name, args.workspace)
+        return `[OK] 归属已更新：${fmtRow(row)}`
       }
       if (action === 'verify') {
         const db = state.getDb()
@@ -567,8 +639,8 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
         const rows = listIdentities(db)
         if (!rows.length) return '注册表为空。'
         const lines = rows.map(r =>
-          `  ${r.status === 'retired' ? '○' : '●'} ${r.name}  #${r.short_id}${r.note ? `  ｜${r.note}` : ''}`)
-        return `注册表（${rows.length} 个，● 在册 ○ 停用）：\n${lines.join('\n')}`
+          `  ${r.status === 'retired' ? '○' : '●'} ${r.name}  #${r.short_id}${r.workspace ? `  [${r.workspace}]` : ''}${r.note ? `  ｜${r.note}` : ''}`)
+        return `注册表（${rows.length} 个，● 在册 ○ 停用，[工作区]）：\n${lines.join('\n')}`
       }
       if (action === 'retire') {
         const db = state.getDb()
@@ -735,6 +807,10 @@ export const __test = {
   unbindSession,
   bindingFor,
   listBindings,
+  attributeWorkspace,
+  noteSession,
+  seenWorkspaceFor,
+  deriveSessionWorkspace,
   probe,
   launch,
   ensureReady,
