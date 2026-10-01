@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.5.6'
+export const PLUGIN_VERSION = '0.5.7'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -254,21 +254,12 @@ function saveRetired(key, list) {
   } catch { return false }
 }
 
-/** 工具面默认会话：pre-step 每轮刷新；工具调用省略 session 参数时用它。 */
-let lastActiveKey = ''
-let lastActiveSessionId = ''
-function touchActive(key, sessionId) { lastActiveKey = key; lastActiveSessionId = String(sessionId ?? '') }
-function defaultKey() {
-  if (lastActiveKey) return { key: lastActiveKey, sessionId: lastActiveSessionId }
-  try {
-    const files = readdirSync(notesDir()).filter(f => f.endsWith('.json'))
-    if (files.length === 1) {
-      const key = files[0].replace(/\.json$/, '')
-      return { key, sessionId: '' }
-    }
-  } catch { /* 目录还没有 */ }
-  return { key: '', sessionId: '' }
-}
+/* 🔴-9（v0.5.7）：此处原有「工具面默认会话＝最后跑 pre-step 的会话」那套全局指针
+ * （模块级 last-active 变量 + 一个读它的默认键函数 + 一个写它的 touch 函数），已整条删除。
+ * 事故：宿主单进程承载全部会话，谁的 step 最后跑，工具就读写谁的池——多智能体房间里
+ * list 报别人的池、stick/promote 把便签挂进/送出**别的智能体**的池，**且不报错**。
+ * 工具面现取调用方会话（见下方 resolveSessionArg / callerSessionOf）。
+ * ⚠ 不要加回来：_dev/verify-fixes.mjs 有源码级护栏，断言这三个标识符全文件 **0 引用（含注释）**。 */
 
 /* ──────────────────────────────────────────────────────────────────────────
  * 2. 向量：复用 8082（llama.cpp /v1/embeddings，qwen3-emb）。失败返回 null → 降级。
@@ -743,28 +734,34 @@ export function buildPromoteTags(head, workspace) {
  * 10. 工具面：_dsh_external_dsh_liubian_note
  * ────────────────────────────────────────────────────────────────────────── */
 
-function resolveSessionArg(args) {
-  const explicit = String(args.session || '').trim()
-  if (explicit) return { key: sessionKeyFor(explicit), sessionId: explicit }
-  const d = defaultKey()
-  if (!d.key) return null
-  return d
+/* 🔴-9（v0.5.7）：工具面默认池＝**调用方会话**，绝不回落到「最后活跃池」。
+ * 取法照家族先例（基建 v0.2.2 callerSessionOf）：exec.agent.session.id。 */
+export function callerSessionOf(exec) {
+  const s = exec && exec.agent && exec.agent.session
+  const id = String((s && s.id) || '').trim()
+  if (!id) return null
+  return { key: sessionKeyFor(id), sessionId: id }
 }
 
-export async function noteToolAction(cfg, args = {}, logger) {
+/** 解析顺序：args.session（显式，优先）→ 调用方会话（exec）→ null（调用方按 B 档明确报错）。 */
+function resolveSessionArg(args, exec) {
+  const explicit = String(args.session || '').trim()
+  if (explicit) return { key: sessionKeyFor(explicit), sessionId: explicit }
+  return callerSessionOf(exec)
+}
+
+/** B 档：解析不到就明确报错，不静默回落（静默回落＝「两处真相」，今天已出过一例）。 */
+const SESSION_UNRESOLVED = '[错误] 无法解析调用方会话：本工具的默认池是「调用方会话的池」，'
+  + '当前调用没带会话上下文。请显式传 session=<会话标识>，或从对话内调用。'
+
+export async function noteToolAction(cfg, args = {}, logger, exec = null) {
   const action = String(args.action || 'list').trim()
   if (action === 'list') {
-    const key = String(args.session || '').trim() ? sessionKeyFor(args.session) : (defaultKey().key || '')
-    const pools = []
-    if (key) pools.push(loadPool(key, args.session))
-    else {
-      try {
-        for (const f of readdirSync(notesDir()).filter(f => f.endsWith('.json'))) {
-          const raw = readJson(join(notesDir(), f))
-          if (raw) pools.push(raw)
-        }
-      } catch { /* 目录还没有 */ }
-    }
+    /* 🔴-9：默认池＝调用方会话。「key 为空就列全部池」那条调试回落已取消（B 档）——
+     * 列全池的正路是 HTTP 路由 op=pools（面板与排障用），工具面不再留"无会话上下文也能列全库"的静默入口。 */
+    const sess0 = resolveSessionArg(args, exec)
+    if (!sess0) return SESSION_UNRESOLVED
+    const pools = [loadPool(sess0.key, sess0.sessionId)]
     if (!pools.length) return '[空] 还没有任何便签池（自动聚合每 ' + cfg.aggregateRounds + ' 轮一篇，或用 stick 主动挂起）。'
     const m = cfg.heatRounds
     return pools.map(pool => {
@@ -786,10 +783,9 @@ export async function noteToolAction(cfg, args = {}, logger) {
     }).join('\n\n')
   }
 
-  const sess = resolveSessionArg(args)
-  if (!sess) return '[提示] 还没有活跃便签池：先对话几轮（每 ' + cfg.aggregateRounds + ' 轮自动聚合一篇），或先在对话里触发一次注入。'
+  const sess = resolveSessionArg(args, exec)
+  if (!sess) return SESSION_UNRESOLVED
   const pool = loadPool(sess.key, sess.sessionId)
-  touchActive(sess.key, sess.sessionId)
 
   if (action === 'stick') {
     const head = String(args.head || '').trim()
@@ -1211,17 +1207,20 @@ export function apply(ctx, input = {}) {
     name: 'note',
     description: '流变·便签（本对话的短期记忆池）。action=list 看池+热度；show 读全文；'
       + 'stick 主动挂起便签（head=一句话简介即向量来源，body=正文；与自动便签同规则）；'
-      + 'promote 手动晋级（当前为缓存制：入 pending 队列等固化通道）；drop/restore 回收站。session 可选。',
+      + 'promote 手动晋级（当前为缓存制：入 pending 队列等固化通道）；drop/restore 回收站。'
+      + '默认操作本对话的池（＝调用方会话）；session 可选，用于显式指定别的会话。',
     parameters: {
       action: { type: 'string', required: true, description: 'list | show | stick | promote | drop | restore', enum: ['list', 'show', 'stick', 'promote', 'drop', 'restore'] },
       head: { type: 'string', description: 'stick 用：便签头（一句话简介，向量来源）' },
       body: { type: 'string', description: 'stick 用：便签正文' },
       id: { type: 'string', description: 'show/promote/drop/restore 用：便签 ID，如 NT-1' },
-      session: { type: 'string', description: '可选：会话标识（默认当前对话池）' },
+      session: { type: 'string', description: '可选：会话标识；省略即本对话的池（＝调用方会话）；解析不到调用方会话时明确报错，不会回落到其他会话的池' },
       workspace: { type: 'string', description: 'promote 用：目标工作区（默认记忆侧配置）' },
     },
-    async execute(args) {
-      try { return await noteToolAction(cfg, args || {}, ctx.logger) }
+    async execute(args, exec) {
+      // 🔴-9：第 2 形参（调用方上下文）必须转发——旧包装只接 args，exec 被丢掉，
+      // 于是"取调用方会话"整条链拿不到数据，只能回落「最后活跃池」。
+      try { return await noteToolAction(cfg, args || {}, ctx.logger, exec) }
       catch (err) { return '[错误] ' + ((err && err.message) || String(err)) }
     },
   })
@@ -1303,7 +1302,6 @@ export function apply(ctx, input = {}) {
       const sessionId = String(agent?.session?.id ?? '')
       if (!sessionId) return decision
       const key = sessionKeyFor(sessionId)
-      touchActive(key, sessionId)
       const pool = loadPool(key, sessionId)
       const humanCount = (decision.messages || []).filter(isHumanMessage).length
       const prompt = currentPrompt(decision.messages)
@@ -1363,7 +1361,7 @@ export function apply(ctx, input = {}) {
 
 /* ── 纯函数测试缝（dev_stage_add 挂 staging 工具 import 本文件调 __test）── */
 export const __test = {
-  resolveConfig, configFile, memoryConfigFile, diaryApiConfigFile, sessionKeyFor,
+  resolveConfig, configFile, memoryConfigFile, diaryApiConfigFile, sessionKeyFor, callerSessionOf,
   cosine, pruneHeat, heatScore, heatCountAt, withPoolLock,
   buildNoteBody, buildAutoHead, composeQueryText,
   previousQAPair, buildNotesBlock, buildPackPrompt, generateNoteViaLlm,

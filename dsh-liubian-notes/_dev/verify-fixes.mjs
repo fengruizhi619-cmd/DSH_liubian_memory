@@ -307,6 +307,41 @@ const cfg = T.resolveConfig({})
   check('M4 回归：非人类轮不入窗', T.shouldSealTurn({ human: [] }) === false && T.shouldSealTurn({ human: ['x'] }) === true, '')
 }
 
+/* 🔴-9（v0.5.7）：工具面默认池＝调用方会话——绝不回落到「最后活跃池」
+ * 反向对照：改前必须先复现串池。现场脚本 E:\DSH_data\中枢\notes-leak-repro.mjs 已复现两处：
+ *   ① 不带 session 的 stick 落进别的会话池；② **即使传了 exec 也照样串**——包装只接一个形参。 */
+{
+  const victim = 'sess-fix-leak-victim'
+  const caller = 'sess-fix-leak-caller'
+  const vk = K(victim), ck = K(caller)
+  writePool(vk, basePool(vk, { sessionId: victim }))
+  /* ① 让 victim 成为「最后活跃」：显式 session 的写路径正是 pre-step 之外唯一刷新那枚全局指针的地方 */
+  await T.noteToolAction(cfg, { action: 'stick', head: '受害者自己的', body: 'b', session: victim }, null)
+  const vSeed = JSON.parse(readPlain(vk)).notes.length
+  /* ② 调用方带 exec、不带 session → 必须落 caller 自己池，绝不碰 victim */
+  const fakeExec = { agent: { session: { id: caller } } }
+  await T.noteToolAction(cfg, { action: 'stick', head: '调用方自己的', body: 'b' }, null, fakeExec)
+  const vAfter = JSON.parse(readPlain(vk)).notes.length
+  check('🔴-9 不带 session 不写进别人池（无串池）', vAfter === vSeed, 'victim ' + vSeed + '→' + vAfter + '（期望不变）')
+  let cPool = null
+  try { cPool = JSON.parse(readPlain(ck)) } catch { /* 未建池 */ }
+  check('🔴-9 落进调用方自己的池', !!cPool && cPool.notes.length === 1 && cPool.sessionId === caller,
+    'caller 池=' + (cPool ? cPool.notes.length : '无'))
+  /* ③ B 档：既无显式 session 又无调用方上下文 → 明确报错，不回落到 victim */
+  const noCtx = await T.noteToolAction(cfg, { action: 'list' }, null)
+  check('🔴-9 无会话上下文 → 明确报错（B 档）', /无法解析调用方会话/.test(noCtx), String(noCtx).slice(0, 34))
+  /* ④ 显式 session 仍优先于调用方会话 */
+  const explicitOut = await T.noteToolAction(cfg, { action: 'list', session: victim }, null, fakeExec)
+  check('🔴-9 显式 session 优先', explicitOut.indexOf('池 ' + vk) === 0, String(explicitOut).split('\n')[0])
+  /* ⑤ 源码级护栏：包装必须转发第 2 形参（旧包装只接 args → 整条链全废） */
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'impl.mjs'), 'utf8')
+  check('🔴-9 工具包装转发 exec', /async execute\(args, exec\)/.test(src)
+    && /noteToolAction\(cfg, args \|\| \{\}, ctx\.logger, exec\)/.test(src), 'execute 第 2 形参已转发')
+  /* ⑥ 源码级护栏（玉簪 ③）：旧机制必须彻底消失，防复活——0 引用，含注释 */
+  const leftover = ['lastActiveKey', 'lastActiveSessionId', 'touchActive', 'defaultKey'].filter((w) => src.indexOf(w) >= 0)
+  check('🔴-9 last-active 链已彻底移除（0 引用，含注释）', leftover.length === 0, '残留=' + (leftover.join('/') || '无'))
+}
+
 /* 🔴-8 真行为回归（**放在最后**：它会真的 apply 并最终 dispose，之后本进程不再能落盘）：
  * `ctx.effect(fn)` 的 fn 是「立即执行」的注册面，f返回的函数才是清理器。
  * 旧 bug：`disposed = true` 写在 fn 体里 → 实例**挂载瞬间即自我标记已卸载** →
