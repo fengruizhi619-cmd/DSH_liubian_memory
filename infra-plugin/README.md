@@ -1,7 +1,7 @@
 # dsh-liubian-infra · 流变基建
 
-> 流变家族的共享底座：**独特名注册中心** + **向量服务控制面**。
-> 管理员 2026-10-01 钉：核心功能 = 向量化服务（已有实现划归）+ 独特名注册机制。
+> 流变家族的共享底座：**独特名注册中心** + **会话↔身份独热绑定** + **向量服务所有权**。
+> 管理员 2026-10-01 钉：核心功能 = 向量化服务（v0.2.0 起所有权归基建）+ 独特名注册机制 + 会话绑定。
 > 契约：`docs/流变独特名注册契约_v1.md`（本插件是参考实现）｜标准：`docs/流变插件族接口与构造标准_v0.1.md`
 
 ## 独特名注册中心
@@ -25,8 +25,18 @@
 | `lookup` | 按 `name` 或 `id`（短/全 hash，≥8 位 hex）查询 |
 | `list` | 全表 |
 | `retire` | 停用（独热保留） |
+| `bind` | **会话绑定**：以会话哈希（8 位 hex，注入提示里给）绑定已注册身份，独热配对 |
+| `unbind` | 释放绑定（按 session 或 name） |
+| `binding` / `bindings` | 查绑定 / 全部绑定 |
 | `status` | 总览 |
-| `embed-status` / `embed-ensure` / `embed-stop` / `embed-restart` | 向量服务控制面（v0.1 过渡期手动控制，见下） |
+| `embed-status` / `embed-ensure` / `embed-stop` / `embed-restart` | 向量服务控制面（v0.2.0 起所有权归基建） |
+
+## 会话↔身份独热绑定（v0.2.0）
+
+- 会话哈希 = `SHA256(sessionId)` 前 8 位（与被炉房间 ID 同源同配方）。
+- 未绑定会话在每个新人类回合收到**一条**注册提示（含本会话哈希）；已绑定会话不注入；注册中心不可用静默降级。总开关 `bindNag`（默认开）。
+- 独热配对双向强制：会话侧主键 + 身份侧唯一索引。旧会话终结 → `unbind` 释放 → 重绑。
+- 绑定即归因：该会话的署名/贡献者行为归因到绑定身份。
 
 ## 注册表存储（其他插件怎么统一查询）
 
@@ -47,14 +57,14 @@ identities(name TEXT PRIMARY KEY, name_key TEXT UNIQUE, hash TEXT UNIQUE,
 - 派生函数必须与契约一致：消费方自算 hash 时用
   `sha256(utf8(NFC(name)))`（§8 同源派生函数纪律：禁止一边字面量一边哈希）。
 
-## 向量服务控制面（v0.1 过渡期）
+## 向量服务所有权（v0.2.0 挂牌迁移）
 
-`dsh-liubian-embed`（v0.1.1）仍是**服务所有者**：插件加载自动探活带起 + 内存看门狗
-（私有提交 >4096MB 自动重启，每 300s）。本插件 v0.1 只提供**手动控制面**（同名动作、
-同一份 `~/.dsh/liubian/embed.json` 配置源、服务本体不动）——避免双看门狗与双 ensure 竞争。
+`dsh-liubian-embed` 已退役（patch disabled 阻断自装配）。本插件接管服务所有权：
 
-**挂牌迁移完成后**（admin 批准切换时）：embed 插件退役，本插件接手 autoEnsure + 看门狗，
-并保留 `_dsh_external_dsh_liubian_embed` 工具名作为过渡期别名（契约 v1.2 §5 随行项）。
+- **加载自动带起**：`autoEnsureOnLoad=true`（探活离线 → 后台直起 exe，无窗）
+- **内存看门狗**：`watchdogEnabled=true`，私有提交 >`watchdogLimitMb`(4096MB) 自动重启，每 `watchdogIntervalSec`(300s) 检查
+- **过渡期别名**：`_dsh_external_dsh_liubian_embed` 由本插件承载（动作与 infra 同；家属迁移窗口结束、全部换用 infra 后删）
+- 配置源不变：`~/.dsh/liubian/embed.json`（共享键同名，标准 §5）
 
 ## 配置
 

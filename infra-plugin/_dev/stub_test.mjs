@@ -8,8 +8,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
-  normalizeName, deriveHash, computeShortIds, recomputeShortIds,
+  normalizeName, deriveHash, computeShortIds, recomputeShortIds, sessionHashFor,
   openDb, registerIdentity, verifyName, lookupIdentity, listIdentities, retireIdentity,
+  bindSession, unbindSession, bindingFor, listBindings,
   resolveConfig,
 } from '../lib/impl.mjs'
 
@@ -116,6 +117,51 @@ t('retire 幂等', () => {
   eq(r.alreadyRetired, true)
 })
 t('未注册名 retire 拒绝', () => throws(() => retireIdentity(db, '不存在的人'), '不在册'))
+
+console.log('== sessionHashFor（与被炉 idFor 同源） ==')
+t('配方 = sha256(sessionId) 前 8', () => eq(sessionHashFor('test-session'), createHash('sha256').update('test-session').digest('hex').slice(0, 8)))
+t('同会话同哈希', () => eq(sessionHashFor('abc'), sessionHashFor('abc')))
+
+console.log('== 会话↔身份独热绑定（临时真库） ==')
+registerIdentity(db, '绑定甲', '绑定测试')
+registerIdentity(db, '绑定乙', '绑定测试')
+t('绑定成功', () => {
+  const r = bindSession(db, 'aaaa0000', '绑定甲', '桩测')
+  eq(r.name, '绑定甲'); eq(r.session_hash, 'aaaa0000')
+})
+t('同会话同名幂等', () => {
+  const r = bindSession(db, 'aaaa0000', '绑定甲')
+  eq(r.already, true)
+})
+t('同会话改名 → 拒绝（唯一绑定）', () => throws(() => bindSession(db, 'aaaa0000', '绑定乙'), '唯一绑定'))
+t('同名字绑第二会话 → 拒绝（独热配对）', () => throws(() => bindSession(db, 'bbbb0000', '绑定甲'), '独热配对'))
+t('未注册名绑定 → 拒绝', () => throws(() => bindSession(db, 'cccc0000', '没注册的人'), '尚未注册'))
+t('bindingFor 命中带短ID', () => {
+  const r = bindingFor(db, 'aaaa0000')
+  eq(r.name, '绑定甲'); if (!r.short_id) throw new Error('应带身份短 ID')
+})
+t('bindingFor 未命中 → null', () => eq(bindingFor(db, 'ffffff00'), null))
+t('unbind 按 session 释放', () => {
+  const r = unbindSession(db, { session: 'aaaa0000' })
+  eq(r.released.name, '绑定甲')
+  eq(bindingFor(db, 'aaaa0000'), null)
+})
+t('释放后可重绑（旧会话终结场景）', () => {
+  const r = bindSession(db, 'bbbb0000', '绑定甲', '重绑')
+  eq(r.name, '绑定甲')
+  unbindSession(db, { session: 'bbbb0000' })
+})
+t('unbind 按 name 释放', () => {
+  bindSession(db, 'dddd0000', '绑定乙')
+  const r = unbindSession(db, { name: '绑定乙' })
+  eq(r.released.session_hash, 'dddd0000')
+})
+t('非法会话哈希拒绝', () => throws(() => bindSession(db, 'xyz', '绑定甲'), '8 位十六进制'))
+t('bindings 计数', () => {
+  bindSession(db, 'eeee0000', '绑定甲')
+  if (listBindings(db).length < 1) throw new Error('应有绑定行')
+  unbindSession(db, { name: '绑定甲' })
+})
 
 db.close()
 try { rmSync(dir, { recursive: true, force: true }) } catch {}

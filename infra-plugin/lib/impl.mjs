@@ -1,18 +1,21 @@
 /**
- * dsh-liubian-infra —— 流变·基建
+ * dsh-liubian-infra —— 流变基建
  *
- * 两大职责（管理员 2026-10-01 钉）：
- *   1. 独特名注册中心：每个智能体一个全局独热唯一的名字；注册时自动从名字
- *      派生 SHA-256 哈希作为身份唯一标识符；全家族插件统一查询注册表。
- *   2. 向量服务控制面：移植自 dsh-liubian-embed（服务本体不变）。
- *      ⚠ v0.1 过渡期：embed 插件仍是服务所有者（加载自动带起 + 看门狗），
- *      本插件只提供手动控制面（status/ensure/stop/restart），不开看门狗、
- *      不自动拉起 —— 避免双看门狗与双 ensure 竞争。挂牌迁移完成后切换。
+ * 三大职责：
+ *   1. 独特名注册中心：全局独热唯一的智能体名，注册时自动派生 SHA-256 哈希作为身份
+ *      唯一标识符；全家族插件统一查询注册表。（契约 v1）
+ *   2. 会话↔身份独热绑定（v0.2.0，管理员钉）：对话哈希（sha256(sessionId) 前 8 位，
+ *      与被炉同源派生）与名字哈希独热配对；未绑定会话在每回合注入一条注册提示。
+ *      已绑定会话不注入（管理员原话只规定未绑定分支）。
+ *   3. 向量服务所有权（v0.2.0 挂牌迁移）：autoEnsureOnLoad + 内存看门狗从
+ *      dsh-liubian-embed 划归本插件；过渡期保留 `_dsh_external_dsh_liubian_embed`
+ *      工具名别名（迁移随行项，见 docs/流变向量服务调用契约_v1.md 头部 contract-version 1.2
+ *      的 §5 控制面迁移条款；家属迁移窗口结束后删）。
  *
  * 接口与构造依据：docs/流变插件族接口与构造标准_v0.1.md
- * 注册语义依据：docs/流变独特名注册契约_v1.md（本插件是该契约的参考实现）
+ * 注册语义依据：docs/流变独特名注册契约_v1.md（本插件是参考实现）
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -20,20 +23,25 @@ import { DatabaseSync } from 'node:sqlite'
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
-export const PLUGIN_VERSION = '0.1.0'
+export const PLUGIN_NAME = 'dsh-liubian-infra'
+export const PLUGIN_VERSION = '0.2.0'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
 export const DSH_HOME = process.env.DSH_HOME || join(HOME, '.dsh')
 
 export const TOOL_NAME = '_dsh_external_dsh_liubian_infra'
+/** 过渡期别名（embed 退役后保留，迁移窗口结束后删） */
+export const ALIAS_TOOL_NAME = '_dsh_external_dsh_liubian_embed'
 
 /* ══ 配置（标准 §5：DEFAULTS → config.json 剥 BOM → 宿主 input，单入口） ══ */
 
 export const DEFAULTS = {
-  /** 注册表数据库（共享资源登记表 §10：归属基建，消费方=全家只读，变更通报基石） */
+  /** 注册表数据库（§10 登记表：归属基建，消费方=全家只读，变更通报基石） */
   dbPath: join(DSH_HOME, 'liubian-infra', 'registry.db'),
-  /** 向量服务（与 dsh-liubian-embed 同一份配置源 ~/.dsh/liubian/embed.json，共享键同名） */
+  /** 会话绑定提示（管理员 2026-10-01：未绑定会话注入一条注册提示） */
+  bindNag: true,
+  /* ── 向量服务（与 dsh-liubian-embed 同一份配置源 ~/.dsh/liubian/embed.json，共享键同名）── */
   embedUrl: 'http://127.0.0.1:8082',
   embedPort: 8082,
   serverExe: 'E:/llama.cpp/llama-server.exe',
@@ -45,6 +53,12 @@ export const DEFAULTS = {
   serverCwd: 'E:/llama.cpp',
   readyTimeoutMs: 45000,
   probeTimeoutMs: 3000,
+  /** v0.2.0 挂牌迁移：服务所有权划归基建（与 embed 插件默认值一致，键名同名） */
+  autoEnsureOnLoad: true,
+  /** 内存看门狗：llama-server 私有提交超限自动重启（泄漏史：5.5h→10.9GB，重启释放 9.2GB） */
+  watchdogEnabled: true,
+  watchdogIntervalSec: 300,
+  watchdogLimitMb: 4096,
 }
 
 export function configFile() {
@@ -83,14 +97,8 @@ export function resolveConfig(input = {}) {
   return merged
 }
 
-/* ══ 独特名：纯函数（契约 v1 的派生规则，消费方照此实现必须得到同一结果） ══ */
+/* ══ 独特名：纯函数（契约 v1 §2 派生规则，消费方必须逐字对齐） ══ */
 
-/**
- * 名字规范化（标准 §8：注册与校验两侧必须调用同一派生函数）。
- * 规则：去首尾空白 → NFC 规范化 → 非空、≤64 字符、不含控制字符、
- *       不以 @ 或 # 开头（保留给提及/标签语法）。
- * name_key = 小写化（大小写不敏感唯一：中文不受影响，ASCII 防混淆）。
- */
 export function normalizeName(raw) {
   let name = String(raw ?? '').trim().normalize('NFC')
   if (!name) return { ok: false, error: '名字不能为空' }
@@ -100,16 +108,20 @@ export function normalizeName(raw) {
   return { ok: true, name, key: name.toLowerCase() }
 }
 
-/** 身份哈希：SHA-256(UTF-8(NFC(name))) 十六进制小写 64 位。全局唯一标识符。 */
+/** 身份哈希：SHA-256(UTF-8(NFC(name))) 小写 hex 64 位。 */
 export function deriveHash(name) {
   return createHash('sha256').update(name, 'utf8').digest('hex')
 }
 
 /**
- * git 式最短唯一前缀（被炉的「会话号 SHA256 前 8 位」惯例的无碰撞推广）：
- * 从 8 位起找能让集合内所有 hash 前缀互不相同的长度；无碰撞时恒为 8。
- * short_id 随表演化（新注册可能使既有条目扩位），语义与 git 短哈希一致。
+ * 会话哈希（对话哈希）：SHA256(sessionId) 前 8 位十六进制。
+ * ⚠ 与被炉 idFor 同源同配方（标准 §8：同一派生函数）——被炉房间 ID 即本值。
  */
+export function sessionHashFor(sessionId) {
+  return createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 8)
+}
+
+/** git 式最短唯一前缀（≥8；碰撞自动扩位，随表演化）。 */
 export function computeShortIds(hashes, minLen = 8) {
   let len = minLen
   for (;;) {
@@ -128,7 +140,7 @@ export function computeShortIds(hashes, minLen = 8) {
   return out
 }
 
-/* ══ 注册表存储（单写多读：只有本插件写；其他插件只读 DB 文件，契约 v1 §4） ══ */
+/* ══ 存储层（单写多读：只有本插件写；消费方只读 DB 文件，契约 v1 §3） ══ */
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS identities (
@@ -142,6 +154,13 @@ CREATE TABLE IF NOT EXISTS identities (
   retired_at  TEXT,
   retired_note TEXT
 );
+CREATE TABLE IF NOT EXISTS bindings (
+  session_hash TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  bound_at     TEXT NOT NULL,
+  note         TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_name ON bindings(name);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 `
 
@@ -181,7 +200,6 @@ export function registerIdentity(db, rawName, note) {
   return db.prepare('SELECT * FROM identities WHERE name_key = ?').get(key)
 }
 
-/** 唯一性校验（无副作用）：可用 / 已被谁占用。 */
 export function verifyName(db, rawName) {
   const norm = normalizeName(rawName)
   if (!norm.ok) return { ok: false, available: false, error: norm.error }
@@ -199,7 +217,6 @@ export function verifyName(db, rawName) {
   }
 }
 
-/** 查询：按 name，或按短/全 hash（≥8 位 hex 前缀）。 */
 export function lookupIdentity(db, { name, id } = {}) {
   if (name) {
     const norm = normalizeName(name)
@@ -236,7 +253,72 @@ export function retireIdentity(db, rawName, note) {
   return db.prepare('SELECT * FROM identities WHERE name_key = ?').get(norm.key)
 }
 
-/* ══ 向量服务控制面（移植自 dsh-liubian-embed；契约 v1.2 语义不变） ══ */
+/* ── 会话↔身份独热绑定（v0.2.0，管理员钉） ── */
+
+/** 会话哈希合法化：8 位 hex（与被炉 idFor 同源派生的产物）。 */
+function normSessionHash(raw) {
+  const q = String(raw ?? '').trim().toLowerCase()
+  if (!/^[0-9a-f]{8}$/.test(q)) throw new Error('[错误] 会话哈希须为 8 位十六进制（注入提示里给的那个）')
+  return q
+}
+
+/** 绑定：会话↔名字独热配对。同会话同名幂等；改绑需先 unbind；名字需已注册。 */
+export function bindSession(db, rawSessionHash, rawName, note) {
+  const sh = normSessionHash(rawSessionHash)
+  const norm = normalizeName(rawName)
+  if (!norm.ok) throw new Error(`[拒绝] ${norm.error}`)
+  const ident = db.prepare('SELECT name, short_id, status FROM identities WHERE name_key = ?').get(norm.key)
+  if (!ident) throw new Error(`[拒绝] 名字「${norm.name}」尚未注册——先 register 再 bind。`)
+  if (ident.status === 'retired') throw new Error(`[拒绝] 名字「${norm.name}」已停用，不能绑定。`)
+  const existing = db.prepare('SELECT * FROM bindings WHERE session_hash = ?').get(sh)
+  if (existing && existing.name === ident.name) return { ...existing, short_id: ident.short_id, already: true }
+  if (existing) throw new Error(`[拒绝] 会话 ${sh} 已绑定「${existing.name}」（唯一绑定）。要改绑先 action=unbind 释放。`)
+  const byName = db.prepare('SELECT session_hash FROM bindings WHERE name = ?').get(ident.name)
+  if (byName) throw new Error(`[拒绝] 名字「${ident.name}」已绑定会话 ${byName.session_hash}（独热配对）。若旧会话已终结，用 action=unbind（name=${ident.name}）释放后重绑。`)
+  const now = new Date().toISOString()
+  db.prepare('INSERT INTO bindings (session_hash, name, bound_at, note) VALUES (?,?,?,?)')
+    .run(sh, ident.name, now, note ? String(note) : null)
+  return { session_hash: sh, name: ident.name, short_id: ident.short_id, bound_at: now }
+}
+
+export function unbindSession(db, { session, name } = {}) {
+  if (session) {
+    const sh = normSessionHash(session)
+    const row = db.prepare('SELECT * FROM bindings WHERE session_hash = ?').get(sh)
+    if (!row) return { ok: true, nothing: true }
+    db.prepare('DELETE FROM bindings WHERE session_hash = ?').run(sh)
+    return { ok: true, released: { session_hash: row.session_hash, name: row.name } }
+  }
+  if (name) {
+    const norm = normalizeName(name)
+    if (!norm.ok) throw new Error(norm.error)
+    const row = db.prepare('SELECT * FROM bindings WHERE name = ?').get(norm.key)
+    if (!row) return { ok: true, nothing: true }
+    db.prepare('DELETE FROM bindings WHERE name = ?').run(norm.key)
+    return { ok: true, released: { session_hash: row.session_hash, name: row.name } }
+  }
+  throw new Error('[错误] unbind 需要 session 或 name 之一')
+}
+
+/** 查绑定（带身份短 ID）。 */
+export function bindingFor(db, rawSessionHash) {
+  const sh = normSessionHash(rawSessionHash)
+  return db.prepare(`
+    SELECT b.session_hash, b.name, b.bound_at, b.note, i.short_id, i.status
+    FROM bindings b LEFT JOIN identities i ON i.name = b.name
+    WHERE b.session_hash = ?
+  `).get(sh) || null
+}
+
+export function listBindings(db) {
+  return db.prepare(`
+    SELECT b.session_hash, b.name, b.bound_at, b.note, i.short_id
+    FROM bindings b LEFT JOIN identities i ON i.name = b.name
+    ORDER BY b.bound_at
+  `).all()
+}
+
+/* ══ 向量服务控制面（契约 v1.2；v0.2.0 起服务所有权归基建） ══ */
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -313,6 +395,106 @@ export function stopService(cfg) {
   }
 }
 
+/* ── 服务所有权：加载自动带起 + 内存看门狗（自 embed 移交，2026-10-01 挂牌迁移） ── */
+
+const POWER_SHELL = 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+
+/** 读进程私有提交内存（MB）。看门狗用它与阈值比；读不到返回 0（跳过本轮）。 */
+export function privateCommitMb(pid) {
+  if (!pid) return 0
+  try {
+    const out = execFileSync(POWER_SHELL, [
+      '-NoProfile', '-NonInteractive', '-Command',
+      `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).PrivateMemorySize64`,
+    ], { encoding: 'utf-8', windowsHide: true, timeout: 20000, maxBuffer: 1 << 20 })
+    const v = Number(String(out || '').trim())
+    return Number.isFinite(v) && v > 0 ? v / 1048576 : 0
+  } catch {
+    return 0
+  }
+}
+
+let lastEnsureAt = 0
+/** 插件加载 / 冷却带起：探活在线就不动作（fire-and-forget，不阻塞宿主）。 */
+export function ensureInFlow(cfg, logger, { force = false } = {}) {
+  if (!force && !cfg.autoEnsureOnLoad) return
+  if (!force && Date.now() - lastEnsureAt < 60000) return
+  lastEnsureAt = Date.now()
+  void (async () => {
+    const before = await probe(cfg)
+    if (before.ok) return
+    launch(cfg)
+    logger?.info?.(`[${PLUGIN_NAME}] 向量服务离线，已在后台拉起（直起 exe，无窗）`)
+  })().catch(() => {})
+}
+
+let lastWatchdogRestart = ''
+
+/** 单次看门狗检查：在线 → 读私有提交 → 超限 stop+launch。失败只 warn，绝不抛。 */
+export async function watchdogTick(cfg, logger) {
+  try {
+    const up = await probe(cfg)
+    if (!up.ok) return
+    const pid = listeningPid(cfg.embedPort)
+    if (!pid) return
+    const mb = privateCommitMb(pid)
+    if (!mb) return
+    const limit = Math.max(512, Number(cfg.watchdogLimitMb) || 4096)
+    if (mb <= limit) return
+    logger?.warn?.(`[${PLUGIN_NAME}] 看门狗：llama-server(PID ${pid}) 私有提交 ${mb.toFixed(0)}MB 超过 ${limit}MB，自动重启`)
+    const stopped = stopService(cfg)
+    await sleep(1500)
+    const launched = launch(cfg)
+    lastWatchdogRestart =
+      `${new Date().toLocaleString('zh-CN')}｜${mb.toFixed(0)}MB → 重启（stop=${stopped.ok ? 'ok' : 'fail'} launch=${launched}）`
+    logger?.info?.(`[${PLUGIN_NAME}] 看门狗重启完成：${lastWatchdogRestart}`)
+  } catch (err) {
+    logger?.warn?.(`[${PLUGIN_NAME}] 看门狗异常：${(err && err.message) || err}`)
+  }
+}
+
+/** 周期看门狗，随插件卸载清理。 */
+export function mountWatchdog(ctx, cfg) {
+  if (!cfg.watchdogEnabled) return
+  let timer = null
+  const loop = async () => {
+    await watchdogTick(cfg, ctx.logger)
+    timer = setTimeout(loop, (Number(cfg.watchdogIntervalSec) || 300) * 1000)
+  }
+  timer = setTimeout(loop, (Number(cfg.watchdogIntervalSec) || 300) * 1000)
+  ctx.effect(() => {
+    if (timer) clearTimeout(timer)
+  }, 'dsh-liubian-infra: 内存看门狗')
+}
+
+/* ══ 注入钩子：未绑定会话注入一条注册提示（v0.2.0，管理员钉；已绑定不注入） ══ */
+
+export function mountBindingInjection(ctx, cfg, state) {
+  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next()
+    try {
+      if (!decision || decision.kind !== 'enter' || signal?.aborted) return decision
+      if (!cfg.bindNag) return decision
+      const sessionId = agent?.session?.id
+      if (!sessionId) return decision
+      const db = state.tryDb()
+      if (!db) return decision                      // 注册中心不可用 → 静默降级（门禁③）
+      const sh = sessionHashFor(sessionId)
+      if (bindingFor(db, sh)) return decision       // 已绑定：不注入（管理员只规定未绑定分支）
+      const text = `【流变·基建｜独特名注册】本会话尚未绑定身份（会话哈希 ${sh}）。请两步完成：① _dsh_external_dsh_liubian_infra action=register 注册一个全局独热名字（规范：非空、≤64 字符、不以 @/# 开头、注册即永久保留）；② action=bind 以会话哈希 ${sh} 绑定该名字。绑定后会话与身份独热配对，后续署名/贡献者归因此身份。`
+      return { kind: 'enter', messages: [...decision.messages, {
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text }],
+        source: { kind: 'plugin:' + PLUGIN_NAME },
+      }] }
+    } catch (err) {
+      ctx.logger?.warn?.(`[${PLUGIN_NAME}] 绑定注入异常（忽略，不影响本轮）：${err?.message || err}`)
+      return decision
+    }
+  }, { prepend: true })
+}
+
 /* ══ 工具面 ══ */
 
 const OUT = {
@@ -330,22 +512,29 @@ function fmtRow(r) {
   ].filter(Boolean).join('\n')
 }
 
-function registerInfraTool(ctx, cfg, state) {
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: TOOL_NAME,
-    description: '流变·基建（dsh-liubian-infra）：独特名注册中心 + 向量服务控制面。'
-      + '独特名 = 全局独热唯一的智能体名，注册时自动派生 SHA-256 哈希作为身份唯一标识符，'
-      + '全家族插件统一查询注册表（契约 v1.0：docs/流变独特名注册契约_v1.md）。'
-      + 'action: register 注册｜verify 唯一性校验（无副作用）｜lookup 按 name 或 hash 查｜list 全表｜retire 停用（独热保留）'
-      + '｜status 总览｜embed-status / embed-ensure / embed-stop / embed-restart 向量服务控制（v0.1 过渡期手动控制）。',
+const REGISTRY_ACTIONS = 'register / verify / lookup / list / retire / bind / unbind / binding / bindings / status'
+const EMBED_ACTIONS = 'embed-status / embed-ensure / embed-stop / embed-restart'
+
+function fmtBindingRow(r) {
+  return `「${r.name}」（#${r.short_id || '?'}）↔ 会话 ${r.session_hash}｜绑定于 ${r.bound_at}${r.note ? `｜${r.note}` : ''}`
+}
+
+function buildInfraTool(cfg, state, { name, descriptionNote }) {
+  return defineTool({
+    name,
+    description: descriptionNote + '独特名注册中心：全局独热唯一的智能体名，注册时自动派生 SHA-256 哈希作为身份唯一标识符，'
+      + '全家族插件统一查询注册表（契约 v1.0）；会话↔身份独热绑定：未绑定会话每回合收到一条注册提示；'
+      + '向量服务控制面（挂牌迁移后服务所有权归基建）。'
+      + `action: ${REGISTRY_ACTIONS}｜${EMBED_ACTIONS}`,
     parameters: {
       action: {
         type: 'string', required: true,
-        description: '操作：register / verify / lookup / list / retire / status / embed-status / embed-ensure / embed-stop / embed-restart',
+        description: `操作：${REGISTRY_ACTIONS}｜${EMBED_ACTIONS}`,
       },
-      name: { type: 'string', description: 'register/verify/lookup/retire 用：独特名' },
+      name: { type: 'string', description: 'register/verify/lookup/retire/bind/unbind/binding 用：独特名' },
       id: { type: 'string', description: 'lookup 用：短或全 hash（8~64 位十六进制）' },
-      note: { type: 'string', description: 'register/retire 用：备注（归属、用途等）' },
+      session: { type: 'string', description: 'bind/unbind/binding 用：会话哈希（8 位十六进制，注入提示里给的）' },
+      note: { type: 'string', description: 'register/retire/bind 用：备注（归属、用途等）' },
     },
     output: OUT,
     async execute(args) {
@@ -388,33 +577,60 @@ function registerInfraTool(ctx, cfg, state) {
         return `[OK] 已停用「${row.name}」（${row.retired_at}）。名字独热保留，不可被再次注册。`
       }
 
+      /* ── 会话绑定（v0.2.0） ── */
+      if (action === 'bind') {
+        const db = state.getDb()
+        const r = bindSession(db, args.session, args.name, args.note)
+        if (r.already) return `[OK] 已绑定（幂等）：${fmtBindingRow(r)}`
+        return `[OK] 已绑定：${fmtBindingRow(r)}\n  └─ 独热配对成立，本会话身份归因「${r.name}」。`
+      }
+      if (action === 'unbind') {
+        const db = state.getDb()
+        const r = unbindSession(db, { session: args.session, name: args.name })
+        if (r.nothing) return '[OK] 没有找到对应的绑定，无需释放。'
+        return `[OK] 已释放：${fmtBindingRow(r.released)}`
+      }
+      if (action === 'binding') {
+        const db = state.getDb()
+        const row = bindingFor(db, args.session)
+        if (row) return `[OK] ${fmtBindingRow(row)}`
+        return `[未绑定] 会话 ${args.session || '?'} 尚未绑定身份。`
+      }
+      if (action === 'bindings') {
+        const db = state.getDb()
+        const rows = listBindings(db)
+        if (!rows.length) return '当前没有会话绑定。'
+        return `会话绑定（${rows.length} 对）：\n` + rows.map(r => `  「${r.name}」（#${r.short_id || '?'}）↔ ${r.session_hash}`).join('\n')
+      }
+
       /* ── 总览 ── */
       if (action === 'status') {
         const up = await probe(cfg)
         let reg = '注册表不可用'
-        let count = '0'
         try {
           const db = state.getDb()
           const rows = listIdentities(db)
-          count = String(rows.length)
+          const binds = listBindings(db)
           const act = rows.filter(r => r.status === 'active').length
-          reg = `${act} 在册 / ${rows.length - act} 停用`
+          reg = `${act} 在册 / ${rows.length - act} 停用｜绑定 ${binds.length} 对`
         } catch (e) {
           reg = '打开失败：' + ((e && e.message) || e)
         }
+        const pid = listeningPid(cfg.embedPort)
         return [
           `[流变基建 v${PLUGIN_VERSION}｜契约 v${CONTRACT_VERSION}]`,
           `[注册表] ${reg}｜${cfg.dbPath}`,
-          `[向量服务] ${up.ok ? `在线 ${cfg.embedUrl}` : `离线（${up.body}）`}${listeningPid(cfg.embedPort) ? `｜PID ${listeningPid(cfg.embedPort)}` : ''}`,
-          `[过渡期说明] v0.1：向量服务所有权仍在 dsh-liubian-embed（加载自动带起+看门狗）；基建仅手动控制面，不重复看门狗。挂牌迁移后切换。`,
+          `[会话绑定] ${cfg.bindNag ? '未绑定会话注入注册提示（管理员 2026-10-01）' : '提示已关（bindNag=false）'}`,
+          `[向量服务] ${up.ok ? `在线 ${cfg.embedUrl}` : `离线（${up.body}）`}${pid ? `｜PID ${pid}` : ''}｜所有权：基建（v0.2.0 挂牌迁移）`,
+          `[看门狗] ${cfg.watchdogEnabled ? `开（>${cfg.watchdogLimitMb}MB / 每 ${cfg.watchdogIntervalSec}s）` : '关'}${lastWatchdogRestart ? `｜最近：${lastWatchdogRestart}` : ''}`,
         ].join('\n')
       }
 
-      /* ── 向量服务控制面（移植自 embed 工具，语义一致） ── */
+      /* ── 向量服务控制面 ── */
       if (action === 'embed-stop') {
         const r = stopService(cfg)
         if (!r.ok) return `[错误] 关停失败（PID ${r.pid}）：${r.error}`
-        return r.pid ? `[OK] 已关停向量服务（PID ${r.pid}）。注意：v0.1 过渡期 embed 插件的看门狗/ensure 在线检查会把它带回来——彻底关停应先停 embed 插件。` : '[OK] 端口上没有监听进程。'
+        return r.pid ? `[OK] 已关停向量服务（PID ${r.pid}）。注意：基建看门狗只重启不主动拉起，关停后想恢复用 embed-ensure。` : '[OK] 端口上没有监听进程。'
       }
       if (action === 'embed-restart') {
         const r = stopService(cfg)
@@ -435,15 +651,28 @@ function registerInfraTool(ctx, cfg, state) {
         return [
           before.ok ? `[OK] 向量服务在线：${cfg.embedUrl}` : `[离线] ${cfg.embedUrl}（${before.body}）`,
           `[端口] ${cfg.embedPort}${pid ? `　PID ${pid}` : '　（无监听进程）'}`,
-          `[启动方式] 直起 exe ${cfg.serverExe}（无窗）`,
-          `[所有者] v0.1 过渡期：dsh-liubian-embed（autoEnsure+看门狗）；本插件仅手动控制`,
+          `[启动方式] 直起 exe ${cfg.serverExe}（无窗）｜所有权：基建（autoEnsure=${cfg.autoEnsureOnLoad}）`,
           before.ok ? before.body : '',
         ].filter(Boolean).join('\n')
       }
 
-      return `[错误] 未知 action：${action}（可用：register / verify / lookup / list / retire / status / embed-status / embed-ensure / embed-stop / embed-restart）`
+      return `[错误] 未知 action：${action}（可用：${REGISTRY_ACTIONS}｜${EMBED_ACTIONS}）`
     },
-  })), TOOL_NAME)
+  })
+}
+
+function registerTools(ctx, cfg, state) {
+  ctx.effect(() => ctx.tools.register(
+    buildInfraTool(cfg, state, {
+      name: TOOL_NAME,
+      descriptionNote: '流变·基建（dsh-liubian-infra）。',
+    }), TOOL_NAME))
+  // 过渡期别名（embed 退役后由基建承接同名控制面；家属迁移窗口结束、全部换用 infra 后删）
+  ctx.effect(() => ctx.tools.register(
+    buildInfraTool(cfg, state, {
+      name: ALIAS_TOOL_NAME,
+      descriptionNote: `（过渡期别名：原 dsh-liubian-embed 控制面，v0.2.0 起由 dsh-liubian-infra 承载，注册中心动作同样可用。）`,
+    }), ALIAS_TOOL_NAME))
 }
 
 /* ══ 入口 ══ */
@@ -451,7 +680,7 @@ function registerInfraTool(ctx, cfg, state) {
 export function apply(ctx, input = {}) {
   const cfg = resolveConfig(input)
 
-  // 惰性开库：DB 打不开不拖垮插件挂载，注册动作时才报错
+  // 惰性开库：DB 打不开不拖垮插件挂载，注册动作时才报错；注入钩子侧降级静默
   const state = {
     _db: null,
     _err: null,
@@ -462,16 +691,28 @@ export function apply(ctx, input = {}) {
       }
       return this._db
     },
+    tryDb() {
+      try { return this.getDb() } catch { return null }
+    },
   }
 
-  registerInfraTool(ctx, cfg, state)
+  registerTools(ctx, cfg, state)
+
+  // 挂牌迁移（v0.2.0）：服务所有权——加载自动带起 + 内存看门狗
+  ensureInFlow(cfg, ctx.logger, { force: true })
+  mountWatchdog(ctx, cfg)
+
+  // 会话绑定注入（未绑定 → 一条注册提示；已绑定 → 不注入）
+  mountBindingInjection(ctx, cfg, state)
 
   ctx.effect(() => {
     try { state._db?.close() } catch { /* 卸载时关闭尽力而为 */ }
   }, 'dsh-liubian-infra: 关闭注册表')
 
   ctx.logger?.info?.(
-    `[dsh-liubian-infra] v${PLUGIN_VERSION} 已挂载：注册表 ${cfg.dbPath}（契约 v${CONTRACT_VERSION}）｜向量服务控制面就绪（过渡期手动）`,
+    `[${PLUGIN_NAME}] v${PLUGIN_VERSION} 已挂载：注册表 ${cfg.dbPath}（契约 v${CONTRACT_VERSION}，bindNag=${cfg.bindNag}）`
+    + `｜向量服务所有权已接管（autoEnsure=${cfg.autoEnsureOnLoad}，看门狗=${cfg.watchdogEnabled ? `>${cfg.watchdogLimitMb}MB/${cfg.watchdogIntervalSec}s` : '关'}）`
+    + `｜过渡期别名 ${ALIAS_TOOL_NAME} 在位`,
   )
 }
 
@@ -481,6 +722,7 @@ export const __test = {
   configFile,
   normalizeName,
   deriveHash,
+  sessionHashFor,
   computeShortIds,
   recomputeShortIds,
   openDb,
@@ -489,9 +731,15 @@ export const __test = {
   lookupIdentity,
   listIdentities,
   retireIdentity,
+  bindSession,
+  unbindSession,
+  bindingFor,
+  listBindings,
   probe,
   launch,
   ensureReady,
   listeningPid,
   stopService,
+  privateCommitMb,
+  watchdogTick,
 }
