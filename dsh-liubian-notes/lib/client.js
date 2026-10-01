@@ -47,7 +47,10 @@ window.__ModuleLoader__.load({
       if (!iso) return ''
       var ms = Date.parse(iso)
       if (isNaN(ms)) return ''
-      return new Date(ms + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(5, 16)
+      // 本地时区（原实现硬编码 +8h，非 +8 时区的机器会显示错时间）
+      var d = new Date(ms)
+      var p = function (x) { return (x < 10 ? '0' : '') + x }
+      return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
     }
 
     function statusChip(n) {
@@ -86,17 +89,26 @@ window.__ModuleLoader__.load({
     }
 
     function NotesApp() {
-      var st = React.useState({ pools: [], poolKey: null, loaded: false, cfg: null })
+      var st = React.useState({ pools: [], poolKey: null, loaded: false, cfg: null, error: null })
       var state = st[0]
       var setState = st[1]
 
       React.useEffect(function () {
         var alive = true
+        var seq = 0            // 请求序号：防慢响应乱序覆盖新状态
+        var inflight = false   // 同一时刻只允许一个在飞请求
         function load() {
+          if (inflight) return
+          inflight = true
+          var mine = ++seq
           fetch('/api/liubian-notes?op=pools')
-            .then(function (r) { return r.json() })
+            .then(function (r) {
+              if (!r.ok) throw new Error('HTTP ' + r.status)   // 404/500 不得伪装成空态
+              return r.json()
+            })
             .then(function (j) {
-              if (!alive) return
+              inflight = false
+              if (!alive || mine !== seq) return   // 旧响应直接丢弃
               setState(function (s) {
                 var pools = j.pools || []
                 var key = s.poolKey
@@ -105,10 +117,14 @@ window.__ModuleLoader__.load({
                   var withNotes = pools.filter(function (x) { return (x.notes || []).length > 0 })
                   key = (withNotes[0] || pools[0] || {}).key || null
                 }
-                return Object.assign({}, s, { pools: pools, poolKey: key, loaded: true, cfg: { heatRounds: j.heatRounds, poolSize: j.poolSize, injectTop: j.injectTop, aggregateRounds: j.aggregateRounds } })
+                return Object.assign({}, s, { pools: pools, poolKey: key, loaded: true, error: null, cfg: { heatRounds: j.heatRounds, poolSize: j.poolSize, injectTop: j.injectTop, aggregateRounds: j.aggregateRounds } })
               })
             })
-            .catch(function () { if (alive) setState(function (s) { return Object.assign({}, s, { loaded: true }) }) })
+            .catch(function (err) {
+              inflight = false
+              // 失败时保留上一次成功数据，并把错误显式暴露（旧实现只置 loaded=true → 显示成"还没有任何便签池"）
+              if (alive && mine === seq) setState(function (s) { return Object.assign({}, s, { loaded: true, error: String((err && err.message) || err) }) })
+            })
         }
         load()
         var t = window.setInterval(load, 4000)
@@ -135,6 +151,11 @@ window.__ModuleLoader__.load({
       if (!state.loaded) {
         body = React.createElement('div', { className: 'nts-empty' },
           React.createElement('div', { className: 'nts-emptyDesc' }, '加载中…'))
+      } else if (state.error && !state.pools.length) {
+        // 路由不可用/报错必须显式呈现——旧实现把它伪装成「还没有任何便签池」，排障时会走错方向
+        body = React.createElement('div', { className: 'nts-empty' },
+          React.createElement('div', { className: 'nts-emptyTitle' }, '便签面板暂不可用'),
+          React.createElement('div', { className: 'nts-emptyDesc' }, '路由 /api/liubian-notes 请求失败：' + state.error))
       } else if (!state.pools.length) {
         body = React.createElement('div', { className: 'nts-empty' },
           React.createElement('div', { className: 'nts-emptyTitle' }, '流变·便签'),

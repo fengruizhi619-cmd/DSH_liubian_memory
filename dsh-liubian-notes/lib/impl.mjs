@@ -14,7 +14,7 @@
  * 方案文档：E:\DSH_data\流变系统\docs\便签系统_DSH实施方案.md
  */
 import { randomUUID, createHash } from 'node:crypto'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 /* ── 可选依赖：有 junction 就用 defineTool，没有就退回裸对象（绝不因依赖挂掉插件）── */
@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.4.0'
+export const PLUGIN_VERSION = '0.4.1'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -145,25 +145,78 @@ function newPool(sessionKey, sessionId) {
 
 const poolCache = new Map()
 
+/* 实例代次与运行期日志句柄（🟠-3）：
+ * 入口壳每次 apply 都用 `?t=` 动态 import → 每次装配都是**独立的模块实例**，
+ * 也就各有自己的模块级状态。旧实例被卸载后，它在途的异步闭包（聚合最长 120s）仍持有旧 pool
+ * 快照，若不设护栏就会在完成时 savePool 把旧快照整份写回 → 覆盖新实例期间新增的便签。
+ * 所以：dispose 时置 disposed=true，savePool/dispose 之后一律拒绝回写。 */
+let disposed = false
+let currentLogger = null
+
+/** 坏池文件隔离：**改名保留现场**（不删、不被空池覆盖），返回隔离后的路径。 */
+function quarantinePool(key) {
+  const src = poolFile(key)
+  if (!existsSync(src)) return ''
+  const dst = `${src}.corrupt-${Date.now()}`
+  try { renameSync(src, dst); return dst } catch { return '' }
+}
+
 function loadPool(key, sessionId) {
   let pool = poolCache.get(key)
   if (pool) return pool
-  const raw = readJson(poolFile(key))
+  /* 🔴-2：旧实现读不出就 newPool，随后任何 savePool 会把**空池**写回原文件
+   * ——半截 JSON（崩溃/断电）即可让整池静默蒸发。现在改为：解析失败或结构异常时
+   * **先把现场隔离**（改名 .corrupt-<ts>）再新建空池，任何情况下原始字节都不丢。 */
+  let raw = null
+  let parseFailed = false
+  try {
+    const file = poolFile(key)
+    if (existsSync(file)) {
+      const text = readFileSync(file, 'utf8').replace(/^\uFEFF/, '')
+      if (text.trim()) {
+        try { raw = JSON.parse(text) } catch { parseFailed = true }
+      }
+    }
+  } catch { parseFailed = true }
+  const schemaBad = !!raw && !Array.isArray(raw.notes)
+  if (parseFailed || schemaBad) {
+    const q = quarantinePool(key)
+    currentLogger?.warn?.(
+      `[dsh-liubian-notes] 池文件${parseFailed ? '解析失败' : '结构异常'}（${key}）→ 已隔离到 ${q || '（隔离失败！原始文件仍在）'} 并新建空池`,
+    )
+  }
   pool = raw && Array.isArray(raw.notes) ? raw : newPool(key, sessionId)
   if (!Array.isArray(pool.sealed)) pool.sealed = []
   if (!pool.current) pool.current = null
   if (!pool.meta) pool.meta = { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 }
   if (typeof pool.meta.humanRounds !== 'number') pool.meta.humanRounds = 0
+  /* 🟠-4 兼容：旧代码「先落盘再清 current」会把同一轮同时留在 sealed 末尾与 current，
+   * 读到这种重复态时按已封存处理，避免该轮被二次封存/二次聚合。 */
+  if (pool.current && pool.sealed.length
+    && pool.sealed[pool.sealed.length - 1]
+    && pool.sealed[pool.sealed.length - 1].turn === pool.current.turn) {
+    pool.current = null
+  }
   poolCache.set(key, pool)
   return pool
 }
 
+/** 原子落盘（🔴-2）：写临时文件 → rename 替换，避免半截 JSON。
+ *  返回 boolean 供调用方判成败（🟡-1：不再"内存改了就算成功"）。 */
 function savePool(pool) {
+  if (disposed) return false   // 🟠-3：已卸载实例不得回写旧快照
   pool.updatedAt = new Date().toISOString()
   try {
     mkdirSync(notesDir(), { recursive: true })
-    writeFileSync(poolFile(pool.sessionKey), JSON.stringify(pool), 'utf8')
-  } catch { /* 落盘失败下轮重试，不影响本轮 */ }
+    const file = poolFile(pool.sessionKey)
+    const tmp = `${file}.tmp-${process.pid}`
+    writeFileSync(tmp, JSON.stringify(pool), 'utf8')
+    renameSync(tmp, file)
+    return true
+  } catch (err) {
+    currentLogger?.warn?.(`[dsh-liubian-notes] 落盘失败（下轮重试，本次改动未持久化）：${(err && err.message) || err}`)
+    return false
+  }
 }
 
 function loadRetired(key) {
@@ -177,10 +230,17 @@ function loadRetired(key) {
 }
 
 function saveRetired(key, list) {
+  if (disposed) return false
   try {
     mkdirSync(notesDir(), { recursive: true })
-    writeFileSync(retiredFile(key), list.map(n => JSON.stringify(n)).join('\n') + (list.length ? '\n' : ''), 'utf8')
-  } catch { /* 忽略 */ }
+    /* 🟠-5：回收站也是「整份重写」语义 —— 同样改成 tmp + rename 原子替换，
+     * 否则半截写 = 整个回收站丢失，同时丢掉判重保护（findDuplicate 依赖回收站）。 */
+    const file = retiredFile(key)
+    const tmp = `${file}.tmp-${process.pid}`
+    writeFileSync(tmp, list.map(n => JSON.stringify(n)).join('\n') + (list.length ? '\n' : ''), 'utf8')
+    renameSync(tmp, file)
+    return true
+  } catch { return false }
 }
 
 /** 工具面默认会话：pre-step 每轮刷新；工具调用省略 session 参数时用它。 */
@@ -203,11 +263,14 @@ function defaultKey() {
  * 2. 向量：复用 8082（llama.cpp /v1/embeddings，qwen3-emb）。失败返回 null → 降级。
  * ────────────────────────────────────────────────────────────────────────── */
 
-export async function embedTexts(cfg, texts, timeoutMs = 60000) {
+export async function embedTexts(cfg, texts, timeoutMs = undefined) {
   const list = (Array.isArray(texts) ? texts : [texts]).map(t => String(t || '').trim()).filter(Boolean)
   if (!list.length) return null
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs || cfg.embedTimeoutMs)
+  /* 🟡-7：旧签名 `timeoutMs = 60000` 让默认值恒为真 → `cfg.embedTimeoutMs` 永不生效（死配置）。
+   * 改成 undefined 默认，再由配置兜底（显式传参仍可覆盖）。 */
+  const budget = Number(timeoutMs) > 0 ? Number(timeoutMs) : (Number(cfg.embedTimeoutMs) > 0 ? Number(cfg.embedTimeoutMs) : 60000)
+  const timer = setTimeout(() => controller.abort(), budget)
   try {
     const res = await fetch(cfg.embedUrl, {
       method: 'POST',
@@ -240,14 +303,20 @@ export function cosine(a, b) {
 
 export function pruneHeat(note, nowTurn, m) {
   if (!Array.isArray(note.heat)) note.heat = []
-  const keep = note.heat.filter(t => (Number(nowTurn) - Number(t)) < m && (Number(nowTurn) - Number(t)) >= 0)
+  /* 🟠-2：只丢「确实过期」的记录（d >= m）；**保留 d < 0 的记录**。
+   * d < 0 意味着该记录的回合号大于当前 nowTurn —— 而 nowTurn 来自「当前消息表里人类消息的条数」
+   * （非单调：宿主裁剪/fork/恢复都可能让它回退）。旧实现把 d<0 也当过期删除，
+   * 于是任何一次回合号回退都会**永久抹掉**较新的热度记录（与 M2 事故同一机理）。 */
+  const keep = note.heat.filter(t => (Number(nowTurn) - Number(t)) < m)
   note.heat = keep
   return keep.length
 }
 
 export function heatScore(note, nowTurn, m) {
-  const l = pruneHeat(note, nowTurn, m)
-  return l / Math.max(1, Number(m) || 1)
+  /* 只读口径（与 heatCountAt 同源）：窗口内的记录数 / m，恒 ≤ 1。
+   * 不再经 pruneHeat —— 打分是读操作，不得改写 note.heat；
+   * 记录数组的收缩交给 write 路径显式 pruneHeat（见 injectionBlock）。 */
+  return heatCountAt(note, nowTurn, m) / Math.max(1, Number(m) || 1)
 }
 
 /** 只读热度计数（**无副作用**）：旁路查询（面板路由）专用。
@@ -271,7 +340,12 @@ export function heatCountAt(note, nowTurn, m) {
  *  LLM 生成等长耗时段**不持锁**，否则会卡住本轮 pre-step。
  * ────────────────────────────────────────────────────────────────────────── */
 
-const poolLocks = new Map()
+/* 🟠-3：池锁与聚合守卫**挂到 globalThis**（按 poolKey 键控）。
+ *  入口壳每次 apply 都 `?t=` 新 import → 每次装配都是独立模块实例，各有一份模块级 Map；
+ *  于是「旧实例的聚合 + 新实例的工具写」可同时对同一池「读快照→算 ID→写盘」，
+ *  M1 的丢单/撞号会以跨实例形态回归。进程内共享一份即可消除该维度。 */
+const SHARED = (globalThis.__liubianNotesShared ||= { locks: new Map(), aggregateInFlight: new Set(), lastInjectedTurn: new Map() })
+const poolLocks = SHARED.locks
 
 export function withPoolLock(key, fn) {
   const prev = poolLocks.get(key) || Promise.resolve()
@@ -448,20 +522,28 @@ export async function addNoteToPool(pool, draft, cfg, nowTurn) {
   if (dup) return { ok: false, reason: `判重拒收：与${dup.where}便签 ${dup.id} 相似度超过 ${cfg.dedupThreshold}`, note }
   const evicted = raceEvict(pool, cfg, nowTurn)
   pool.notes.push(note)
-  savePool(pool)
-  return { ok: true, note, evicted }
+  const saved = savePool(pool)     // 🟡-1：把落盘结果带回给调用方（回执必须反映真实持久化状态）
+  return { ok: true, note, evicted, saved }
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
  * 7. 聚合：从池内持久化 sealed 窗口取料，LLM 生成头+正文（失败回退拼接）
  * ────────────────────────────────────────────────────────────────────────── */
 
-const aggregateInFlight = new Set()
+const aggregateInFlight = SHARED.aggregateInFlight   // 🟠-3：与池锁同源，跨实例共享
+const lastInjectedTurn = SHARED.lastInjectedTurn     // 🟠-1：同轮去重 token（跨实例共享，内存态）
+
+/** 🟠-1 的可测缝：本回合是否已注入过（同 key + 同 humanCount）。
+ *  人类消息条数在同一步重试时不变 → 是"本回合"的稳定标识；用内存态而非持久化 lastTurn，
+ *  避免重启后首轮被误抑制。 */
+export function injectionAlreadyDone(key, humanCount) { return lastInjectedTurn.get(key) === humanCount }
+export function markInjectionDone(key, humanCount) { lastInjectedTurn.set(key, humanCount) }
 
 /** 聚合主流程：sealed 里凑满 R 个人类轮 → LLM 打包 → 入池（循环清空积压）。
  *  返回本轮实际入池篇数。 */
 export async function maybeAggregate(pool, cfg, nowTurn, logger) {
   let made = 0
+  let rejected = 0
   while (true) {
     const window = []
     while (pool.sealed.length && window.length < cfg.aggregateRounds) {
@@ -479,12 +561,29 @@ export async function maybeAggregate(pool, cfg, nowTurn, logger) {
       ? { head: llm.head, body: llm.body, source: 'auto', gen: 'llm' }
       : { head: buildAutoHead(window), body: buildNoteBody(window), source: 'auto', gen: 'concat' }
     const res = await withPoolLock(pool.sessionKey, () => addNoteToPool(pool, draft, cfg, nowTurn))
-    made += 1
+    if (res.ok) {
+      made += 1
+    } else {
+      /* 🔴-3：判重拒收时**把窗口回补**，否则这 R 个人类轮既没变成便签、也不在 sealed 里 = 永久消失。
+       * 拒收意味着「池里已有同义便签」，但原料仍属于对话记忆，应留在窗口待下轮（或逐轮滑出）。
+       * 回补到队首保持时间序，并**立即 break**：同一窗口在同一次调度里重试必然再被拒
+       * （判重是确定性的），若不跳出就会变成"无限重试 + 狂打 LLM"的死循环。 */
+      pool.sealed.unshift(...window)
+      rejected += 1
+      savePool(pool)
+      logger?.info?.(
+        `[dsh-liubian-notes] 自动聚合被拒（${res.reason}）→ 窗口已回补 ${window.length} 轮（本轮不再重试）` +
+        (pool.sealed.length > 16 ? `；⚠ sealed 已达 ${pool.sealed.length}（上限 16，将丢弃最旧轮）` : ''),
+      )
+      break
+    }
     logger?.info?.(
-      `[dsh-liubian-notes] 自动聚合入池 ${res.ok ? `${res.note.id}「${firstLine(res.note.head, 30)}」(${draft.gen})` : `被拒（${res.reason}）`}` +
+      `[dsh-liubian-notes] 自动聚合入池 ${res.note.id}「${firstLine(res.note.head, 30)}」(${draft.gen})` +
       (res.evicted ? `，赛马淘汰 ${res.evicted.id}` : ''),
     )
   }
+  if (rejected) currentLogger?.warn?.(`[dsh-liubian-notes] 本轮有 ${rejected} 个聚合窗口因判重被拒（原料已回补，池可能已饱和于同义主题）`)
+  return made
 }
 
 function scheduleAggregate(ctx, cfg, sessionId, pool, nowTurn) {
@@ -541,11 +640,16 @@ function currentPrompt(messages) {
 async function backfillVectors(pool, cfg) {
   const missing = pool.notes.filter(n => n.status !== 'retired' && !Array.isArray(n.vector))
   if (!missing.length) return true
-  const vecs = await embedTexts(cfg, missing.map(n => n.head))
-  if (!vecs) return false
-  missing.forEach((n, i) => { if (vecs[i]) n.vector = vecs[i] })
+  /* 🟡-2：embedTexts 内部会 `filter(Boolean)` 丢掉空串——若直接把 missing 的 head 原样传进去，
+   * 一旦出现空 head，其后所有便签会按**原下标**拿到别人的向量（注入错篇、判重全错，且落盘）。
+   * 这里先滤出「可嵌入」（非空 head）的子集再按下标回填，下标与请求数组一一对应。 */
+  const pending = missing.filter(n => String(n.head || '').trim())
+  if (!pending.length) return false
+  const vecs = await embedTexts(cfg, pending.map(n => String(n.head).trim()))
+  if (!Array.isArray(vecs)) return false
+  pending.forEach((n, i) => { if (Array.isArray(vecs[i]) && vecs[i].length) n.vector = vecs[i] })
   savePool(pool)
-  return missing.every(n => Array.isArray(n.vector))
+  return pending.every(n => Array.isArray(n.vector))
 }
 
 /** 每轮注入主流程。返回注入块文本（空串 = 本轮不注）。 */
@@ -561,7 +665,10 @@ export async function injectionBlock(pool, cfg, queryText, nowTurn) {
     .slice(0, cfg.injectTop)
   if (cfg.minSim > 0) ranked = ranked.filter(r => r.sim >= cfg.minSim)
   if (!ranked.length) return ''
-  for (const r of ranked) r.note.heat.push(nowTurn)   // 每被注入一次记 1 条热度
+  for (const r of ranked) {
+    r.note.heat.push(nowTurn)                          // 每被注入一次记 1 条热度
+    pruneHeat(r.note, nowTurn, cfg.heatRounds)         // 压缩只发生在写路径（d≥m 的记录才丢）
+  }
   savePool(pool)
   return buildNotesBlock(ranked, cfg.poolSize)
 }
@@ -575,6 +682,22 @@ function appendPending(entry) {
     mkdirSync(dirname(pendingPromotionsFile()), { recursive: true })
     appendFileSync(pendingPromotionsFile(), JSON.stringify(entry) + '\n', 'utf8')
     return true
+  } catch { return false }
+}
+
+/** 🟡-5：pending 队列里是否已有该（会话, 便签）——用于 promote 幂等（jsonl 无唯一键，只能扫）。 */
+export function pendingHasId(sessionKey, id) {
+  const wantId = String(id || '')
+  if (!wantId) return false
+  try {
+    const file = pendingPromotionsFile()
+    if (!existsSync(file)) return false
+    return readFileSync(file, 'utf8').split('\n').filter(Boolean).some((line) => {
+      try {
+        const e = JSON.parse(line.replace(/^\uFEFF/, ''))
+        return e && String(e.id) === wantId && (!sessionKey || String(e.session_key) === String(sessionKey))
+      } catch { return false }
+    })
   } catch { return false }
 }
 
@@ -626,8 +749,13 @@ export async function noteToolAction(cfg, args = {}, logger) {
     return pools.map(pool => {
       const avg = pool.meta.rounds ? ((pool.meta.humanChars + pool.meta.assistantChars) / pool.meta.rounds).toFixed(0) : '0'
       const lines = pool.notes.map(n => {
-        const l = pruneHeat(n, Number(args.nowTurn) || 0, m)
-        const heat = Number(args.nowTurn) ? (l / m).toFixed(2) : `${n.heat.length}条`
+        /* 🔴-1：**读路径不得触碰 note.heat**。此处原用 pruneHeat（会物理删除过期记录）；
+         * 工具 schema 不暴露 nowTurn → 恒为 0 → 任何 t≥1 的记录被判 d<0 一律删除，
+         * 再被下一次 savePool 固化 = 热度整体归零、赛马失去输入。
+         * 只读计数一律走 heatCountAt（M2 修复的是路由，这里补上工具面这条同源路径）。
+         * 显示口径：给了 nowTurn → 窗口分 l/m；没给 → 原始记录条数（对排障更有信息量）。 */
+        const l = Number(args.nowTurn) ? heatCountAt(n, Number(args.nowTurn), m) : (Array.isArray(n.heat) ? n.heat.length : 0)
+        const heat = Number(args.nowTurn) ? (l / m).toFixed(2) : `${l}条`
         const vec = Array.isArray(n.vector) ? '有向量' : '无向量'
         const gen = n.gen ? '/' + n.gen : ''
         return `  ${n.id} [${n.source}${gen}${n.status !== 'active' ? '/' + n.status : ''}] 热度${heat} ${vec} born#t${n.born_turn}${n.diary_ref ? ' →' + n.diary_ref : ''}：${firstLine(n.head, 50)}`
@@ -650,7 +778,8 @@ export async function noteToolAction(cfg, args = {}, logger) {
       const res = await addNoteToPool(pool, { head, body, source: 'manual' }, cfg, Number(args.nowTurn) || pool.meta.rounds)
       if (!res.ok) return `[拒收] ${res.reason}`
       return `已挂起 ${res.note.id}「${firstLine(res.note.head, 40)}」入池（${racableNotes(pool).length}/${cfg.poolSize}）` +
-        (res.evicted ? `；赛马淘汰 ${res.evicted.id}（入回收站，可 restore）` : '')
+        (res.evicted ? `；赛马淘汰 ${res.evicted.id}（入回收站，可 restore）` : '') +
+        (res.saved === false ? '（⚠ 落盘失败：仅内存生效，下轮写入会重试——如需持久请稍后重试）' : '')
     })
   }
 
@@ -670,6 +799,13 @@ export async function noteToolAction(cfg, args = {}, logger) {
       if (!note) return `[未找到] 便签 ${args.id}。`
       if (note.status === 'queued') return `[跳过] ${note.id} 已在待固化缓存里。`
       if (note.status === 'submitted') return `[跳过] ${note.id} 已固化（${note.diary_ref}）。`
+      /* 🟡-5：pending 队列按 id 去重。旧实现只在池内状态上判重，而「队列已写入、note.status
+       * 置位前 savePool 失败」会留下队列有记录、池内仍 active 的错位 → 再次 promote 重复入队。 */
+      if (pendingHasId(pool.sessionKey, note.id)) {
+        note.status = 'queued'
+        savePool(pool)
+        return `[跳过] ${note.id} 已在 pending_promotions.jsonl 里（已把池内状态补正为 queued）。`
+      }
       const ws = String(args.workspace || cfg.workspace || '工作组').trim()
       const entry = {
         queued_at: new Date().toISOString(),
@@ -684,8 +820,10 @@ export async function noteToolAction(cfg, args = {}, logger) {
       }
       if (!appendPending(entry)) return '[失败] 写入 pending_promotions.jsonl 未成功（便签保持原状态，可重试）。'
       note.status = 'queued'
-      savePool(pool)
-      return `已缓存待固化：${note.id} → pending_promotions.jsonl（标签 ${entry.tags.join('/')}）。通道就绪（被炉 P2P + 独特名）前只累积不提交。`
+      const savedOk = savePool(pool)   // 🟡-1：回执反映真实持久化状态
+      return `已缓存待固化：${note.id} → pending_promotions.jsonl（标签 ${entry.tags.join('/')}）。`
+        + `通道就绪（被炉 P2P + 独特名）前只累积不提交。`
+        + (savedOk ? '' : '（⚠ 池状态落盘失败：队列条目已在，池内状态仅内存生效，下轮写入会重试）')
     })
   }
 
@@ -694,12 +832,21 @@ export async function noteToolAction(cfg, args = {}, logger) {
       const idx = pool.notes.findIndex(n => n.id === String(args.id || ''))
       if (idx < 0) return `[未找到] 便签 ${args.id}。`
       const [note] = pool.notes.splice(idx, 1)
+      /* 🟡-5：排队/已固化的便签不得直接丢进回收站——那会让 pending_promotions.jsonl 里的条目
+       * 变成孤儿（固化通道将来会把已回收的内容提交出去）。 */
+      if (note.status === 'queued' || note.status === 'submitted') {
+        pool.notes.splice(idx, 0, note)   // 放回原位
+        return `[拒绝] ${note.id} 状态为 ${note.status}（已入待固化队列/已固化），不能 drop——`
+          + `如需丢弃请先说明用途，避免 pending 队列产生孤儿条目。`
+      }
       note.status = 'retired'
       const retired = loadRetired(pool.sessionKey)
       retired.push(note)
-      saveRetired(pool.sessionKey, retired)
-      savePool(pool)
+      /* 🟡-1：回收站与池两处谁没落盘都要如实回执（旧实现无论成败都回"已移入回收站"）。 */
+      const retiredOk = saveRetired(pool.sessionKey, retired)
+      const poolOk = savePool(pool)
       return `已移入回收站：${note.id}（restore 可救回）。`
+        + (retiredOk && poolOk ? '' : `（⚠ 落盘异常：回收站=${retiredOk ? 'ok' : '失败'} 池=${poolOk ? 'ok' : '失败'}，下轮写入会重试）`)
     })
   }
 
@@ -716,6 +863,7 @@ export async function noteToolAction(cfg, args = {}, logger) {
         return `[拒收] 恢复失败：${res.reason}（便签已放回回收站）`
       }
       return `已恢复：${note.id} 重新入池${res.evicted ? `（赛马淘汰 ${res.evicted.id}）` : ''}。`
+        + (res.saved === false ? '（⚠ 落盘失败：仅内存生效，下轮写入会重试）' : '')
     })
   }
 
@@ -766,8 +914,11 @@ export function mountPanelRoutes(ctx, cfg) {
         const files = existsSync(notesDir()) ? readdirSync(notesDir()).filter(x => x.endsWith('.json')) : []
         for (const f of files) {
           const key = f.replace(/\.json$/, '')
-          const pool = loadPool(key)
-          if (!pool) continue
+          /* 🟡-6：**纯读**——旧实现用 loadPool(key)（不传 sessionId）会把池塞进 poolCache，
+           * 一旦磁盘上是坏文件（🔴-2 场景）这个只读接口就会把「空池」缓存起来，
+           * 反向污染写路径。路由只读盘、不进缓存。 */
+          const pool = readJson(join(notesDir(), f))
+          if (!pool || !Array.isArray(pool.notes)) continue
           const m = cfg.heatRounds
           const lastTurn = Number(pool.lastTurn) || 0
           pools.push({
@@ -776,7 +927,7 @@ export function mountPanelRoutes(ctx, cfg) {
             updatedAt: pool.updatedAt,
             lastTurn,
             sealed: (pool.sealed || []).length,
-            meta: pool.meta || { rounds: 0, humanChars: 0, assistantChars: 0 },
+            meta: pool.meta || { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 },
             notes: (pool.notes || []).filter(n => n.status !== 'retired').map(n => {
               const l = heatCountAt(n, lastTurn, m)   // 只读计数：路由不得改写 heat（M2 修复）
               return {
@@ -841,6 +992,7 @@ export function shouldSealTurn(turn) {
 
 export function apply(ctx, input = {}) {
   const cfg = resolveConfig(input)
+  currentLogger = ctx.logger || null      // 🟡-1：模块级日志句柄，落盘/隔离失败要能留痕
   if (cfg.enabled === false) {
     ctx.logger?.info?.('[dsh-liubian-notes] 已通过配置停用（enabled=false），本轮不挂载任何钩子与工具')
     return
@@ -895,20 +1047,30 @@ export function apply(ctx, input = {}) {
           break
         case 'turn/end': {
           if (!pool.current) break
-          const sealedNow = shouldSealTurn(pool.current)   // M4：无人类内容的轮不入窗
+          const ended = pool.current                       // 先留引用（下面会置空）
+          const sealedNow = shouldSealTurn(ended)           // M4：无人类内容的轮不入窗
           if (sealedNow) {
-            pool.sealed.push(pool.current)
-            if (pool.sealed.length > 16) pool.sealed.shift()
+            pool.sealed.push(ended)
+            if (pool.sealed.length > 16) {
+              const dropped = pool.sealed.shift()
+              // 🟡-4：超限丢的是**最旧的人类轮**，必须留痕（否则是无声的记忆缺口）
+              currentLogger?.warn?.(
+                `[dsh-liubian-notes] sealed 超限（16）→ 丢弃最旧轮 t${dropped && dropped.turn}（聚合滞后或人类轮过快时发生）`,
+              )
+            }
           }
-          const counted = bumpStats(pool, pool.current)
+          const counted = bumpStats(pool, ended)
+          /* 🟠-4：**先清 current 再落盘**。旧顺序是 push(sealed) → savePool → current=null，
+           * 于是磁盘上每次"轮结束"都把同一轮同时留在 sealed 末尾与 current 里；
+           * 若进程死在该窗口，重启后 current 被读回，该轮可能被二次封存/二次聚合。 */
+          pool.current = null
           savePool(pool)
           // 诊断（P1 观察封存节奏用）
           ctx.logger?.info?.(
-            `[dsh-liubian-notes] 轮封存 t${pool.current.turn}：human=${pool.current.human.length} assistant=${pool.current.assistant.length}`
+            `[dsh-liubian-notes] 轮封存 t${ended.turn}：human=${ended.human.length} assistant=${ended.assistant.length}`
             + `｜${sealedNow ? '入窗' : '跳过（无人类内容）'} sealed=${pool.sealed.length}`
             + ` humanRounds=${Number(pool.meta.humanRounds) || 0} rounds=${pool.meta.rounds}${counted ? '' : '（无内容不计轮）'}`,
           )
-          pool.current = null
           break
         }
         default: break
@@ -932,12 +1094,21 @@ export function apply(ctx, input = {}) {
       if (!prompt) return decision   // 同轮后续步不重复注入
       // 记录当前回合号（面板热度分按它算 l/m；lastTurn 持久化在池文件里）
       if (pool.lastTurn !== humanCount) { pool.lastTurn = humanCount; savePool(pool) }
+      /* 🟠-1：同轮去重（内存态 token）。pre-step 在**同一步可能被多次调用**（重试/多段生成），
+       * 旧实现只有 `if (!prompt) return` 一道守卫，于是同一 humanCount 会被重复注入
+       * ——上下文里出现多份整块 <liubian-notes>，且每条命中便签被重复记热度（真实池文件里
+       * 可见 [1,1] / [16,16] 这类同回合指纹），热度 l/m 被灌水、赛马排序失真。
+       * 参照同族已验证写法（dsh-liubian 的 state.turnReminderCount !== humanCount）：
+       * 人类消息条数在同一步重试时不变，天然是"本回合"的稳定标识。
+       * 用内存态而非 pool.lastTurn：持久化的话重启后首轮会被误抑制。 */
+      if (injectionAlreadyDone(key, humanCount)) return decision   // 本回合已注入过，直接放行
       // ① 自动聚合（fire-and-forget，LLM 调用耗时绝不能卡本轮）
       scheduleAggregate(ctx, cfg, sessionId, pool, humanCount)
       // ② 向量注入：该轮对话 + 上一轮完整问答 作查询
       const prev = previousQAPair(decision.messages, messageText, isHumanMessage)
       const block = await injectionBlock(pool, cfg, composeQueryText(prompt, prev), humanCount)
       if (!block) return decision
+      markInjectionDone(key, humanCount)
       return { kind: 'enter', messages: [...decision.messages, pluginMessage(block, 'recall')] }
     } catch (err) {
       ctx.logger?.warn?.(`[dsh-liubian-notes] 本轮注入失败（已忽略，不影响对话）: ${(err && err.message) || err}`)
@@ -946,9 +1117,13 @@ export function apply(ctx, input = {}) {
   })
 
   ctx.effect(() => {
+    /* 🟠-3：卸载本实例时置 disposed —— 在途异步闭包（聚合最长 120s）此后不得再 savePool，
+     * 否则它会把旧快照整份写回、覆盖新实例期间的写入。
+     * ⚠ 只清**本实例**的 poolCache；共享守卫（池锁 / 聚合在飞 / 同轮 token）**不清**，
+     * 它们属于进程内其它仍存活的实例。 */
+    disposed = true
     poolCache.clear()
-    aggregateInFlight.clear()
-  }, 'dsh-liubian-notes: 清理池缓存与聚合守卫')
+  }, 'dsh-liubian-notes: 标记实例已卸载并清理本实例池缓存')
 
   ctx.logger?.info?.(
     `[dsh-liubian-notes] v${PLUGIN_VERSION} 便签已挂载：池 ${cfg.poolSize}/注入 ${cfg.injectTop}/R ${cfg.aggregateRounds}`
@@ -968,5 +1143,8 @@ export const __test = {
   addNoteToPool, loadPool, savePool, loadRetired, saveRetired, injectionBlock,
   maybeAggregate, noteToolAction, embedTexts, pluginMessage, messageText,
   isHumanMessage, currentPrompt, bumpStats, shouldSealTurn, buildPromoteTags, pendingPromotionsFile,
+  /* L157 `function quarantinePool(key)`（坏池隔离）、L683 `export function pendingHasId(...)`（promote 幂等） */
+  pendingHasId, quarantinePool,
+  injectionAlreadyDone, markInjectionDone, backfillVectors,
   MEMORY_KEYS, DEFAULTS, notesDir,
 }
