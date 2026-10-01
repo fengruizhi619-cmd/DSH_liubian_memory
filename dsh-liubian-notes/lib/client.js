@@ -173,7 +173,7 @@ window.__ModuleLoader__.load({
             : null,
           React.createElement('span', { className: 'nts-stats' },
             pool
-              ? (pool.notes.length + '/' + size + ' 篇 · 待封存 ' + pool.sealed + ' 轮 · 已统计 ' + pool.meta.rounds + ' 轮'
+              ? (pool.notes.length + '/' + size + ' 篇 · 待封存 ' + pool.sealed + ' 轮 · 人类轮 ' + (pool.meta.humanRounds || 0) + ' / 内容轮 ' + pool.meta.rounds
                 + (avg ? '（均 ' + avg + ' 字/轮）' : '') + ' · 热度窗口 m=' + m)
               : '短期记忆池 · 卡片视图')),
         body)

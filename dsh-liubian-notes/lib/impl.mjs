@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.3.1'
+export const PLUGIN_VERSION = '0.3.2'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -131,7 +131,7 @@ function newPool(sessionKey, sessionId) {
     sessionId: String(sessionId ?? ''),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    meta: { rounds: 0, humanChars: 0, assistantChars: 0 },  // 平均每轮文本量统计（定 R 用）
+    meta: { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 },  // 平均每轮文本量统计（定 R 用）
     sealed: [],        // 已封存轮次窗口（持久化；聚合从这取料）
     current: null,     // 进行中轮次（turn/start 建档，turn/end 封存）
     notes: [],
@@ -147,7 +147,8 @@ function loadPool(key, sessionId) {
   pool = raw && Array.isArray(raw.notes) ? raw : newPool(key, sessionId)
   if (!Array.isArray(pool.sealed)) pool.sealed = []
   if (!pool.current) pool.current = null
-  if (!pool.meta) pool.meta = { rounds: 0, humanChars: 0, assistantChars: 0 }
+  if (!pool.meta) pool.meta = { rounds: 0, humanRounds: 0, humanChars: 0, assistantChars: 0 }
+  if (typeof pool.meta.humanRounds !== 'number') pool.meta.humanRounds = 0
   poolCache.set(key, pool)
   return pool
 }
@@ -627,7 +628,7 @@ export async function noteToolAction(cfg, args = {}, logger) {
         return `  ${n.id} [${n.source}${gen}${n.status !== 'active' ? '/' + n.status : ''}] 热度${heat} ${vec} born#t${n.born_turn}${n.diary_ref ? ' →' + n.diary_ref : ''}：${firstLine(n.head, 50)}`
       })
       const retiredN = loadRetired(pool.sessionKey).length
-      return `池 ${pool.sessionKey}（${pool.notes.length}/${cfg.poolSize}，回收站 ${retiredN}，待封存轮 ${pool.sealed.length}；已统计 ${pool.meta.rounds} 轮，均 ${avg} 字/轮）\n${lines.join('\n') || '  （空池）'}`
+      return `池 ${pool.sessionKey}（${pool.notes.length}/${cfg.poolSize}，回收站 ${retiredN}，待封存轮 ${pool.sealed.length}；人类轮 ${Number(pool.meta.humanRounds) || 0} / 内容轮 ${pool.meta.rounds}，均 ${avg} 字/轮）\n${lines.join('\n') || '  （空池）'}`
     }).join('\n\n')
   }
 
@@ -813,15 +814,24 @@ function register(ctx, def) {
   ctx.effect(() => ctx.tools.register(tool), TOOL_PREFIX + def.name)
 }
 
-/** 每轮人声文本量进 meta（定 R 的统计口径：human+assistant 字符 / 轮）。 */
+/** 每轮人声文本量进 meta（定 R 的统计口径：human+assistant 字符 / 轮）。
+ *  M4（2026-10-01）：另记 humanRounds（含人类内容的轮数）——聚合窗口只吃人类轮，
+ *  而内容轮（被炉唤醒等无人类内容的轮）会把 rounds 推高却不进窗，两个口径分开记。 */
 export function bumpStats(pool, t) {
   const h = (t.human || []).join('').length
   const a = (t.assistant || []).join('').length
   if (!h && !a) return false
   pool.meta.rounds += 1
+  if (h > 0) pool.meta.humanRounds = (Number(pool.meta.humanRounds) || 0) + 1
   pool.meta.humanChars += h
   pool.meta.assistantChars += a
   return true
+}
+
+/** M4：只有含人类内容的轮才进封存窗口。无人类内容的轮（房间唤醒等）对聚合零贡献，
+ *  过去它们会占满 sealed 的 16 上限并从最旧开始挤掉人类轮（静默丢窗隐患）。 */
+export function shouldSealTurn(turn) {
+  return !!(turn && Array.isArray(turn.human) && turn.human.length > 0)
 }
 
 export function apply(ctx, input = {}) {
@@ -880,14 +890,18 @@ export function apply(ctx, input = {}) {
           break
         case 'turn/end': {
           if (!pool.current) break
-          pool.sealed.push(pool.current)
-          if (pool.sealed.length > 16) pool.sealed.shift()
+          const sealedNow = shouldSealTurn(pool.current)   // M4：无人类内容的轮不入窗
+          if (sealedNow) {
+            pool.sealed.push(pool.current)
+            if (pool.sealed.length > 16) pool.sealed.shift()
+          }
           const counted = bumpStats(pool, pool.current)
           savePool(pool)
           // 诊断（P1 观察封存节奏用）
           ctx.logger?.info?.(
             `[dsh-liubian-notes] 轮封存 t${pool.current.turn}：human=${pool.current.human.length} assistant=${pool.current.assistant.length}`
-            + `｜sealed=${pool.sealed.length} rounds=${pool.meta.rounds}${counted ? '' : '（无人声不计轮）'}`,
+            + `｜${sealedNow ? '入窗' : '跳过（无人类内容）'} sealed=${pool.sealed.length}`
+            + ` humanRounds=${Number(pool.meta.humanRounds) || 0} rounds=${pool.meta.rounds}${counted ? '' : '（无内容不计轮）'}`,
           )
           pool.current = null
           break
@@ -948,6 +962,6 @@ export const __test = {
   previousQAPair, buildNotesBlock, buildPackPrompt, generateNoteViaLlm,
   addNoteToPool, loadPool, savePool, loadRetired, saveRetired, injectionBlock,
   maybeAggregate, noteToolAction, embedTexts, pluginMessage, messageText,
-  isHumanMessage, currentPrompt, bumpStats, buildPromoteTags, pendingPromotionsFile,
+  isHumanMessage, currentPrompt, bumpStats, shouldSealTurn, buildPromoteTags, pendingPromotionsFile,
   MEMORY_KEYS, DEFAULTS, notesDir,
 }
