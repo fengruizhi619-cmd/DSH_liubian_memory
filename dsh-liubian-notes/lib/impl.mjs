@@ -689,9 +689,19 @@ function sendJson(res, code, obj) {
   } catch { /* 客户端断开等，忽略 */ }
 }
 
-/** 面板数据路由：/api/liubian-notes?op=pools——全池快照（卡片渲染用，只读）。 */
+/** 面板数据路由：/api/liubian-notes?op=pools——全池快照（卡片渲染用，只读）。
+ *  webServer 获取走 ctx.reflect.get（免 inject 声明）——入口壳 main.mjs 被 ESM 缓存，
+ *  热注入拿不到新声明的服务清单（checklist §3.1.3），reflect 层是官方豁免口。 */
 export function mountPanelRoutes(ctx, cfg) {
-  ctx.effect(() => ctx.webServer.register({
+  ctx.effect(() => {
+    const webServer = (ctx.reflect && typeof ctx.reflect.get === 'function')
+      ? ctx.reflect.get('webServer', false)
+      : ctx.webServer
+    if (!webServer || typeof webServer.register !== 'function') {
+      ctx.logger?.warn?.('[dsh-liubian-notes] webServer 服务不可得，面板路由未挂载（下次重载重试）')
+      return
+    }
+    return webServer.register({
     kind: 'exact',
     path: '/api/liubian-notes',
     async handler(req, res) {
@@ -737,7 +747,8 @@ export function mountPanelRoutes(ctx, cfg) {
         sendJson(res, 200, { pools, heatRounds: cfg.heatRounds, poolSize: cfg.poolSize, injectTop: cfg.injectTop, aggregateRounds: cfg.aggregateRounds })
       } catch (err) { sendJson(res, 500, { error: (err && err.message) || String(err) }) }
     },
-  }), 'dsh-liubian-notes.panel-routes')
+    })
+  }, 'dsh-liubian-notes.panel-routes')
 }
 
 function register(ctx, def) {
