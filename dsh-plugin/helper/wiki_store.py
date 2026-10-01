@@ -380,17 +380,6 @@ def op_rollback(conn, req):
     return {"ok": True, "slug": slug, "rev": rev, "restoredFromTime": snap_time}
 
 
-OPS = {
-    "create": op_create,
-    "update": op_update,
-    "get": op_get,
-    "tree": op_tree,
-    "list": op_list,
-    "move": op_move,
-    "rollback": op_rollback,
-    "search": op_search,
-}
-
 
 def op_search(conn, req):
     """S4 分级向量检索（银杏骨架 v0.1 + 双余弦加权）。
@@ -423,7 +412,7 @@ def op_search(conn, req):
             continue
         iv = [x / ivn for x in iv]
         cos = sum(a * b for a, b in zip(qv, iv))
-        scored.append({"slug": slug, "family_path": family, "full_path": full,
+        scored.append({"slug": slug, "family_path": fp, "full_path": full,
                        "title": title, "intro": intro, "content": content,
                        "status": status, "revisions": revs, "updated_at": upd,
                        "score": round(cos, 4)})
@@ -453,6 +442,17 @@ def embed_text_cached(text):
 
 
 _embed_cache = {}
+
+OPS = {
+    "create": op_create,
+    "update": op_update,
+    "get": op_get,
+    "tree": op_tree,
+    "list": op_list,
+    "move": op_move,
+    "rollback": op_rollback,
+    "search": op_search,
+}
 
 
 def main():
