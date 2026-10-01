@@ -220,5 +220,11 @@ window.__ModuleLoader__.load({
         }, NotesApp)
       })
     }
+
+    /* ⚠ 必须返回模块导出：加载器以**工厂返回值**作为该客户端的模块（官方客户端模块与
+     * kotatsu 均以 `return module.exports` 收尾）。缺这一行 → 加载器拿到 undefined →
+     * 渲染器启动即报 `Renderer boot failed … The client Loader did not provide an error
+     * message.`（无错误消息，因为根本没抛错，只是拿不到 apply/inject）。 */
+    return module.exports
   },
 })
