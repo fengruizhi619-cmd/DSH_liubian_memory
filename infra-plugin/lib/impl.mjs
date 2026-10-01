@@ -1,4 +1,4 @@
-﻿/**
+/**
  * dsh-liubian-infra —— 流变基建
  *
  * 三大职责：
@@ -24,7 +24,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const PLUGIN_NAME = 'dsh-liubian-infra'
-export const PLUGIN_VERSION = '0.3.1'
+export const PLUGIN_VERSION = '0.3.2'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
@@ -411,6 +411,17 @@ export function resolveIdentityRef(db, ref) {
     const cands = db.prepare('SELECT * FROM identities WHERE hash LIKE ?').all(h + '%')
     if (cands.length === 1) return cands[0]
     if (cands.length > 1) throw new Error(`[歧义] hash 前缀命中 ${cands.length} 条，请给更长的 hash`)
+  }
+  // 会话哈希路径（2026-10-01 交接首日实测补）：消费方（被炉 account 工具）传的 `hash` 是
+  // **会话哈希**（= 被炉成员 ID = `bindings.session_hash`，由 sessionId 派生），而 `identities.hash`
+  // 由**名字**派生——两者**不同源**（实测生产库 13 条绑定里同源 0 条），当身份 hash 直查必然落空。
+  // 故先按绑定反查名字、再取身份行；随后才回落名字路径。
+  if (/^[0-9a-f]{8}$/.test(q.toLowerCase())) {
+    const bound = db.prepare('SELECT name FROM bindings WHERE session_hash = ?').get(q.toLowerCase())
+    if (bound) {
+      const byBind = db.prepare('SELECT * FROM identities WHERE name = ?').get(bound.name)
+      if (byBind) return byBind
+    }
   }
   const norm = normalizeName(q)
   if (norm.ok) {

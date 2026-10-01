@@ -1,6 +1,6 @@
-﻿{
+{
   "name": "dsh-liubian-infra",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "流变·基建：独特名注册中心（全局独热名字 → SHA-256 身份哈希，单写多读 SQLite）+ 改名（hash 不变 + 别名表 + 改名账目）+ 向量服务控制面（移植自 dsh-liubian-embed，过渡期手动控制）。供流变家族插件统一查询注册表。",
   "private": true,
   "type": "module",

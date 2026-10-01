@@ -329,6 +329,22 @@ await ta('服务改名撞名 → ok:false 且零写入', async () => {
   eq(r.ok, false)
   eq(snap(), before, '拒绝时必须零写入')
 })
+await ta('会话哈希路径：resolveIdentityRef 按 bindings 反查（消费方传的 hash 是成员 ID）', () => {
+  // 事实：identities.hash 由**名字**派生、bindings.session_hash 由**会话**派生——两者不同源
+  // （生产库实测：13 条绑定里同源 0 条）。被炉 account 工具的 `{ hash: mine.id }` 就是后者。
+  const row = resolveIdentityRef(db, 'a1b2c3d4')
+  eq(row.name, 'JasminePro')
+  return `a1b2c3d4 → ${row.name} #${row.short_id}`
+})
+await ta('服务 rename（消费方真实形态：hash = 会话哈希）→ ok + 绑定副本同步', async () => {
+  const r = await svc.rename({ hash: 'a1b2c3d4', newName: 'JasmineSvc', actor: '契约探针', note: '会话哈希路径' })
+  eq(r.ok, true, JSON.stringify(r))
+  eq(r.name, 'JasmineSvc')
+  eq(r.bindingsMoved, 1, '绑定名字副本应同步')
+})
+await ta('反向对照：未绑定的会话哈希 → 明确报错，不静默定位到别处', () => {
+  throws(() => resolveIdentityRef(db, 'deadbeef'), '未找到身份')
+})
 await ta('服务 unbind：删绑定（removed 1 → 二次 0 幂等）', async () => {
   const r1 = await svc.unbind({ sessionHash: 'a1b2c3d4' })
   eq(r1.ok, true); eq(r1.removed, 1)
