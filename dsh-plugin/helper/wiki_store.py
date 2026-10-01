@@ -81,7 +81,8 @@ DDL = [
 
 
 def out(obj):
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False))
+    # default=str：任何漏网的非序列化对象（如 Row）降级为字符串，不让整个工具调用炸掉
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, default=str))
     sys.stdout.flush()
 
 
@@ -262,7 +263,8 @@ def op_get(conn, req):
         "status": row[6], "revisions": row[7], "createdAt": row[8], "updatedAt": row[9],
         "children": [{"slug": s, "familyPath": f, "title": t} for s, f, t in children],
         "checkpoints": [{"slot": s, "time": t} for s, t in cps],
-        "recentRevisions": revs,
+        "recentRevisions": [{"rev": v, "time": t, "contributor": c, "action": a, "summary": s}
+                            for v, t, c, a, s in revs],
     }}
 
 
