@@ -1,6 +1,6 @@
 {
   "name": "dsh-liubian-notes",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "流变·便签 —— 流变系统的短期记忆子系统：会话内便签池（自动聚合 + 主动挂起），向量唯一检索，热度 l/m，赛马淘汰，周期送审固化为流变记忆",
   "private": true,
   "type": "module",
