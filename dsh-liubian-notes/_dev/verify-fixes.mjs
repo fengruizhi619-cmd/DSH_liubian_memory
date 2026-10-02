@@ -399,6 +399,27 @@ const cfg = T.resolveConfig({})
   check('v0.6.1 反向对照：占用号被避让（本轮 IDs 无重复）', taken.size === p2.notes.length, 'n=' + p2.notes.length)
 }
 
+/* v0.6.2：回合标识必须是真实轮次，不能再是「人类消息条数」（它恒为 1 → 注入被永久抑制、
+ * 热度全记成 1、born_turn 恒为 1）。这类"接线错了"用源码级护栏最省且最准。 */
+{
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'impl.mjs'), 'utf8')
+  check('v0.6.2 pre-step 用 turnToken（真实轮次）', /const turnToken = Math\.max\(/.test(src)
+    && /scheduleAggregate\(ctx, cfg, sessionId, pool, turnToken\)/.test(src)
+    && /pool\.lastTurn !== turnToken/.test(src), 'turnToken 已接线')
+  check('v0.6.2 去重与热度也走 turnToken', /injectionAlreadyDone\(key, turnToken\)/.test(src)
+    && /markInjectionDone\(key, turnToken\)/.test(src)
+    && /injectionBlock\(pool, cfg, composeQueryText\(prompt, prev\), turnToken\)/.test(src), '三处已换')
+  /* 反向对照：旧接线必须彻底消失（含 humanCount 变量本身——死变量是下一个地雷） */
+  check('v0.6.2 反向对照：旧 humanCount 接线已清除',
+    src.indexOf('humanCount') < 0, 'humanCount 残留=' + (src.indexOf('humanCount') >= 0 ? '有' : '无'))
+  /* token 语义：同轮内稳定、跨轮递增——用真函数钉一次口径 */
+  const p = T.loadPool('v062-token-probe', 's-v062')
+  const tk1 = Math.max(Number(p.current && p.current.turn) || 0, (Number(p.meta && p.meta.rounds) || 0) + 1)
+  p.meta.rounds = 7
+  const tk2 = Math.max(Number(p.current && p.current.turn) || 0, (Number(p.meta && p.meta.rounds) || 0) + 1)
+  check('v0.6.2 token 随完成轮次递增', Number.isFinite(tk1) && tk2 > tk1, 'tk1=' + tk1 + ' tk2=' + tk2)
+}
+
 /* 🔴-8 真行为回归（**放在最后**：它会真的 apply 并最终 dispose，之后本进程不再能落盘）：
  * `ctx.effect(fn)` 的 fn 是「立即执行」的注册面，f返回的函数才是清理器。
  * 旧 bug：`disposed = true` 写在 fn 体里 → 实例**挂载瞬间即自我标记已卸载** →

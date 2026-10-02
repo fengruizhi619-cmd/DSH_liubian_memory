@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.6.1'
+export const PLUGIN_VERSION = '0.6.2'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -552,11 +552,12 @@ export async function addNoteToPool(pool, draft, cfg, nowTurn) {
 const aggregateInFlight = SHARED.aggregateInFlight   // 🟠-3：与池锁同源，跨实例共享
 const lastInjectedTurn = SHARED.lastInjectedTurn     // 🟠-1：同轮去重 token（跨实例共享，内存态）
 
-/** 🟠-1 的可测缝：本回合是否已注入过（同 key + 同 humanCount）。
- *  人类消息条数在同一步重试时不变 → 是"本回合"的稳定标识；用内存态而非持久化 lastTurn，
- *  避免重启后首轮被误抑制。 */
-export function injectionAlreadyDone(key, humanCount) { return lastInjectedTurn.get(key) === humanCount }
-export function markInjectionDone(key, humanCount) { lastInjectedTurn.set(key, humanCount) }
+/** 🟠-1 的可测缝：本回合是否已注入过（同 key + 同 turnToken）。
+ *  v0.6.2：token 由调用方传入**真实轮次**（pool.current.turn / meta.rounds+1）——
+ *  旧实现传的是「人类消息条数」，而它恒为 1，导致注入被永久抑制（见 pre-step 段注释）。
+ *  用内存态而非持久化 lastTurn，避免重启后首轮被误抑制。 */
+export function injectionAlreadyDone(key, token) { return lastInjectedTurn.get(key) === token }
+export function markInjectionDone(key, token) { lastInjectedTurn.set(key, token) }
 
 /** 聚合主流程：sealed 里凑满 R 个人类轮 → LLM 打包 → 入池（循环清空积压）。
  *  返回本轮实际入池篇数。 */
@@ -1367,30 +1368,45 @@ export function apply(ctx, input = {}) {
       if (!sessionId) return decision
       const key = sessionKeyFor(sessionId)
       const pool = loadPool(key, sessionId)
-      const humanCount = (decision.messages || []).filter(isHumanMessage).length
+      /* v0.6.2：**回合标识必须来自真实轮次**。
+       * 旧实现用「人类消息条数」（decision.messages 里 role=user 且非插件来源的条数）当回合号——
+       * 而 pre-step 的 messages **只带本回合的提示**，于是它恒等于 1（全库实证：**每个池的
+       * lastTurn 都是 1**、所有 heat 记录取值都是 1、所有便签 born#t1）。后果三条，全部实测：
+       *   ① `injectionAlreadyDone(key, 1)` 一旦注入过，此后**每一轮**都被判成"本回合已注入" →
+       *      **注入被永久抑制**（022e38e8 跑到第 231 轮只有 7 次注入≈每个进程生命周期只注一次）；
+       *   ② 注入记的热度全是同一回合号 → l/m 热度窗口失真 → 赛马排序失真；
+       *   ③ born_turn 恒为 1。
+       * 改用 `pool.current.turn`（turn/start 事件的真实轮次，实测 t229/t230/t231），
+       * 取不到时回退 `meta.rounds + 1`；两者取 max 保证单调不回退，且同轮内稳定。 */
+      const turnToken = Math.max(
+        Number(pool.current && pool.current.turn) || 0,
+        (Number(pool.meta && pool.meta.rounds) || 0) + 1,
+      )
       /* v0.6.0：**任何形式的唤醒都算一轮** → 聚合调度移出「有人类提问」这道门。
        * 旧实现下唤醒轮的 prompt 为空、在下面早退，聚合**永不触发**。scheduleAggregate 自带
        * 同会话去重，且 maybeAggregate 只在窗口凑满 R 时才动，重复调用是廉价 no-op。
        * ⚠ 只把**聚合**移出门外；**注入仍只发生在人类轮**（唤醒轮不注 <liubian-notes>，避免注入块膨胀）。 */
-      scheduleAggregate(ctx, cfg, sessionId, pool, humanCount)
+      scheduleAggregate(ctx, cfg, sessionId, pool, turnToken)
       const prompt = currentPrompt(decision.messages)
       if (!prompt) return decision   // 同轮后续步不重复注入（注入面）
       // 记录当前回合号（面板热度分按它算 l/m；lastTurn 持久化在池文件里）
-      if (pool.lastTurn !== humanCount) { pool.lastTurn = humanCount; savePool(pool) }
+      if (pool.lastTurn !== turnToken) { pool.lastTurn = turnToken; savePool(pool) }
       /* 🟠-1：同轮去重（内存态 token）。pre-step 在**同一步可能被多次调用**（重试/多段生成），
-       * 旧实现只有 `if (!prompt) return` 一道守卫，于是同一 humanCount 会被重复注入
-       * ——上下文里出现多份整块 <liubian-notes>，且每条命中便签被重复记热度（真实池文件里
-       * 可见 [1,1] / [16,16] 这类同回合指纹），热度 l/m 被灌水、赛马排序失真。
-       * 参照同族已验证写法（dsh-liubian 的 state.turnReminderCount !== humanCount）：
-       * 人类消息条数在同一步重试时不变，天然是"本回合"的稳定标识。
+       * 旧实现只有 `if (!prompt) return` 一道守卫，于是同一回合会被重复注入
+       * ——上下文里出现多份整块 <liubian-notes>，且每条命中便签被重复记热度。
+       * v0.6.2 更正一处历史归因：池文件里那些 [1,1] / [16,16] 指纹**不只是**同轮重复，
+       * 主因是回合标识恒为 1（见 pre-step 段注释）——所有注入都挤在同一个回合号上，
+       * 热度 l/m 因此被灌水、赛马排序失真。
+       * 参照同族已验证写法（dsh-liubian 的 state.turnReminderCount !== 回合号）：
+       * 真实轮次在同一步重试时不变，天然是"本回合"的稳定标识。
        * 用内存态而非 pool.lastTurn：持久化的话重启后首轮会被误抑制。 */
-      if (injectionAlreadyDone(key, humanCount)) return decision   // 本回合已注入过，直接放行
+      if (injectionAlreadyDone(key, turnToken)) return decision   // 本回合已注入过（同轮重试/多段生成）
       // ① 自动聚合已在上方调度（v0.6.0：唤醒轮同样触发）
       // ② 向量注入：该轮对话 + 上一轮完整问答 作查询
       const prev = previousQAPair(decision.messages, messageText, isHumanMessage)
-      const block = await injectionBlock(pool, cfg, composeQueryText(prompt, prev), humanCount)
+      const block = await injectionBlock(pool, cfg, composeQueryText(prompt, prev), turnToken)
       if (!block) return decision
-      markInjectionDone(key, humanCount)
+      markInjectionDone(key, turnToken)
       return { kind: 'enter', messages: [...decision.messages, pluginMessage(block, 'recall')] }
     } catch (err) {
       ctx.logger?.warn?.(`[dsh-liubian-notes] 本轮注入失败（已忽略，不影响对话）: ${(err && err.message) || err}`)
