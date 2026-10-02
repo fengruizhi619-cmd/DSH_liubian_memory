@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.6.3'
+export const PLUGIN_VERSION = '0.7.0'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -638,14 +638,17 @@ function findDuplicate(pool, vec, threshold) {
 }
 
 function raceEvict(pool, cfg, nowTurn) {
-  /* 赛马门槛（管理员 2026-10-01）：**缓存满 poolSize 篇后才开始赛马**——
-   * 池未满时一个都不淘汰。计数口径 = 池内全部便签（含 queued/submitted，与面板「N/10 篇」一致）；
-   * queued/submitted 本身受保护不占赛马名额（见 racableNotes）。 */
-  if (pool.notes.length < cfg.poolSize) return null
+  /* v0.7.0：**容量按总数管，受害者从"可赛马集合"里选**。
+   * 旧实现是「进来看总数、循环看可赛马数」——两者在"总数超限但可赛马数不足"时**都不淘汰**，
+   * 于是池会越过上限（有 queued/submitted 占位时尤其明显）。现在：
+   *   while (总数 >= 容量) 就腾位；受保护的便签不可被选为受害者；若全受保护则如实停手（break）。
+   * 调用方在其后 push，最终总数回到容量。 */
   let evicted = null
-  while (racableNotes(pool).length >= cfg.poolSize) {
+  while (pool.notes.length >= cfg.poolSize) {
+    const cands = racableNotes(pool)
+    if (!cands.length) break                       // 全受保护 → 腾不了位，如实停手（不假装淘汰了）
     let worst = null
-    for (const n of racableNotes(pool)) {
+    for (const n of cands) {
       const s = heatScore(n, nowTurn, cfg.heatRounds)
       if (!worst || s < worst.s || (s === worst.s && n.born_turn < worst.n.born_turn)) worst = { n, s }
     }
@@ -658,6 +661,119 @@ function raceEvict(pool, cfg, nowTurn) {
     evicted = worst.n
   }
   return evicted
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * 6.5 自动升格（v0.7.0 —— 管理员 2026-10-01 定稿）
+ *   池满（active 便签数 = poolSize）→ 取**热度最高**的一张 → 产升格请求 → 发银杏
+ *   → **立即出池**。出池后池 = 9，新便签直接补位 —— 不再需要靠赛马踢人腾位。
+ *
+ *   三条口径（管理员定）：
+ *     ① **全自动触发**：不靠人手点 promote；
+ *     ② **不回信**：便签侧**不消费**银杏的回执，落树与否由他定，本侧不依赖回执推进
+ *        （也因此不需要 settle/land 之类动作，出池即完成本侧职责）；
+ *     ③ **上传记忆只能银杏做**：本插件**绝不**调记忆侧的 wiki 写入服务、不写 wiki 库
+ *        （源码级护栏见 _dev/verify-fixes.mjs）。
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const graduateInFlight = SHARED.graduateInFlight || (SHARED.graduateInFlight = new Set())
+
+/** 池内**热度最高**的一张（并列取最旧）。只读，不改盘。 */
+export function topHeatNote(pool, nowTurn, m) {
+  let top = null
+  for (const n of racableNotes(pool)) {
+    const s = heatScore(n, nowTurn, m)
+    if (!top || s > top.s || (s === top.s && n.born_turn < top.n.born_turn)) top = { n, s }
+  }
+  return top
+}
+
+/** 同 id 只留一条升格账目：先摘旧条目再落新的。 */
+function persistGraduate(sessionKey, id, entry) {
+  removePendingEntry(sessionKey, id)
+  return appendPending(entry)
+}
+
+/** 自动升格主流程。**池未满一律不动**（管理员：放满了才送）。
+ *  返回 { ok, id?, slug?, bid?, skipped?, error? }。 */
+export async function graduateOnce(cfg, pool, logger) {
+  const m = Number(cfg.heatRounds) || Number(cfg.aggregateRounds) || 5
+  const nowTurn = Math.max(
+    Number(pool.current && pool.current.turn) || 0,
+    (Number(pool.meta && pool.meta.rounds) || 0) + 1,
+  )
+  if (racableNotes(pool).length < cfg.poolSize) return { ok: false, skipped: '池未满' }
+  const top = topHeatNote(pool, nowTurn, m)
+  if (!top) return { ok: false, skipped: '无可送审对象' }
+  const note = top.n
+  const req = await buildPromoteRequest(cfg, note, logger)
+  const svc = serviceOf('kotatsuBoard')
+  const entry = {
+    queued_at: new Date().toISOString(),
+    session_key: pool.sessionKey,
+    id: note.id,
+    head: note.head,
+    body: note.body,                       // v0.7.0：账目带**全文**（v0.6.3 漏了；退回/审计要用）
+    born_turn: note.born_turn,
+    source: note.source,
+    workspace: String(cfg.workspace || '工作组').trim(),
+    request: { slug: req.slug, title: req.title, intro: req.intro, gen: req.gen },
+    heat_at_send: Number(top.s.toFixed(3)),
+    auto: true,
+    sent: false,
+  }
+  if (!svc || typeof svc.send !== 'function') {
+    entry.last_error = 'kotatsuBoard v1 服务不可用'
+    persistGraduate(pool.sessionKey, note.id, entry)
+    logger?.warn?.('[dsh-liubian-notes] 自动升格未送出（' + entry.last_error + '）：' + note.id + ' 留在池内，账目 sent:false')
+    return { ok: false, id: note.id, error: entry.last_error }
+  }
+  let res = null
+  try {
+    res = await svc.send({
+      to: BOARD_TO,
+      subject: '便签升格请求｜' + (req.title || note.head),
+      content: req.content,
+      fromName: BOARD_FROM,
+      fromRef: 'notes:' + pool.sessionKey + '/' + note.id,
+    })
+  } catch (err) { res = { ok: false, error: (err && err.message) || String(err) } }
+  if (!res || res.ok !== true) {
+    entry.last_error = String((res && res.error) || '未知错误（返回形状异常）')
+    persistGraduate(pool.sessionKey, note.id, entry)
+    logger?.warn?.('[dsh-liubian-notes] 自动升格送达失败（' + entry.last_error + '）：' + note.id + ' 留在池内，账目 sent:false')
+    return { ok: false, id: note.id, error: entry.last_error }
+  }
+  entry.sent = true
+  entry.bid = res.bid
+  entry.sent_at = new Date().toISOString()
+  persistGraduate(pool.sessionKey, note.id, entry)
+  /* **出池**：内容已随请求交给银杏，本侧不再持有 → 腾出槽位给新便签 */
+  pool.notes = pool.notes.filter((x) => x !== note)
+  if (!Array.isArray(pool.graduated)) pool.graduated = []
+  pool.graduated.push({
+    id: note.id, head: note.head, slug: req.slug, bid: res.bid,
+    heat: Number(top.s.toFixed(3)), at: new Date().toISOString(),
+  })
+  const saved = savePool(pool)
+  logger?.info?.(
+    '[dsh-liubian-notes] 自动升格出池 ' + note.id + '「' + firstLine(note.head, 30) + '」→ ' + BOARD_TO
+    + '（board #' + res.bid + '｜热度 ' + top.s.toFixed(2) + '｜slug ' + req.slug + '）'
+    + (saved ? '' : '（⚠ 落盘失败）'),
+  )
+  return { ok: true, id: note.id, slug: req.slug, bid: res.bid }
+}
+
+/** fire-and-forget 调度（同会话去重）：LLM 提炼耗时绝不卡当轮。 */
+export function scheduleGraduate(ctx, cfg, pool) {
+  const key = pool.sessionKey
+  if (graduateInFlight.has(key)) return
+  graduateInFlight.add(key)
+  void (async () => {
+    try { await withPoolLock(key, () => graduateOnce(cfg, pool, ctx.logger)) }
+    catch (err) { ctx.logger?.warn?.('[dsh-liubian-notes] 自动升格失败（下轮重试）: ' + ((err && err.message) || err)) }
+    finally { graduateInFlight.delete(key) }
+  })()
 }
 
 /** 入池主流程（判重 → 赛马 → 向量补齐 → 落盘）。draft 带已有便签（restore）则保留原 ID。 */
@@ -1440,16 +1556,20 @@ export function apply(ctx, input = {}) {
     name: 'note',
     description: '流变·便签（本对话的短期记忆池）。action=list 看池+热度；show 读全文；'
       + 'stick 主动挂起便签（head=一句话简介即向量来源，body=正文；与自动便签同规则）；'
-      + 'promote 升格请求（产出语义 slug + 三段式并直发银杏校验，家族由银杏定）；'
+      + 'promote 升格请求（产出语义 slug + 三段式并直发银杏校验，家族由银杏定；**池满时会自动触发并把该便签移出池**）；'
       + 'unqueue 解除待固化（queued→active 并摘除 pending 条目，串池误标后的修复路径）；drop/restore 回收站。'
       + '默认操作本对话的池（＝调用方会话）；session 可选，用于显式指定别的会话。',
     parameters: {
       action: { type: 'string', required: true, description: 'list | show | stick | promote | unqueue | drop | restore', enum: ['list', 'show', 'stick', 'promote', 'unqueue', 'drop', 'restore'] },
       head: { type: 'string', description: 'stick 用：便签头（一句话简介，向量来源）' },
       body: { type: 'string', description: 'stick 用：便签正文' },
-      id: { type: 'string', description: 'show/promote/drop/restore 用：便签 ID，如 NT-1' },
+      id: { type: 'string', description: 'show/promote/unqueue/drop/restore 用：便签 ID，如 NT-1' },
       session: { type: 'string', description: '可选：会话标识；省略即本对话的池（＝调用方会话）；解析不到调用方会话时明确报错，不会回落到其他会话的池' },
       workspace: { type: 'string', description: 'promote 用：目标工作区（默认记忆侧配置）' },
+      /* v0.7.0：补声明 —— 实现里 list/stick/restore 三处都在读 args.nowTurn，
+       * 而 schema 一直没有它 → 任何照 schema 调的调用方永远拿不到（list 因此永远只能显示
+       * 「N 条」原始记录数、显示不出 l/m 热度窗口分）。同类缺口参考：wiki move 的 newFamilyPath。 */
+      nowTurn: { type: 'number', description: '可选：当前回合号。list 用它把热度显示成 l/m 窗口分；stick/restore 用它标 born_turn（省略则按池内进度推定）' },
     },
     async execute(args, exec) {
       // 🔴-9：第 2 形参（调用方上下文）必须转发——旧包装只接 args，exec 被丢掉，
@@ -1556,6 +1676,8 @@ export function apply(ctx, input = {}) {
        * 同会话去重，且 maybeAggregate 只在窗口凑满 R 时才动，重复调用是廉价 no-op。
        * ⚠ 只把**聚合**移出门外；**注入仍只发生在人类轮**（唤醒轮不注 <liubian-notes>，避免注入块膨胀）。 */
       scheduleAggregate(ctx, cfg, sessionId, pool, turnToken)
+      /* v0.7.0 自动升格：**池满才动**（graduateOnce 内部判），服务不可用则留在池内 */
+      scheduleGraduate(ctx, cfg, pool)
       const prompt = currentPrompt(decision.messages)
       if (!prompt) return decision   // 同轮后续步不重复注入（注入面）
       // 记录当前回合号（面板热度分按它算 l/m；lastTurn 持久化在池文件里）
@@ -1622,6 +1744,7 @@ export const __test = {
   maybeAggregate, noteToolAction, embedTexts, pluginMessage, messageText,
   isHumanMessage, currentPrompt, bumpStats, shouldSealTurn, pendingPromotionsFile, removePendingEntry,
   pendingEntry, buildPromoteRequest, fallbackPromoteRequest, slugifyHead, serviceOf, __testSetCtx,
+  topHeatNote, graduateOnce, scheduleGraduate, appendPending, raceEvict, racableNotes,
   /* L157 `function quarantinePool(key)`（坏池隔离）、L683 `export function pendingHasId(...)`（promote 幂等） */
   pendingHasId, quarantinePool,
   injectionAlreadyDone, markInjectionDone, backfillVectors,
