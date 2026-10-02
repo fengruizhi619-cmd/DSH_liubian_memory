@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.6.2'
+export const PLUGIN_VERSION = '0.6.3'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -467,6 +467,158 @@ export async function generateNoteViaLlm(cfg, turns) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * 5.5 升格请求（v0.6.3 —— 管理员 2026-10-01 定的新升格流）
+ *   promote → 产出「升格请求」（语义 slug + 三段式结论/机制/终态 + 来源痕迹）
+ *          → 经被炉 kotatsuBoard v1 直发**银杏**校验
+ *          → 银杏定 familyPath + 查重归并 → 他落树 → 回执 slug
+ *   便签侧**不再猜家族**（挑家族本质是归并判断，只有能看到全树的人做得准）。
+ *   本地 pending_promotions.jsonl 降级为**账目**（请求内容 + 送没送出去 + bid）。
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const BOARD_TO = '银杏'          // 升格请求的固定校验方（管理员 2026-10-01 定）
+const BOARD_FROM = '流变便签'
+
+/** v0.6.3：模块级 ctx 句柄 —— 工具动作里要取跨插件服务（服务通道没有 exec 概念）。 */
+let currentCtx = null
+/** 仅供测试缝使用：注入/复位 ctx（生产路径由 apply 赋值）。 */
+export function __testSetCtx(c) { currentCtx = c }
+
+/** 取跨插件服务：ctx.reflect.get(name) 优先、ctx.get(name) 回退，皆无 → null（缺席不抛）。 */
+export function serviceOf(name) {
+  const c = currentCtx
+  if (!c) return null
+  try {
+    const s = c.reflect && typeof c.reflect.get === 'function' ? c.reflect.get(name) : null
+    if (s) return s
+  } catch { /* 反射失败按缺席处理 */ }
+  try { return typeof c.get === 'function' ? c.get(name) : null } catch { return null }
+}
+
+/** 语义 slug（禁池内编号、禁斜杠）：从便签头蒸馏，纯启发式，作为回退与 LLM 输出的校验基线。 */
+export function slugifyHead(head) {
+  const s = String(head || '')
+    .replace(/[\\/:*?"<>|#@\s]+/g, '')
+    .replace(/[，。；：、！？（）【】「」『』…—～·]+/g, '')
+    .trim()
+  return (s.slice(0, 24) || '便签升格')
+}
+
+/** LLM 不可用时的回退请求：**如实标注未提炼**（gen=fallback），不假装做过三段式。 */
+export function fallbackPromoteRequest(note) {
+  const head = String(note.head || '').trim() || '（无头）'
+  const body = String(note.body || '').trim()
+  return {
+    slug: slugifyHead(head),
+    title: head.slice(0, 30),
+    intro: firstLine(head, 120),
+    conclusion: body || '（正文为空）',
+    mechanism: '',
+    endState: '',
+    gen: 'fallback',
+  }
+}
+
+const PROMOTE_PROMPT_HEAD = [
+  '把下面这张便签整理成一条 wiki 条目的「升格请求」。**只输出一个 JSON 对象**，不要解释、不要代码围栏。',
+  '字段与要求：',
+  '  slug：语义标识，6~24 字符，中文或英数，**不含斜杠**，能概括主题；禁止使用 NT-1 这类池内编号。',
+  '  title：条目标题，≤30 字。',
+  '  intro：一句话简介，是**检索主锚**——写清主题与关键术语，便于日后按语义命中，≤120 字。',
+  '  conclusion：结论（TL;DR，一两句把结果说死）。',
+  '  mechanism：机制（为什么/怎么做到的）。',
+  '  endState：终态（现在是什么状态、还挂着什么待办）。',
+  '提交号、版本号、轮次流水**不要**写进三段，它们会由调用方降为末行「来源」痕迹。',
+  '便签如下：',
+].join('\n')
+
+/** LLM 提炼升格请求；任何失败返回 null → 调用方回退 fallbackPromoteRequest。 */
+export async function generatePromoteRequestViaLlm(cfg, note) {
+  try {
+    const fresh = readJson(memoryConfigFile()) || {}
+    const useUrl = fresh.llmApiUrl || cfg.diaryApiUrl
+    const useKey = fresh.llmApiKey || cfg.diaryApiKey
+    const useModel = fresh.llmApiModel || cfg.diaryApiModel
+    if (!useKey) return null
+    const head = String(note.head || '').trim()
+    const body = String(note.body || '').trim()
+    const text = PROMOTE_PROMPT_HEAD + '\n' + head + '\n' + body
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), cfg.llmTimeoutMs)
+    try {
+      const res = await fetch(useUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + useKey },
+        body: JSON.stringify({ model: useModel, messages: [{ role: 'user', content: text }] }),
+        signal: controller.signal,
+      })
+      if (!res.ok) return null
+      const data = JSON.parse(await res.text())
+      const content = data && data.choices && data.choices[0] && data.choices[0].message
+        ? String(data.choices[0].message.content || '') : ''
+      const m = /\{[\s\S]*\}/.exec(content)
+      if (!m) return null
+      const p = JSON.parse(m[0])
+      const out = {
+        slug: String(p.slug || '').trim().replace(/\//g, ''),
+        title: String(p.title || '').trim(),
+        intro: String(p.intro || '').trim(),
+        conclusion: String(p.conclusion || '').trim(),
+        mechanism: String(p.mechanism || '').trim(),
+        endState: String(p.endState || '').trim(),
+        gen: 'llm',
+      }
+      if (!out.slug || !out.intro || !out.conclusion) return null
+      if (/^promote-NT-/i.test(out.slug)) return null      // 池内编号当 slug = 违规，宁可回退
+      return out
+    } finally { clearTimeout(timer) }
+  } catch { return null }
+}
+
+/** 组装升格请求：LLM 优先、失败回退；**不含 familyPath**（家族由银杏定）。 */
+export async function buildPromoteRequest(cfg, note, logger) {
+  const head = String(note.head || '').trim()
+  const body = String(note.body || '').trim()
+  let req = cfg.noteLlmGen === false ? null : await generatePromoteRequestViaLlm(cfg, note)
+  if (!req) {
+    req = fallbackPromoteRequest(note)
+    logger?.warn?.('[dsh-liubian-notes] 升格请求走回退提炼（LLM 不可用或未配置 Key）——已如实标注 gen=fallback')
+  }
+  const seg = (label, v) => (String(v || '').trim() ? label + '：' + String(v).trim() + '\n' : '')
+  const content = [
+    '【便签升格请求】' + (req.gen === 'llm' ? '（LLM 三段提炼）' : '（⚠ 回退提炼，未做三段式，请银杏多看一眼）'),
+    '建议 slug：' + req.slug,
+    '建议标题：' + (req.title || head),
+    '一句话简介（检索主锚）：' + req.intro,
+    '内容（三段式）：',
+    seg('结论', req.conclusion) + seg('机制', req.mechanism) + seg('终态', req.endState),
+    '来源痕迹：便签 ' + note.id + '｜生成 ' + req.gen + '｜原文：',
+    body,
+    '—— 请校验：① slug 是否与现有条目冲突或应归并；② 该挂到哪棵家族（家族由你定，我不猜）；',
+    '③ 是否与既有条目重叠（多切片归并优先）。落树后回执 slug，我侧把该便签改判 submitted。',
+  ].join('\n')
+  return Object.assign({}, req, { head, content })
+}
+
+/** 按（会话, 便签）读 pending 账目里最后一条；无则 null。 */
+export function pendingEntry(sessionKey, id) {
+  const wantId = String(id || '')
+  if (!wantId) return null
+  try {
+    const file = pendingPromotionsFile()
+    if (!existsSync(file)) return null
+    let found = null
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const e = JSON.parse(line.replace(/^\uFEFF/, ''))
+        if (e && String(e.id) === wantId && String(e.session_key) === String(sessionKey)) found = e
+      } catch { /* 坏行跳过 */ }
+    }
+    return found
+  } catch { return null }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  * 6. 入池：判重（>阈值拒收，回收站也参与）→ 赛马（满员踢最低分）→ 落盘
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -749,22 +901,10 @@ export function removePendingEntry(sessionKey, id) {
   } catch { return -1 }
 }
 
-/** 升格标签：便签升格 + 会话工作区名 + 2~3 个内容关键词（补位去重，复用型填充）。 */
-export function buildPromoteTags(head, workspace) {
-  const words = String(head || '')
-    .split(/[^\u4e00-\u9fffA-Za-z0-9]+/)
-    .map(s => s.trim())
-    .filter(s => s.length >= 2)
-  const uniq = [...new Set(words)]
-  uniq.sort((a, b) => b.length - a.length)
-  const tags = ['便签升格', String(workspace || '').trim() || '未知工作区', ...uniq.slice(0, 3)]
-  const seen = new Set(tags)
-  for (const filler of ['待整理', '短期记忆', '流变便签']) {
-    if (tags.length >= 5) break
-    if (!seen.has(filler)) { tags.push(filler); seen.add(filler) }
-  }
-  return [...new Set(tags)].slice(0, 5)
-}
+/* v0.6.3：此处原有的「五连发升格标签」派生（'便签升格' + 工作区名 + 头内取词 + 补位填充）
+ * 已整段删除——新升格流的定位是 **语义 slug + 三段式 + 银杏定家族**，标签那一层不再存在。
+ * 它也从来不是"误派生"的受害者（真因是串池，见 🔴-9）：它按设计工作，只是设计作废了。
+ * ⚠ 不要加回来：_dev/verify-fixes.mjs 有源码级护栏断言它 0 引用（含注释）。 */
 
 /* ──────────────────────────────────────────────────────────────────────────
  * 10. 工具面：_dsh_external_dsh_liubian_note
@@ -845,38 +985,66 @@ export async function noteToolAction(cfg, args = {}, logger, exec = null) {
   }
 
   if (action === 'promote') {
-    // 晋级缓存制（管理员 2026-10-01）：固化通道暂缓，先入 pending 队列，
-    // 将来经被炉 P2P + 独特名系统提交 wiki。
+    /* v0.6.3（管理员 2026-10-01 定的新升格流）：promote 不再自己挑家族、也不再"只入本地队列等通道"——
+     * 而是**产出升格请求并直发银杏校验**（他定 familyPath、查重/归并），他落树后回执 slug。
+     * 本地 pending 降级为**账目**（请求内容 + 送没送出去 + bid）。
+     * 纪律：服务不可用或送达失败 → **明确报错 + 账目留 sent:false**，绝不静默丢。 */
     return withPoolLock(pool.sessionKey, async () => {
       const note = pool.notes.find(n => n.id === String(args.id || ''))
       if (!note) return `[未找到] 便签 ${args.id}。`
-      if (note.status === 'queued') return `[跳过] ${note.id} 已在待固化缓存里。`
-      if (note.status === 'submitted') return `[跳过] ${note.id} 已固化（${note.diary_ref}）。`
-      /* 🟡-5：pending 队列按 id 去重。旧实现只在池内状态上判重，而「队列已写入、note.status
-       * 置位前 savePool 失败」会留下队列有记录、池内仍 active 的错位 → 再次 promote 重复入队。 */
-      if (pendingHasId(pool.sessionKey, note.id)) {
+      if (note.status === 'submitted') return `[跳过] ${note.id} 已固化（${note.diary_ref || '已落树'}）。`
+      const prev = pendingEntry(pool.sessionKey, note.id)
+      if (prev && prev.sent) {
         note.status = 'queued'
         savePool(pool)
-        return `[跳过] ${note.id} 已在 pending_promotions.jsonl 里（已把池内状态补正为 queued）。`
+        return `[跳过] ${note.id} 的升格请求已发出（board #${prev.bid || '?'}），等银杏校验并定家族。`
       }
       const ws = String(args.workspace || cfg.workspace || '工作组').trim()
+      const req = await buildPromoteRequest(cfg, note, logger)
+      const svc = serviceOf('kotatsuBoard')
       const entry = {
         queued_at: new Date().toISOString(),
         session_key: pool.sessionKey,
         id: note.id,
         head: note.head,
-        body: note.body,
         born_turn: note.born_turn,
         source: note.source,
         workspace: ws,
-        tags: buildPromoteTags(note.head, ws),
+        request: { slug: req.slug, title: req.title, intro: req.intro, gen: req.gen },
+        sent: false,
       }
-      if (!appendPending(entry)) return '[失败] 写入 pending_promotions.jsonl 未成功（便签保持原状态，可重试）。'
+      /* 同 id 只留一条账目：重发路径先摘旧条目再落新的（不追求跨文件原子，账目可容忍） */
+      const persist = (e) => { if (prev) removePendingEntry(pool.sessionKey, note.id); return appendPending(e) }
+      if (!svc || typeof svc.send !== 'function') {
+        entry.last_error = 'kotatsuBoard v1 服务不可用（被炉未 provide 或未装载）'
+        const wrote = persist(entry)
+        return `[失败] ${entry.last_error} —— 升格请求未发出，便签保持 ${note.status}。`
+          + (wrote ? '请求已留在 pending_promotions.jsonl 账目（sent:false），服务恢复后重发 promote 即可。' : '（⚠ 连账目都没写成功，请检查数据目录权限）')
+      }
+      let res = null
+      try {
+        res = await svc.send({
+          to: BOARD_TO,
+          subject: '便签升格请求｜' + (req.title || note.head),
+          content: req.content,
+          fromName: BOARD_FROM,
+          fromRef: 'notes:' + pool.sessionKey + '/' + note.id,
+        })
+      } catch (err) { res = { ok: false, error: (err && err.message) || String(err) } }
+      if (!res || res.ok !== true) {
+        entry.last_error = String((res && res.error) || '未知错误（返回形状异常）')
+        persist(entry)
+        return `[失败] 升格请求未送达银杏：${entry.last_error}（便签保持 ${note.status}；账目 sent:false，可重试）。`
+      }
+      entry.sent = true
+      entry.bid = res.bid
+      entry.sent_at = new Date().toISOString()
+      persist(entry)
       note.status = 'queued'
-      const savedOk = savePool(pool)   // 🟡-1：回执反映真实持久化状态
-      return `已缓存待固化：${note.id} → pending_promotions.jsonl（标签 ${entry.tags.join('/')}）。`
-        + `通道就绪（被炉 P2P + 独特名）前只累积不提交。`
-        + (savedOk ? '' : '（⚠ 池状态落盘失败：队列条目已在，池内状态仅内存生效，下轮写入会重试）')
+      const savedOk = savePool(pool)
+      return `升格请求已发出：${note.id} → ${BOARD_TO}（board #${res.bid}｜建议 slug ${req.slug}｜提炼 ${req.gen}）。`
+        + `等银杏校验并定家族后落树；他回执 slug 后本便签改判 submitted。`
+        + (savedOk ? '' : '（⚠ 池状态落盘失败：账目已在，池内状态仅内存生效）')
     })
   }
 
@@ -1259,6 +1427,7 @@ export function shouldSealTurn(turn) {
 export function apply(ctx, input = {}) {
   const cfg = resolveConfig(input)
   currentLogger = ctx.logger || null      // 🟡-1：模块级日志句柄，落盘/隔离失败要能留痕
+  currentCtx = ctx                         // v0.6.3：服务通道句柄（reflect.get('kotatsuBoard')）
   if (cfg.enabled === false) {
     ctx.logger?.info?.('[dsh-liubian-notes] 已通过配置停用（enabled=false），本轮不挂载任何钩子与工具')
     return
@@ -1271,7 +1440,7 @@ export function apply(ctx, input = {}) {
     name: 'note',
     description: '流变·便签（本对话的短期记忆池）。action=list 看池+热度；show 读全文；'
       + 'stick 主动挂起便签（head=一句话简介即向量来源，body=正文；与自动便签同规则）；'
-      + 'promote 手动晋级（当前为缓存制：入 pending 队列等固化通道）；'
+      + 'promote 升格请求（产出语义 slug + 三段式并直发银杏校验，家族由银杏定）；'
       + 'unqueue 解除待固化（queued→active 并摘除 pending 条目，串池误标后的修复路径）；drop/restore 回收站。'
       + '默认操作本对话的池（＝调用方会话）；session 可选，用于显式指定别的会话。',
     parameters: {
@@ -1451,7 +1620,8 @@ export const __test = {
   previousQAPair, buildNotesBlock, buildPackPrompt, generateNoteViaLlm,
   addNoteToPool, loadPool, savePool, loadRetired, saveRetired, injectionBlock,
   maybeAggregate, noteToolAction, embedTexts, pluginMessage, messageText,
-  isHumanMessage, currentPrompt, bumpStats, shouldSealTurn, buildPromoteTags, pendingPromotionsFile, removePendingEntry,
+  isHumanMessage, currentPrompt, bumpStats, shouldSealTurn, pendingPromotionsFile, removePendingEntry,
+  pendingEntry, buildPromoteRequest, fallbackPromoteRequest, slugifyHead, serviceOf, __testSetCtx,
   /* L157 `function quarantinePool(key)`（坏池隔离）、L683 `export function pendingHasId(...)`（promote 幂等） */
   pendingHasId, quarantinePool,
   injectionAlreadyDone, markInjectionDone, backfillVectors,

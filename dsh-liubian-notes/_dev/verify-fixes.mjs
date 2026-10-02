@@ -420,6 +420,65 @@ const cfg = T.resolveConfig({})
   check('v0.6.2 token 随完成轮次递增', Number.isFinite(tk1) && tk2 > tk1, 'tk1=' + tk1 + ' tk2=' + tk2)
 }
 
+/* v0.6.3：promote = 产出升格请求 → 直发银杏（家族由银杏定，便签侧不猜） */
+{
+  try {
+  const s = 'sess-v063-promote'
+  const k = K(s)
+  T.savePool(basePool(k, {
+    sessionId: s,
+    notes: [{
+      id: 'NT-1', source: 'auto', status: 'active', born_turn: 1, heat: [],
+      head: '云端 LoRA 停训与复现对比结论',
+      body: '结论：复现成立（逐窗 mean|Δ|=6.84e-4）。机制：bf16 非确定性，不是代码错。终态：云端已空闲，待跑 ep2/ep3。',
+    }],
+  }))
+  const cfgNoLlm = Object.assign({}, cfg, { noteLlmGen: false })
+
+  /* ① 提炼：回退路径也要合规（无斜杠、禁池编号、含三段式与来源、且不猜家族） */
+  const req = await T.buildPromoteRequest(cfgNoLlm, T.loadPool(k, s).notes[0], null)
+  check('v0.6.3 回退提炼：slug 合规（无斜杠、非池编号）',
+    !!req.slug && req.slug.indexOf('/') < 0 && !/^promote-NT-/.test(req.slug), 'slug=' + req.slug)
+  check('v0.6.3 请求含三段式 + 来源痕迹，且不含 familyPath（家族由银杏定）',
+    /结论/.test(req.content) && /机制/.test(req.content) && /终态/.test(req.content)
+    && /来源痕迹/.test(req.content) && req.content.indexOf('familyPath') < 0, 'gen=' + req.gen)
+
+  /* ② 无服务 → 明确报错 + 账目 sent:false + 池状态不动（绝不静默丢） */
+  T.__testSetCtx(null)
+  const noSvc = await T.noteToolAction(cfgNoLlm, { action: 'promote', id: 'NT-1', session: s }, null)
+  check('v0.6.3 无 board 服务 → 明确报错且不置 queued',
+    /失败/.test(noSvc) && T.loadPool(k, s).notes[0].status === 'active', String(noSvc).slice(0, 30))
+  const e1 = T.pendingEntry(k, 'NT-1')
+  check('v0.6.3 请求未丢：账目落 sent=false 且带 slug',
+    !!e1 && e1.sent === false && !!(e1.request && e1.request.slug), 'sent=' + (e1 && e1.sent))
+
+  /* ③ 服务可用且送达 → queued + bid 入账，且只发一次 */
+  const calls = []
+  T.__testSetCtx({ reflect: { get: (n) => (n === 'kotatsuBoard' ? {
+    version: 1,
+    send: async (a) => { calls.push(a); return { ok: true, bid: 42, to: '银杏' } },
+  } : null) } })
+  const okOut = await T.noteToolAction(cfgNoLlm, { action: 'promote', id: 'NT-1', session: s }, null)
+  check('v0.6.3 送达 → queued 且回执带 bid',
+    /42/.test(okOut) && T.loadPool(k, s).notes[0].status === 'queued', String(okOut).slice(0, 34))
+  check('v0.6.3 收件人=银杏、fromRef 带池键（svc: 由被炉打）',
+    calls.length === 1 && calls[0].to === '银杏' && String(calls[0].fromRef).indexOf(k + '/NT-1') >= 0,
+    JSON.stringify({ to: calls[0] && calls[0].to, fromRef: calls[0] && calls[0].fromRef }))
+  const dup = fs.readFileSync(T.pendingPromotionsFile(), 'utf8').split('\n')
+    .filter(Boolean).filter((l) => l.indexOf(k) >= 0 && l.indexOf('"NT-1"') >= 0).length
+  check('v0.6.3 同 id 账目不重复两条', dup === 1, 'entries=' + dup)
+
+  /* ④ 幂等：已发出的再 promote → 只回跳过，不重发 */
+  const again = await T.noteToolAction(cfgNoLlm, { action: 'promote', id: 'NT-1', session: s }, null)
+  check('v0.6.3 已发出 → 再 promote 只回跳过（不重发）',
+    /跳过/.test(again) && calls.length === 1, String(again).slice(0, 26) + '｜calls=' + calls.length)
+  } catch (err) {
+    check('v0.6.3 升格请求用例组可运行（符号齐备）', false, '抛错：' + ((err && err.message) || err))
+  } finally {
+    try { if (T.__testSetCtx) T.__testSetCtx(null) } catch { /* 复位失败无妨 */ }
+  }
+}
+
 /* 🔴-8 真行为回归（**放在最后**：它会真的 apply 并最终 dispose，之后本进程不再能落盘）：
  * `ctx.effect(fn)` 的 fn 是「立即执行」的注册面，f返回的函数才是清理器。
  * 旧 bug：`disposed = true` 写在 fn 体里 → 实例**挂载瞬间即自我标记已卸载** →
