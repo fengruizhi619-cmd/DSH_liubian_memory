@@ -1757,6 +1757,84 @@ export function disposeContextInjection() {
   contextStates.clear()
 }
 
+/* ══ 跨插件服务：liubianWiki v1（2026-10-02）═════════════════════════════════
+ * 为什么要有它：**便签升格要在插件内写 wiki**，而 wiki 此前只有 agent 侧工具
+ * （`_dsh_external_dsh_liubian_wiki`）——插件代码调不到工具面。家族先例＝基建的
+ * `liubianInfra`：单写者 + 单一事实源 + 消费方只走服务、**不跨库写**。
+ *
+ * 归因（〈升格流落树约定〉规则 7）：服务调用**没有「调用方会话」**这个概念，因此由
+ * 调用方给出**来源会话哈希** `sessionHash`（便签侧＝便签所属会话的哈希），仍走同一
+ * 两级解析：bindings 命中 → 该身份 + `binding`；否则用 `workspace` 兜底 +
+ * `workspace-fallback` 并在 summary 附加标注。**服务不接受自由格式的执行者名**——
+ * 只能给会话哈希，身份仍由注册中心裁决，冒名在结构上依然不可能。
+ * `contributor`（= `sourceContributor`）依旧只落「内容来源者」。
+ *
+ * 降级纪律（与便签侧约定）：服务不可用 → 调用方**明确报错并保留自己的 pending 队列**，
+ * 不许静默丢。本服务自身也绝不抛，一律折 `{ ok:false, error }`。
+ *
+ * ⚠ 位置：**必须定义在 `__test` 之前**——`__test` 在模块初始化时求值，引用尾部 const
+ *   会踩 TDZ（2026-10-02 实测踩过一次）。
+ */
+export const WIKI_SERVICE_VERSION = 1
+export const WIKI_SERVICE_METHODS = ['create', 'update', 'get', 'tree', 'list', 'move', 'rollback']
+
+/** 服务方法 → helper 请求（纯函数，便于桩测：只做方法名 → op 的映射与合法性校验）。 */
+export function wikiServiceRequest(method, req = {}) {
+  const op = String(method || '').toLowerCase()
+  if (!WIKI_SERVICE_METHODS.includes(op)) return null
+  return { ...req, op }
+}
+
+/** 建服务对象。`opts.env` 仅自测/预演用（可把 LU_DB 指到真库副本）。 */
+export function buildWikiService(cfg, opts = {}) {
+  const env = opts.env || undefined
+  const call = async (method, req) => {
+    const payload = wikiServiceRequest(method, req)
+    if (!payload) return { ok: false, error: `未知 wiki 服务方法：${method}` }
+    try {
+      const raw = await runHelperAsync(cfg, 'wiki_store', [], {
+        timeoutMs: Math.max(15000, Number(cfg.memoryTimeoutMs) || 60000),
+        stdin: JSON.stringify(payload),
+        ...(env ? { env } : {}),
+      })
+      const text = String(raw || '').trim()
+      if (!text) return { ok: false, error: 'wiki_store 无输出（helper 未启动或异常退出）' }
+      try {
+        return JSON.parse(text)
+      } catch {
+        return { ok: false, error: 'wiki_store 输出非 JSON：' + text.slice(0, 200) }
+      }
+    } catch (e) {
+      return { ok: false, error: 'wiki_store 调用失败：' + ((e && e.message) || String(e)) }
+    }
+  }
+  const svc = { version: WIKI_SERVICE_VERSION }
+  for (const m of WIKI_SERVICE_METHODS) svc[m] = (req = {}) => call(m, req)
+  return svc
+}
+
+/** 挂服务：`ctx.provide` 优先 / `ctx.reflect.provide` 回退 / 皆无则明确告警（不静默）。 */
+function provideWikiService(ctx, cfg) {
+  const svc = buildWikiService(cfg)
+  const arm = (label, fn) => {
+    try {
+      const disposer = fn('liubianWiki', svc)
+      ctx.logger?.info?.(`[dsh-liubian] 跨插件服务已挂载：liubianWiki v${svc.version}（${label}）`)
+      return disposer
+    } catch (e) {
+      ctx.logger?.warn?.(`[dsh-liubian] 跨插件服务挂载失败（${label}）：${(e && e.message) || e}`)
+      return undefined
+    }
+  }
+  if (typeof ctx.provide === 'function') {
+    ctx.effect(() => arm('ctx.provide', (n, v) => ctx.provide(n, v)), 'dsh-liubian: 跨插件服务')
+  } else if (typeof ctx.reflect?.provide === 'function') {
+    ctx.effect(() => arm('ctx.reflect.provide', (n, v) => ctx.reflect.provide(n, v)), 'dsh-liubian: 跨插件服务')
+  } else {
+    ctx.logger?.warn?.('[dsh-liubian] 宿主无 provide 通道（ctx.provide / ctx.reflect.provide 皆不可用）——wiki 写入服务未挂载；wiki 工具面不受影响')
+  }
+}
+
 /** 纯函数测试缝（自检 / 诊断用，不参与运行时）。 */
 export const __test = {
   candidateTags,
@@ -1816,6 +1894,10 @@ export const __test = {
   // - 归因二分（规则 7）-
   sessionHashFor,
   buildWikiRequest,
+  // - 跨插件服务 liubianWiki -
+  wikiServiceRequest,
+  buildWikiService,
+  WIKI_SERVICE_METHODS,
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -2914,6 +2996,9 @@ export function apply(ctx, input = {}) {
   }
 
   registerTools(ctx, cfg)
+
+  // 跨插件服务：便签升格等消费方在**插件内**写 wiki 的唯一通道（工具面插件调不到）
+  provideWikiService(ctx, cfg)
 
   // 上下文插入：会话启动身份卡 + 每轮联合检索注入（对照 DSH 记忆插件的接线）
   mountContextInjection(ctx, cfg)

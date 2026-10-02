@@ -17,6 +17,7 @@ const {
   pluginMessage, messageText, isOurMessage, isPluginMessage, isHumanMessage,
   promptText, currentPrompt, isFreshUserPrompt, estimateTokens, clipText, embedTexts,
   sessionHashFor, buildWikiRequest,
+  wikiServiceRequest, buildWikiService, WIKI_SERVICE_METHODS,
 } = __test
 
 let pass = 0
@@ -216,6 +217,32 @@ t('diaryWorkspace 固定值优先于推导', () => {
 t('cwd 不在 liubianRoot 下 → 回落默认工作区', () => {
   const other = { session: { id: 's', header: { cwd: 'C:\\Windows\\System32' } } }
   eq(buildWikiRequest(wcfg, { action: 'create' }, other).workspace, '工作组')
+})
+
+/* ── 7. 跨插件服务 liubianWiki（便签升格的写入通道） ────────────────────── */
+console.log('\n== liubianWiki 服务面 ==')
+t('方法 → op 映射（大小写不敏感、业务字段原样透传）', () => {
+  const r = wikiServiceRequest('create', { slug: 's', familyPath: 's', title: 't' })
+  eq(r.op, 'create')
+  eq(r.slug, 's')
+  eq(r.familyPath, 's')
+  eq(wikiServiceRequest('CREATE', { slug: 's' }).op, 'create')
+})
+t('非法/退役方法一律拒（不静默兜底成 create）', () => {
+  eq(wikiServiceRequest('drop', {}), null)
+  eq(wikiServiceRequest('', {}), null)
+  eq(wikiServiceRequest('write', {}), null, '已退役的 write 必须被拒')
+  eq(wikiServiceRequest('search', {}), null, 'search 需要向量，不在服务面')
+})
+t('服务对象：版本 + 七个方法全为函数', () => {
+  const svc = buildWikiService({ memoryTimeoutMs: 1000 })
+  eq(svc.version, 1)
+  eq(WIKI_SERVICE_METHODS.length, 7)
+  for (const m of WIKI_SERVICE_METHODS) ok(typeof svc[m] === 'function', `${m} 应是函数`)
+})
+t('未知方法名不在服务面上（不是函数）', () => {
+  const svc = buildWikiService({ memoryTimeoutMs: 1000 })
+  eq(svc.drop, undefined)
 })
 
 console.log(`\n== 结果：${pass} 过 / ${fail} 败 ==`)
