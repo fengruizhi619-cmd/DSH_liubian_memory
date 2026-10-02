@@ -57,6 +57,9 @@ export const DEFAULTS = {
   serverCwd: 'E:/llama.cpp',
   readyTimeoutMs: 45000,
   probeTimeoutMs: 3000,
+  /** 功能性自检超时（2026-10-02 补）：真发一次 embeddings 的等待上限。正常 10~30ms；
+   *  进入"僵死态"（/health 200 但干不了活）时它会超时——这正是我们要看见的信号。 */
+  probeEmbedTimeoutMs: 8000,
   /** v0.2.0 挂牌迁移：服务所有权划归基建（与 embed 插件默认值一致，键名同名） */
   autoEnsureOnLoad: true,
   /** 内存看门狗：llama-server 私有提交超限自动重启（泄漏史：5.5h→10.9GB，重启释放 9.2GB）
@@ -690,6 +693,39 @@ export async function probe(cfg) {
   }
 }
 
+/**
+ * **功能性**探活：真发一次 embeddings，要求 200 + 向量维度 > 0。
+ * 2026-10-02 青简实测（我复核时那台已被换掉、无法复现，但形态成立）：llama-server 会进入
+ * 「`/health` 200 但真嵌入全部超时」的僵死态——此时 `probe()`（只看 `/health`）**会说谎**：
+ * 看门狗判"在线"→ 既不告警也不恢复，`embed-status` 也报"在线"，消费方则全部等满超时。
+ * 与 2026-10-01 的存活恢复同族：**探针只验了"HTTP 活着"，没验"活儿能干"**。
+ * 维度判 `>0` 而非硬编码 1024（换模型 = 全量重嵌，维度判据不该钉死在探针里）。
+ */
+export async function probeEmbed(cfg, { timeoutMs } = {}) {
+  const ms = Number(timeoutMs) || Number(cfg.probeEmbedTimeoutMs) || 8000
+  const started = Date.now()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), ms)
+  try {
+    const res = await fetch(new URL('/v1/embeddings', cfg.embedUrl), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: ['ping'] }),
+      signal: controller.signal,
+    })
+    if (!res.ok) return { ok: false, status: res.status, elapsedMs: Date.now() - started, error: `HTTP ${res.status}` }
+    const j = await res.json().catch(() => null)
+    const dims = j && Array.isArray(j.data) && j.data[0] && Array.isArray(j.data[0].embedding) ? j.data[0].embedding.length : 0
+    if (!dims) return { ok: false, status: res.status, elapsedMs: Date.now() - started, error: '响应里没有向量' }
+    return { ok: true, status: res.status, dims, elapsedMs: Date.now() - started }
+  } catch (err) {
+    const timeout = err && err.name === 'AbortError'
+    return { ok: false, status: 0, elapsedMs: Date.now() - started, error: timeout ? `超时 ${ms}ms` : ((err && err.message) || String(err)) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export function launch(cfg) {
   try {
     const exe = String(cfg.serverExe || '')
@@ -873,6 +909,7 @@ export function ensureInFlow(cfg, logger, { force = false } = {}) {
 
 let lastWatchdogRestart = ''
 let overLimitStreak = 0
+let funcFailStreak = 0
 
 /** 单次看门狗检查：在线 → 读私有提交 → 连续两轮超限且空闲才 stop+launch。失败只 warn，绝不抛。
  *  2026-10-01 教训（本日事故复盘）：旧 embed 看门狗「单次超限即杀」，同日击杀 80 次
@@ -897,6 +934,26 @@ export async function watchdogTick(cfg, logger) {
     }
     const pid = listeningPid(cfg.embedPort)
     if (!pid) { overLimitStreak = 0; return }
+    // 功能性自检（2026-10-02 补，青简实测逼出）：`/health` 200 不等于"活儿能干"——
+    // 僵死态下 probe() 说在线、看门狗既不告警也不恢复，消费方却全部等满超时。
+    // 故在线之后必须**真发一次请求**验功能；连续 2 轮失败即判僵死并重启（防抖同上）。
+    const fn = await probeEmbed(cfg)
+    if (!fn.ok) {
+      funcFailStreak++
+      const busy = establishedOnPort(cfg.embedPort)
+      logger?.warn?.(`[${PLUGIN_NAME}] 看门狗：/health 在线但**实调自检失败**（${fn.error}｜${fn.elapsedMs}ms｜活动连接 ${busy}｜连续第 ${funcFailStreak} 轮）`)
+      if (funcFailStreak >= 2) {
+        logger?.warn?.(`[${PLUGIN_NAME}] 看门狗：实调自检连续 ${funcFailStreak} 轮失败——判定**僵死**（HTTP 活着但干不了活），执行 stop+launch`)
+        const stopped = stopService(cfg)
+        await sleep(1500)
+        const launched = launch(cfg)
+        funcFailStreak = 0
+        lastWatchdogRestart = `${new Date().toLocaleString('zh-CN')}｜实调自检僵死 → 重启（stop=${stopped.ok ? 'ok' : 'fail'} launch=${launched}）`
+        logger?.info?.(`[${PLUGIN_NAME}] 看门狗重启完成：${lastWatchdogRestart}`)
+      }
+      return
+    }
+    funcFailStreak = 0
     const mb = privateCommitMb(pid)
     if (!mb) return
     const limit = Math.max(512, Number(cfg.watchdogLimitMb) || 4096)
@@ -1218,9 +1275,18 @@ function buildInfraTool(cfg, state, { name, descriptionNote }) {
       if (action === 'embed-status') {
         const before = await probe(cfg)
         const pid = listeningPid(cfg.embedPort)
+        // 2026-10-02（青简要的那条）：把"探活"与"实调自检"分开显示——**让"在线"这个词不再有歧义**。
+        // 僵死态（/health 200 但干不了活）下旧版会报"在线"，把消费方和运维一起骗过去。
+        const fn = before.ok ? await probeEmbed(cfg) : null
+        const head = !before.ok
+          ? `[离线] ${cfg.embedUrl}（${before.body}）`
+          : (fn && fn.ok
+            ? `[OK] 向量服务在线且**实调可用**：${cfg.embedUrl}`
+            : `[可疑] /health 在线，但**实调自检失败**：${fn ? fn.error : '未测'}——消费方调用会等满超时，建议 embed-restart`)
         return [
-          before.ok ? `[OK] 向量服务在线：${cfg.embedUrl}` : `[离线] ${cfg.embedUrl}（${before.body}）`,
+          head,
           `[端口] ${cfg.embedPort}${pid ? `　PID ${pid}` : '　（无监听进程）'}`,
+          `[实调自检] ${fn ? (fn.ok ? `✅ 维度 ${fn.dims}｜${fn.elapsedMs}ms` : `❌ ${fn.error}｜已等 ${fn.elapsedMs}ms`) : '（服务不在线，未测）'}`,
           `[启动方式] 直起 exe ${cfg.serverExe}（无窗）｜所有权：基建（autoEnsure=${cfg.autoEnsureOnLoad}）`,
           before.ok ? before.body : '',
         ].filter(Boolean).join('\n')
@@ -1331,6 +1397,7 @@ export const __test = {
   liftTombstone,
   changesSince,
   shouldRecoverLiveness,
+  probeEmbed,
   bindingFor,
   listBindings,
   attributeWorkspace,

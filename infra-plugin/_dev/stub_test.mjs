@@ -14,6 +14,7 @@ import {
   bindSession, unbindSession, bindingFor, listBindings,
   isForgotten, forgetSession, liftTombstone, changesSince,
   shouldRecoverLiveness,
+  probeEmbed,
   attributeWorkspace, noteSession, seenWorkspaceFor,
   callerSessionOf,
   resolveActor,
@@ -485,6 +486,25 @@ t('有 exec 但该会话未绑定 → null，不抛', () =>
   eq(resolveActor(db, { actor: null, exec: { agent: { session: { id: 'session-unbound-xyz' } } } }), null))
 t('空白 actor 视为未传（不让空格落进账目）', () =>
   eq(resolveActor(db, { actor: '   ', exec: { agent: { session: { id: actorSid } } } }), '账目测试员'))
+
+console.log('== 功能性自检 probeEmbed（2026-10-02 补：/health 说谎时唯一看得见的探针） ==')
+await ta('不可达端口 → ok:false 且带 error，绝不抛', async () => {
+  const r = await probeEmbed({ embedUrl: 'http://127.0.0.1:59999', probeEmbedTimeoutMs: 1500 })
+  eq(r.ok, false)
+  if (!r.error) throw new Error('应带 error 字段')
+  return String(r.error).slice(0, 44)
+})
+await ta('超时口径：极短超时 → 报错而不是抛异常（僵死态的形态）', async () => {
+  const r = await probeEmbed({ embedUrl: 'http://10.255.255.1:8082', probeEmbedTimeoutMs: 600 })
+  eq(r.ok, false)
+  return String(r.error).slice(0, 44)
+})
+await ta('活着时真嵌入 → ok + 维度 > 0（环境无 8082 时记跳过，不把环境依赖做成红）', async () => {
+  const r = await probeEmbed({ embedUrl: 'http://127.0.0.1:8082', probeEmbedTimeoutMs: 8000 })
+  if (!r.ok) return '（本机 8082 未运行，跳过判正例）'
+  eq(r.dims > 0, true)
+  return `维度 ${r.dims}｜${r.elapsedMs}ms`
+})
 
 db.close()
 try { rmSync(dir, { recursive: true, force: true }) } catch {}
