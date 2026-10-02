@@ -380,6 +380,25 @@ const cfg = T.resolveConfig({})
   check('v0.6.0 unqueue：已固化拒绝退回', /拒绝/.test(refused) && T.loadPool(k, s).notes[0].status === 'submitted', String(refused).slice(0, 22))
 }
 
+/* v0.6.1：便签 ID 必须连续——旧公式 seq = notes.length + 1 + taken.size 重复计数，
+ * 导致 ID 只会是奇数（全库实证 NT-1/3/5/7/9）。 */
+{
+  const s = 'sess-v061-idseq'
+  const k = K(s)
+  T.savePool(basePool(k, { sessionId: s }))
+  const cfgNoLlm = Object.assign({}, cfg, { noteLlmGen: false })
+  const p = T.loadPool(k, s)
+  await T.addNoteToPool(p, { head: 'AIC 视频高光训练进度与判据汇总', body: 'b', source: 'manual' }, cfgNoLlm, 1)
+  await T.addNoteToPool(p, { head: '云端 LoRA 停训与复现对比结论', body: 'b', source: 'manual' }, cfgNoLlm, 2)
+  await T.addNoteToPool(p, { head: '样本生成与混合臂出件估算', body: 'b', source: 'manual' }, cfgNoLlm, 3)
+  const ids = T.loadPool(k, s).notes.map(n => n.id).join(',')
+  check('v0.6.1 便签 ID 连续（不再只有奇数）', ids === 'NT-1,NT-2,NT-3', 'IDs=' + ids)
+  /* 反向对照：已有号被占用时必须避让，不得撞号 */
+  const p2 = T.loadPool(k, s)
+  const taken = new Set(p2.notes.map(n => n.id))
+  check('v0.6.1 反向对照：占用号被避让（本轮 IDs 无重复）', taken.size === p2.notes.length, 'n=' + p2.notes.length)
+}
+
 /* 🔴-8 真行为回归（**放在最后**：它会真的 apply 并最终 dispose，之后本进程不再能落盘）：
  * `ctx.effect(fn)` 的 fn 是「立即执行」的注册面，f返回的函数才是清理器。
  * 旧 bug：`disposed = true` 写在 fn 体里 → 实例**挂载瞬间即自我标记已卸载** →

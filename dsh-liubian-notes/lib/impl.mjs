@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.6.0'
+export const PLUGIN_VERSION = '0.6.1'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -512,7 +512,11 @@ function raceEvict(pool, cfg, nowTurn) {
 export async function addNoteToPool(pool, draft, cfg, nowTurn) {
   const isReAdd = !!(draft && draft.id && draft.created_at)
   const taken = new Set([...pool.notes.map(n => n.id), ...loadRetired(pool.sessionKey).map(n => n.id)])
-  let seq = pool.notes.length + 1 + taken.size
+  /* v0.6.1：旧式 `notes.length + 1 + taken.size` 把同一批 notes **计了两遍**
+   * （taken 本已含全部 notes 的 id）→ N 篇之后 seq = 2N+1，ID **只会是奇数**
+   * （全库实证：每个池都是 NT-1/3/5/7/9）。正确基线 = taken.size + 1，再由下面的
+   * while 循环避让已用号。 */
+  let seq = taken.size + 1
   let id = isReAdd ? draft.id : `NT-${seq}`
   while (!isReAdd && taken.has(id)) { seq += 1; id = `NT-${seq}` }
   const note = isReAdd
