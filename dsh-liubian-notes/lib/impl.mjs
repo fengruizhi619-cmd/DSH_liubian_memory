@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.7.0'
+export const PLUGIN_VERSION = '0.7.1'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -707,6 +707,9 @@ export async function graduateOnce(cfg, pool, logger) {
   if (!top) return { ok: false, skipped: '无可送审对象' }
   const note = top.n
   const req = await buildPromoteRequest(cfg, note, logger)
+  /* v0.7.1：**池键顶到正文首行** —— board 服务会把 fromRef 改写成 svc: 来源标记，
+   * 收件方（银杏）因此拿不到"这是哪张便签"，回执与对账会卡在这一格（他 20:0x 实测反馈）。 */
+  req.content = '便签坐标：' + pool.sessionKey + '/' + note.id + '\n' + req.content
   const svc = serviceOf('kotatsuBoard')
   const entry = {
     queued_at: new Date().toISOString(),
@@ -1117,6 +1120,7 @@ export async function noteToolAction(cfg, args = {}, logger, exec = null) {
       }
       const ws = String(args.workspace || cfg.workspace || '工作组').trim()
       const req = await buildPromoteRequest(cfg, note, logger)
+      req.content = '便签坐标：' + pool.sessionKey + '/' + note.id + '\n' + req.content   // v0.7.1：同自动件
       const svc = serviceOf('kotatsuBoard')
       const entry = {
         queued_at: new Date().toISOString(),
