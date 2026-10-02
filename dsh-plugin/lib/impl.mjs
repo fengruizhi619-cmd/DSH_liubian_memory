@@ -78,9 +78,9 @@ export const DEFAULTS = {
   memoryContentChars: 3000,  // 单篇注入正文上限（超长截断）
   memoryTotalChars: 60000,   // 整块注入上限（30 篇全文，防一次吃掉太多上下文）
   // ── 全局通用教训（【2026-09-19 注入已移交流变·孪生】数据与 CLI 留在本插件）──
-  lessonsInject: true,       // 此键现仅影响 buildLessonsBlock 的工具侧输出，不再注入
-  lessonsMax: 20,            // 最多注入几条（同上，仅工具侧输出用）
-  lessonsChars: 2400,        // 教训块总字符上限（同上）
+  lessonsInject: true,       // ⚠ 现为**死键**：buildLessonsBlock 已无活调用点（只被 __test 引用），改它不影响任何行为
+  lessonsMax: 20,            // ⚠ 同上（死键）——保留仅为 __test 缝，以及将来若要恢复执行侧注入时不必重新加键
+  lessonsChars: 2400,        // ⚠ 同上（死键）
   lessonsEveryTurns: 10,     // 能力卡周期重注节奏（教训重注已移交孪生；0 = 只在会话开始注一次）
   // ── 技能自动装载：语义命中超阈值 → 直接注入 SKILL.md 全文并建议使用 ──
   skillAutoLoad: true,       // 总开关
@@ -579,8 +579,11 @@ export function registerTools(ctx, cfg) {
   /* - 全局通用教训 -------------------------------------------------------- */
   register(ctx, {
     name: 'lessons',
-    description: '**通用教训**清单（全局一份 + 当前工作区一份，每次会话开始自动注入 <liubian-lessons> 块）。只收跨领域通用的条目'
+    description: '**通用教训**清单（全局一份 + 当前工作区一份）。只收跨领域通用的条目'
       + '（工程纪律 / 流程与协作 / 验证与诊断方法），不含特定领域内容。'
+      + '**分工（2026-09-19 起）**：教训的**数据与生产**在本插件（本工具）；**「注入」已移交流变·孪生**——'
+      + '它把清单当**审查材料**附进送监指令（判被审动作是否偏离），**不再注入执行侧上下文**。'
+      + '所以要拿教训对照，请先 action=list 显式取，别指望它自己出现在上下文里。'
       + 'action: list 查看｜add 新增（text=教训一句话）｜remove 移除（id=序号）｜generate 从记忆库蒸馏通用教训（LLM）。'
       + 'scope=global｜workspace 选清单（默认 global）。',
     parameters: {
