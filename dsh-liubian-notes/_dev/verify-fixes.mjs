@@ -154,6 +154,13 @@ const cfg = T.resolveConfig({})
     sessionId: session,
     notes: [{ id: 'NT-1', source: 'manual', status: 'active', head: 'h', body: 'b', born_turn: 1, heat: [] }],
   }))
+  /* v0.6.3 起 promote 只走服务通道（无服务 → 明确报错且不入队）。故此处注入一个假服务，
+   * 否则本组用例的前提（promote 会入队）不再成立——那是**语义有意变更**，用例须同步，
+   * 不是把断言放松。 */
+  const sentTo = []
+  T.__testSetCtx({ reflect: { get: (n) => (n === 'kotatsuBoard'
+    ? { version: 1, send: async (a) => { sentTo.push(a); return { ok: true, bid: 11, to: '银杏' } } }
+    : null) } })
   const first = await T.noteToolAction(cfg, { action: 'promote', id: 'NT-1', session }, null)
   const again = await T.noteToolAction(cfg, { action: 'promote', id: 'NT-1', session }, null)
   let lines = []
@@ -165,6 +172,9 @@ const cfg = T.resolveConfig({})
   const dropOut = await T.noteToolAction(cfg, { action: 'drop', id: 'NT-1', session }, null)
   const afterDrop = JSON.parse(readPlain(key))
   check('🟡-5 queued 便签拒绝 drop', /拒绝/.test(dropOut) && afterDrop.notes.some((n) => n.id === 'NT-1'), dropOut.slice(0, 24))
+  /* v0.6.3：新升格流下 promote 的判据 = 「走服务通道发银杏，且只发一次」 */
+  check('🟡-5 promote 走服务通道且只发一次', sentTo.length === 1 && sentTo[0].to === '银杏', 'calls=' + sentTo.length)
+  T.__testSetCtx(null)
 }
 
 /* 🔴-3：判重拒收时窗口必须回补，且不得死循环 */
