@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.7.1'
+export const PLUGIN_VERSION = '0.7.2'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -782,14 +782,25 @@ export function scheduleGraduate(ctx, cfg, pool) {
 /** 入池主流程（判重 → 赛马 → 向量补齐 → 落盘）。draft 带已有便签（restore）则保留原 ID。 */
 export async function addNoteToPool(pool, draft, cfg, nowTurn) {
   const isReAdd = !!(draft && draft.id && draft.created_at)
-  const taken = new Set([...pool.notes.map(n => n.id), ...loadRetired(pool.sessionKey).map(n => n.id)])
+  const taken = new Set([
+    ...pool.notes.map(n => n.id),
+    ...loadRetired(pool.sessionKey).map(n => n.id),
+    ...(Array.isArray(pool.graduated) ? pool.graduated.map(n => n.id) : []),   // v0.7.2：出池件的号也占位
+  ])
   /* v0.6.1：旧式 `notes.length + 1 + taken.size` 把同一批 notes **计了两遍**
    * （taken 本已含全部 notes 的 id）→ N 篇之后 seq = 2N+1，ID **只会是奇数**
    * （全库实证：每个池都是 NT-1/3/5/7/9）。正确基线 = taken.size + 1，再由下面的
    * while 循环避让已用号。 */
-  let seq = taken.size + 1
+  /* v0.7.2：**号位必须单调不回退**。v0.7.0 让升格件出池后，它就不在 taken 里了
+   * （notes 没了、retired 也没有），于是 `taken.size + 1` 会把**已用过的号再发一次**——
+   * 银杏实测：同一池里 NT-17 被复用（14:05:54 向量路线澄清 / 17:59:54 SigLIP2）。
+   * 后果：账目按 (session_key, id) 无法区分两条，归因会张冠李戴。
+   * 现在：号位 = max(池内已发过的最大号, taken.size) + 1，并写回 pool.meta.seq 持久化。 */
+  const prevSeq = Number(pool.meta && pool.meta.seq) || 0
+  let seq = Math.max(prevSeq, taken.size) + 1
   let id = isReAdd ? draft.id : `NT-${seq}`
   while (!isReAdd && taken.has(id)) { seq += 1; id = `NT-${seq}` }
+  if (!isReAdd) pool.meta.seq = Math.max(prevSeq, seq)
   const note = isReAdd
     ? { ...draft, status: draft.status === 'retired' ? 'active' : draft.status }
     : {
