@@ -995,7 +995,7 @@ function contextStateFor(session) {
   const id = String(session?.id ?? 'default')
   let state = contextStates.get(id)
   if (!state) {
-    state = { profileDelivered: false, profilePromise: null, lastRecallKey: '', recallCount: 0, lessonsCounter: 0, lessonsLastKey: '', autoLoadedSkills: [], turnReminderCount: 0 }
+    state = { profileDelivered: false, profilePromise: null, lastRecallKey: '', recallCount: 0, lessonsCounter: 0, lessonsLastKey: '', autoLoadedSkills: [], turnReminderCount: 0, turnNo: 0, lastReminderTurn: 0 }
     contextStates.set(id, state)
   }
   return state
@@ -1730,12 +1730,15 @@ export function mountContextInjection(ctx, cfg) {
           }
         }
       }
-      // 反反驳自查提醒：**每一轮对话都注入**（一次一轮）。
-      // 用「人类消息条数」计轮而非内容比对——用户连发两遍同样的话也各算一轮、各注一次；
-      // 同一步重试时条数不变，天然防重复。注在 additions 末尾（离生成点最近）。
+      // 反反驳自查提醒：**每一轮对话都注入**（一次一轮）。回合标识用**真实轮次**
+      // （session/event turn/start 采集，青简 10-03 同款取法）——此前用「人类消息条数」
+      // 计轮，但 decision.messages 只带本回合提示 → 条数恒 1 → "每轮一次"退化成
+      // "每会话一次"（便签 v0.6.2 修的同款缺陷，10-03 点名让我核的那处，已修）。
+      // 无真实轮次的环境退回旧比对（行为不变，不放宽成每步都注）。
       const humanCount = (decision.messages || []).filter(m => isHumanMessage(m)).length
-      if (humanCount > 0 && humanCount !== state.turnReminderCount) {
-        state.turnReminderCount = humanCount
+      const rd = reminderTurnDecision(state, humanCount)
+      Object.assign(state, rd.patch)
+      if (rd.fire) {
         const reminder = buildTurnReminder(cfg)
         if (reminder) additions.push(pluginMessage(reminder, 'recall'))
       }
@@ -1752,6 +1755,19 @@ export function mountContextInjection(ctx, cfg) {
       return decision
     }
   }, { prepend: true })
+
+  // 真实轮次采集：pre-step 的消息表只带本回合提示、拿不到会话级轮次——
+  // 从 session/event 的 turn/start 取（青简 10-03 同款取法，实测 t229/t230/t231 形态）。
+  // 只更新内存状态，绝不写会话（§3.3.5）。
+  ctx.on('session/event', (session, event) => {
+    try {
+      if (!event || event.type !== 'turn/start') return
+      const t = Number(event.data && event.data.turn)
+      if (!Number.isFinite(t) || t <= 0) return
+      const state = contextStateFor(session)
+      state.turnNo = Math.max(t, Number(state.turnNo) || 0)
+    } catch { /* 附带功能不拖垮主流程（§3.6.2） */ }
+  })
 }
 
 export function disposeContextInjection() {
@@ -1812,6 +1828,22 @@ export function buildWikiService(cfg, opts = {}) {
   const svc = { version: WIKI_SERVICE_VERSION }
   for (const m of WIKI_SERVICE_METHODS) svc[m] = (req = {}) => call(m, req)
   return svc
+}
+
+/** 「反反驳自查」逐轮提醒的回合判定（纯函数，便于桩测）。
+ *  优先**真实轮次**（session/event turn/start 采集到 `state.turnNo`——青简 10-03 同款取法）；
+ *  没有真实轮次的会话退回旧的「人类消息条数」比对。那条路有已知缺陷：
+ *  `decision.messages` 只带本回合提示 → 条数恒 1 → "每轮一次"退化成"每会话一次"
+ *  （便签 v0.6.2 修的就是它）；保留兜底是不让"没发事件的环境"退化成每步都注。 */
+export function reminderTurnDecision(state, humanCount) {
+  const s = state || {}
+  const turnNo = Number(s.turnNo) || 0
+  if (turnNo > 0) {
+    const last = Number(s.lastReminderTurn) || 0
+    return { fire: turnNo !== last, patch: { lastReminderTurn: turnNo } }
+  }
+  const hc = Number(humanCount) || 0
+  return { fire: hc > 0 && hc !== (Number(s.turnReminderCount) || 0), patch: { turnReminderCount: hc } }
 }
 
 /** 挂服务（协议 §19 第一批形态）：BaseLiubianService 承载——provide→reflect 回退、
@@ -1983,6 +2015,7 @@ export const __test = {
   lessonsAddDecision,
   buildLessonsService,
   LESSONS_CAPACITY,
+  reminderTurnDecision,
 }
 
 /* ──────────────────────────────────────────────────────────────────────────

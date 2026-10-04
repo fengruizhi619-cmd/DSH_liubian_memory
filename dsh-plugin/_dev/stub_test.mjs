@@ -19,6 +19,7 @@ const {
   sessionHashFor, buildWikiRequest,
   wikiServiceRequest, buildWikiService, WIKI_SERVICE_METHODS,
   lessonsAddDecision, buildLessonsService, LESSONS_CAPACITY,
+  reminderTurnDecision,
 } = __test
 
 const kit = await import('liubian-kit')
@@ -348,6 +349,28 @@ t('liubianWiki 可由 BaseLiubianService 承载（直调 + version 守卫）', (
   const inst = new kit.BaseLiubianService({ name: 'liubianWiki', version: impl.version, methods: impl, pluginName: 'probe', kitVersion: kit.KIT_VERSION })
   eq(inst.version, 1)
   for (const m of WIKI_SERVICE_METHODS) eq(typeof inst[m], 'function', `${m} 应铺到实例`)
+})
+
+/* ── 9. 反反驳自查提醒·回合判定（真实轮次优先，旧路兜底） ─────────────────── */
+console.log('\n== reminderTurnDecision（回合判定） ==')
+t('真实轮次：新轮 fire、patch 推进 lastReminderTurn', () => {
+  const d = reminderTurnDecision({ turnNo: 5, lastReminderTurn: 4 }, 1)
+  ok(d.fire)
+  eq(d.patch.lastReminderTurn, 5)
+})
+t('真实轮次：同轮重试不 fire', () => {
+  eq(reminderTurnDecision({ turnNo: 5, lastReminderTurn: 5 }, 1).fire, false)
+})
+t('无真实轮次：退回旧比对（行为不变——首条 fire）', () => {
+  const d = reminderTurnDecision({ turnReminderCount: 0 }, 1)
+  ok(d.fire)
+  eq(d.patch.turnReminderCount, 1)
+})
+t('无真实轮次：同条数不再 fire（旧行为保留，含其已知缺陷语义）', () => {
+  eq(reminderTurnDecision({ turnReminderCount: 1 }, 1).fire, false)
+})
+t('humanCount=0（无人类内容轮）不 fire', () => {
+  eq(reminderTurnDecision({ turnReminderCount: 0 }, 0).fire, false)
 })
 
 console.log(`\n== 结果：${pass} 过 / ${fail} 败 ==`)
