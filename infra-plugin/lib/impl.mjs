@@ -25,7 +25,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { BaseLiubianService, BaseTombstones, KIT_VERSION } from 'liubian-kit'
 
 export const PLUGIN_NAME = 'dsh-liubian-infra'
-export const PLUGIN_VERSION = '0.5.0'
+export const PLUGIN_VERSION = '0.5.1'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
@@ -975,17 +975,27 @@ export async function watchdogTick(cfg, logger) {
   }
 }
 
-/** 周期看门狗，随插件卸载清理。 */
+/** 周期看门狗，随插件卸载清理。
+ *  🔴 v0.5.1 修（2026-10-05 凌晨二次死亡事故）：旧版把 `clearTimeout(timer)` 写进了
+ *  `ctx.effect` 的 **fn 体**——而 fn 是立即执行的（家族标准 §11 / 玉簪 🔴-8 同族），
+ *  看门狗在挂载的同一微秒被自己清除：**自 v0.2.0 挂牌迁移起从未运行过**，状态行的
+ *  「看门狗开（>12288MB/300s）」一直在说谎。10-05 凌晨 llama-server 二次死亡 ≥12 分钟
+ *  无人恢复，即此根因。修法：启动循环与清理各归各位——fn 里 `loop()` 启动并返回
+ *  真正的 disposer。 */
 export function mountWatchdog(ctx, cfg) {
   if (!cfg.watchdogEnabled) return
   let timer = null
+  let stopped = false
   const loop = async () => {
     await watchdogTick(cfg, ctx.logger)
-    timer = setTimeout(loop, (Number(cfg.watchdogIntervalSec) || 300) * 1000)
+    if (!stopped) timer = setTimeout(loop, (Number(cfg.watchdogIntervalSec) || 300) * 1000)
   }
-  timer = setTimeout(loop, (Number(cfg.watchdogIntervalSec) || 300) * 1000)
   ctx.effect(() => {
-    if (timer) clearTimeout(timer)
+    loop()                              // fn 体 = **启动**（首 tick 立即，此后每 300s）
+    return () => {                      // 清理作为 disposer 返回——绝不放进 fn 体
+      stopped = true                    // 卸载后，在途 tick 完成时不得再把循环复活
+      if (timer) clearTimeout(timer)
+    }
   }, 'dsh-liubian-infra: 内存看门狗')
 }
 

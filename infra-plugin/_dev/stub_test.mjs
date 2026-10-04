@@ -18,6 +18,7 @@ import {
   attributeWorkspace, noteSession, seenWorkspaceFor,
   callerSessionOf,
   resolveActor,
+  mountWatchdog,
   resolveConfig,
 } from '../lib/impl.mjs'
 
@@ -505,6 +506,37 @@ await ta('活着时真嵌入 → ok + 维度 > 0（环境无 8082 时记跳过�
   eq(r.dims > 0, true)
   return `维度 ${r.dims}｜${r.elapsedMs}ms`
 })
+
+console.log('== mountWatchdog 的 effect 语义（🔴 v0.5.1：fn 立即执行曾把看门狗掐死在挂载瞬间） ==')
+{
+  const lines = []
+  let capturedFn = null, disposer = null
+  const ctx = {
+    logger: { info: () => {}, warn: (...a) => lines.push(a.join(' ')) },
+    // 复刻宿主语义：ctx.effect 的 fn **立即执行**，返回值即 disposer（玉簪 🔴-8 的教训形态）
+    effect: (fn, label) => { capturedFn = fn; disposer = fn() },
+  }
+  // 死配置：exe 不存在 + 端口不可达 → tick 走"存活恢复"分支但 launch 失败（warn 留痕、绝不 spawn 真进程）
+  const deadCfg = {
+    watchdogEnabled: true, watchdogIntervalSec: 300, watchdogLimitMb: 12288,
+    embedPort: 59999, embedUrl: 'http://127.0.0.1:59999',
+    serverExe: 'definitely-not-a-real-llama.exe', serverCwd: '',
+    autoEnsureOnLoad: true, probeTimeoutMs: 200, probeEmbedTimeoutMs: 400,
+  }
+  mountWatchdog(ctx, deadCfg)
+  await new Promise(r => setTimeout(r, 1500))   // loop() 异步：等首 tick（probe+tasklist）完成再断言
+
+  t('effect 的 fn 立即执行后，首 tick 真的跑了（恢复告警出现；🔴-8 形态下 timer 被清、永不运行）', () => {
+    const hit = lines.some(l => l.includes('按存活恢复拉起'))
+    if (!hit) throw new Error('首 tick 未执行——看门狗死在挂载瞬间')
+    return 'deadCfg 下恢复告警已打'
+  })
+  t('effect 收到真正的 disposer（函数）且可安全调用', () => {
+    if (typeof disposer !== 'function') throw new Error('fn 必须返回 disposer（旧代码返回 undefined，卸载永远清不掉）')
+    disposer()   // 卸载：stopped 置位；在途 tick 完成后循环不得复活（代码以 stopped 栓保证）
+    return 'disposer 可调用'
+  })
+}
 
 db.close()
 try { rmSync(dir, { recursive: true, force: true }) } catch {}
