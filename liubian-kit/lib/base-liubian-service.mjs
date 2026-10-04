@@ -1,6 +1,5 @@
-/** kit 自身版本（协议 §19：kit 版本必须出现在服务挂载行——版本漂移可观测）。
- *  ⚠ 与 package.json 的 version **双处同步**——改这里必须改那份，反之亦然。 */
-export const KIT_VERSION = '0.1.1'
+/** kit 自身版本从 ./version.mjs 单源取（防"index 与基类各自一份"的两处真相）。 */
+import { KIT_VERSION } from './version.mjs'
 
 /**
  * BaseLiubianService —— 跨插件服务**提供方**的形态基类（协议 §19）。

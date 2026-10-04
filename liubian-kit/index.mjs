@@ -10,5 +10,7 @@
  * 分发（单源）：家族仓库 `liubian-kit/` 为唯一源；消费方以 junction
  *   `<插件>/node_modules/liubian-kit → <家族仓库>/liubian-kit` 接入，bare import 即可解析。
  */
-export { KIT_VERSION, BaseLiubianService, consumeLiubianService } from './lib/base-liubian-service.mjs'
+export { KIT_VERSION } from './lib/version.mjs'
+export { BaseLiubianService, consumeLiubianService } from './lib/base-liubian-service.mjs'
 export { BaseTombstones } from './lib/base-tombstones.mjs'
+export { BaseJsonlFile } from './lib/base-jsonl-file.mjs'

@@ -3,12 +3,12 @@
  * 跑法：node.cmd liubian-kit/_dev/stub_test.mjs
  * 夹具纪律：临时目录 + 内存态，**绝不 junction 真实仓库**（青芷事故）。
  */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-import { BaseLiubianService, consumeLiubianService, BaseTombstones, KIT_VERSION } from '../index.mjs'
+import { BaseLiubianService, consumeLiubianService, BaseTombstones, BaseJsonlFile, KIT_VERSION } from '../index.mjs'
 
 let pass = 0, fail = 0
 const t = (label, fn) => {
@@ -149,6 +149,67 @@ t('keyColumn 可配：既有库列名（session_hash）直接可用', () => {
   eq(t2.isForgotten('ab12cd34'), true)
   if (!tom.changesSince(0).forgotten.includes('ab12cd34')) throw new Error('两实例应共享同一张表')
 })
+
+console.log('== BaseJsonlFile（协议 §7 #19/#21：JSONL 数据文件即接口） ==')
+{
+  const jf = new BaseJsonlFile({ file: join(dir, 'pending-demo.jsonl'), schema: 'pending-demo', version: 1 })
+  t('首写强制 _meta：meta 行存在、**不带 id**', () => {
+    jf.append({ id: 'NT-1', session_key: 'aa11', queued_at: '2026-10-05T00:00:00Z', head: 'h1' })
+    const raw = jf.rawLines()
+    const meta = JSON.parse(raw[0])
+    if (meta._meta !== true) throw new Error('首行应是 _meta')
+    if ('id' in meta) throw new Error('meta 行禁带 id（§7 #19）')
+    if (meta.schema !== 'pending-demo' || meta.version !== 1) throw new Error('meta 形状不对')
+    return raw[0].slice(0, 60)
+  })
+  t('存量文件无 _meta：ensureMeta 补插且**原行无损**（读侧容忍旧形态）', () => {
+    const f2 = new BaseJsonlFile({ file: join(dir, 'legacy.jsonl'), schema: 'legacy' })
+    writeFileSync(join(dir, 'legacy.jsonl'), '{"id":"old-1"}\n', 'utf8')
+    const r = f2.ensureMeta()
+    eq(r.inserted, true)
+    const rows = f2.rows()
+    eq(rows.length, 1)
+    eq(rows[0].id, 'old-1', '原行必须无损')
+    eq(f2.hasMeta(), true)
+    f2.ensureMeta()
+    eq(f2.rows().length, 1, '二次 ensureMeta 幂等')
+  })
+  t('rows()：跳过 _meta 行与坏行（读侧容忍）', () => {
+    const f3 = new BaseJsonlFile({ file: join(dir, 'messy.jsonl'), schema: 'messy' })
+    f3.append({ id: 'a' })
+    const f = f3.file
+    writeFileSync(f, readFileSync(f, 'utf8') + '这不是JSON\n' + '{"id":"b","extra":1}\n', 'utf8')
+    const rows = f3.rows()
+    eq(rows.map(r => r.id).join(','), 'a,b', '坏行跳过、未知字段容忍')
+  })
+  // NT-16 真事故形态：同 id 双条（不同 queued_at）——三元组摘除只删命中行
+  const f4 = new BaseJsonlFile({ file: join(dir, 'triple.jsonl'), schema: 'triple', version: 1,
+    keyOf: row => `${row.session_key}+${row.id}+${row.queued_at}` })
+  f4.append({ id: 'NT-16', session_key: 'aa11', queued_at: '2026-10-04T10:00:00Z', bid: 47 })
+  f4.append({ id: 'NT-16', session_key: 'aa11', queued_at: '2026-10-04T11:00:00Z', bid: 56 })
+  t('三元组摘除：同 id 双条，摘 bid=56 那条、bid=47 历史无损（NT-16 真事故形态）', () => {
+    const removed = f4.removeByKey('aa11+NT-16+2026-10-04T11:00:00Z')
+    eq(removed, 1, '只删命中行')
+    const rest = f4.rows().filter(r => r.id === 'NT-16')
+    eq(rest.length, 1)
+    eq(rest[0].bid, 47, '历史条目必须无损')
+    return '摘 1 存 1'
+  })
+  t('removeWhere：_meta 行与坏行**原样保留**（摘除不含糊）', () => {
+    writeFileSync(f4.file, readFileSync(f4.file, 'utf8') + '坏行\n', 'utf8')
+    const removed = f4.removeWhere(row => row.id === 'NT-16')
+    eq(removed, 1)
+    const raw = f4.rawLines()
+    if (!raw.some(l => l.includes('坏行'))) throw new Error('坏行必须原样保留')
+    if (raw[0].indexOf('_meta') !== 0 && !JSON.parse(raw[0])._meta) throw new Error('_meta 行必须保留')
+    return `removed=${removed}｜总行=${raw.length}`
+  })
+  t('没删到 = 0（与 -1 写失败严格区分）', () => eq(f4.removeWhere(row => row.id === '查无此人'), 0))
+  t('append 后文件以换行结尾（append-only 卫生）', () => {
+    const s = readFileSync(f4.file, 'utf8')
+    if (!s.endsWith('\n')) throw new Error('尾行应有换行')
+  })
+}
 
 db.close()
 try { rmSync(dir, { recursive: true, force: true }) } catch {}
