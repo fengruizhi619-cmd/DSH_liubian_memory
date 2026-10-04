@@ -32,7 +32,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.7.2'
+export const PLUGIN_VERSION = '0.7.3'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -690,7 +690,9 @@ export function topHeatNote(pool, nowTurn, m) {
 
 /** 同 id 只留一条升格账目：先摘旧条目再落新的。 */
 function persistGraduate(sessionKey, id, entry) {
-  removePendingEntry(sessionKey, id)
+  /* v0.7.3：先取当前条目的 queued_at，再按三元组摘——历史同 id 条目无损 */
+  const prev = pendingEntry(sessionKey, id)
+  removePendingEntry(sessionKey, id, prev && prev.queued_at)
   return appendPending(entry)
 }
 
@@ -984,7 +986,17 @@ export async function injectionBlock(pool, cfg, queryText, nowTurn) {
 function appendPending(entry) {
   try {
     mkdirSync(dirname(pendingPromotionsFile()), { recursive: true })
-    appendFileSync(pendingPromotionsFile(), JSON.stringify(entry) + '\n', 'utf8')
+    const file = pendingPromotionsFile()
+    /* v0.7.3（协议 §19 _meta 首行）：**写方宿主内补插**——首行无 _meta 就插一行，
+     * 存量文件由此升级、读侧容忍缺失。_meta 行**不带 id**（§7 #19：meta 行禁带 id，
+     * 防归因反解按 id 精确匹配时误中）。 */
+    let lines = []
+    try { lines = readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()) } catch { lines = [] }
+    let hasMeta = false
+    if (lines.length) { try { hasMeta = JSON.parse(lines[0].replace(/^\uFEFF/, ''))._meta === true } catch { hasMeta = false } }
+    if (!hasMeta) lines.unshift(JSON.stringify({ _meta: true, schema: 'pending-promotions', version: 1 }))
+    lines.push(JSON.stringify(entry))
+    writeFileSync(file, lines.join('\n') + '\n', 'utf8')
     return true
   } catch { return false }
 }
@@ -1007,7 +1019,11 @@ export function pendingHasId(sessionKey, id) {
 
 /** v0.6.0：把一条 pending 条目从队列里摘掉（unqueue 的配套）。jsonl 无唯一键 → 整表重写。
  *  返回被摘掉的条数；**-1 = 写失败**（调用方必须如实回告，不得假装成功）。 */
-export function removePendingEntry(sessionKey, id) {
+export function removePendingEntry(sessionKey, id, queuedAt) {
+  /* v0.7.3：**三元组键摘除**（session_key+id+queued_at，只删命中行）。
+   * 真实事故：同 id 二次送审按 (session_key,id) 摘除，把历史那条（bid=47）一并摘掉，
+   * 账目少一条（后按宿主日志重建）。键不够唯一时，**删除比写入更危险**。 */
+  const wantQueued = queuedAt === undefined || queuedAt === null ? null : String(queuedAt)
   const wantId = String(id || '')
   if (!wantId) return 0
   const file = pendingPromotionsFile()
@@ -1019,7 +1035,8 @@ export function removePendingEntry(sessionKey, id) {
   for (const line of lines) {
     let e = null
     try { e = JSON.parse(line.replace(/^\uFEFF/, '')) } catch { keep.push(line); continue }
-    if (e && String(e.id) === wantId && (!sessionKey || String(e.session_key) === String(sessionKey))) { removed += 1; continue }
+    const qOk = wantQueued === null || String(e.queued_at) === wantQueued
+    if (e && String(e.id) === wantId && qOk && (!sessionKey || String(e.session_key) === String(sessionKey))) { removed += 1; continue }
     keep.push(line)
   }
   if (!removed) return 0
@@ -1145,7 +1162,7 @@ export async function noteToolAction(cfg, args = {}, logger, exec = null) {
         sent: false,
       }
       /* 同 id 只留一条账目：重发路径先摘旧条目再落新的（不追求跨文件原子，账目可容忍） */
-      const persist = (e) => { if (prev) removePendingEntry(pool.sessionKey, note.id); return appendPending(e) }
+      const persist = (e) => { if (prev) removePendingEntry(pool.sessionKey, note.id, prev.queued_at); return appendPending(e) }
       if (!svc || typeof svc.send !== 'function') {
         entry.last_error = 'kotatsuBoard v1 服务不可用（被炉未 provide 或未装载）'
         const wrote = persist(entry)
@@ -1191,7 +1208,8 @@ export async function noteToolAction(cfg, args = {}, logger, exec = null) {
         return `[拒绝] ${note.id} 已固化（${note.diary_ref || '已提交'}），不能退回 active——如需重做请走 wiki 侧修订。`
       }
       const wasQueued = note.status === 'queued'
-      const removed = removePendingEntry(pool.sessionKey, note.id)
+      const prevQ = (pendingEntry(pool.sessionKey, note.id) || {}).queued_at
+      const removed = removePendingEntry(pool.sessionKey, note.id, prevQ)
       if (removed < 0) return '[失败] 写 pending_promotions.jsonl 未成功（池状态未改，可重试）。'
       if (!wasQueued && !removed) return `[跳过] ${note.id} 本来就不是 queued（池内 ${note.status}，队列里也没有它）。`
       note.status = 'active'
