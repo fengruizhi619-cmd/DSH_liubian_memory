@@ -1,0 +1,12 @@
+{
+  "name": "liubian-kit",
+  "version": "0.1.0",
+  "description": "流变家族跨插件服务的形态基类套件（协议 §19）：BaseLiubianService（provide 形态）/ BaseTombstones（追加式墓碑事件流）。纯形态、零家族依赖——不 import 任何家族插件/文件/服务。",
+  "private": true,
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "license": "MIT"
+}

@@ -15,8 +15,16 @@ import { join } from 'node:path'
 import { openDb, renameIdentity, lookupIdentity, listIdentities, listBindings } from '../lib/impl.mjs'
 
 const PROD = process.env.INFRA_DB || 'C:/Users/Feng/.dsh/liubian-infra/registry.db'
-const FROM = process.argv[2] || '玉簪'
-const TO = process.argv[3] || '玉簪Pro'
+// 2026-10-05 教训：默认源名**不能写死某个具体身份**——身份会按管理员裁定退役（玉簪 10-01
+// retired 后本 drill 3 项红，全是"对 retired 身份正确拒绝"的正确行为）。默认改为
+// 「现取一个 active 且有绑定的身份」，显式参数仍可覆盖。
+function pickDefaultSource(db) {
+  const binds = listBindings(db)
+  const idents = listIdentities(db)
+  const hit = binds.find(b => idents.find(i => i.name === b.name && i.status === 'active'))
+  return hit ? hit.name : null
+}
+const argFrom = process.argv[2]
 
 const sha = f => createHash('sha256').update(readFileSync(f)).digest('hex')
 const prodBefore = sha(PROD)
@@ -29,6 +37,12 @@ for (const suffix of ['', '-wal', '-shm']) {
 }
 if (dbPath === PROD) throw new Error('安全阀：副本路径不得等于生产路径')
 
+const db = openDb(dbPath)
+// 挑默认源名在**副本**上做——绝不为了挑名去开生产库的可写连接（WAL/检查点可能动生产文件）。
+const FROM = argFrom || pickDefaultSource(db)
+const TO = process.argv[3] || (FROM ? FROM + 'Pro' : undefined)
+if (!FROM || !TO) throw new Error('找不到可预演的 active 身份，且未给显式参数：rename_drill.mjs [源名] [新名]')
+
 let pass = 0, fail = 0
 const t = (label, fn) => {
   try { const extra = fn(); pass++; console.log(`  ✓ ${label}${extra ? '｜' + extra : ''}`) }
@@ -38,8 +52,6 @@ const eq = (a, b, msg = '') => { if (a !== b) throw new Error(`期望 ${JSON.str
 
 console.log(`源库（副本）: ${dbPath}`)
 console.log(`预演改名: ${FROM} → ${TO}\n`)
-
-const db = openDb(dbPath)
 
 t('v0.3.0 DDL 迁移：两张新表已在（对既有库幂等）', () => {
   const names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name)

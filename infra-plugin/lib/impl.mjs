@@ -22,9 +22,10 @@ import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { BaseLiubianService, BaseTombstones, KIT_VERSION } from 'liubian-kit'
 
 export const PLUGIN_NAME = 'dsh-liubian-infra'
-export const PLUGIN_VERSION = '0.4.0'
+export const PLUGIN_VERSION = '0.5.0'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
@@ -571,13 +572,16 @@ export function unbindSession(db, { session, name } = {}) {
   throw new Error('[错误] unbind 需要 session 或 name 之一')
 }
 
-/* ── 删除与跨系统同步（v0.4.0，管理员 2026-10-01 裁定：删除 = L1 退房 + L2 删运行身份 + L3 注销名字） ── */
+/* ── 删除与跨系统同步（v0.4.0，管理员 2026-10-01 裁定：删除 = L1 退房 + L2 删运行身份 + L3 注销名字） ──
+ *  v0.5.0（协议 §19 第一批）：墓碑事件流的形态抽到 liubian-kit（BaseTombstones，单源 SQLite 形态）；
+ *  本文件保留的是**业务**——bindings/session_seen/retire 的事务编排与 wire 格式。 */
+
+/** kit 墓碑流实例（key 列沿用既有表的 session_hash，不要求迁移）。 */
+const tombOf = db => new BaseTombstones(db, { keyColumn: 'session_hash' })
 
 /** 该会话当前是否处于「已忘记」态。墓碑**只增不改**：当前状态 = 该会话 id 最大的那行。 */
 export function isForgotten(db, rawSessionHash) {
-  const sh = normSessionHash(rawSessionHash)
-  const row = db.prepare('SELECT op FROM tombstones WHERE session_hash = ? ORDER BY id DESC LIMIT 1').get(sh)
-  return !!row && row.op === 'forget'
+  return tombOf(db).isForgotten(normSessionHash(rawSessionHash))
 }
 
 /**
@@ -595,14 +599,14 @@ export function forgetSession(db, { sessionHash, actor, reason, retireName = fal
   const already = isForgotten(db, sh)
   const bound = db.prepare('SELECT name FROM bindings WHERE session_hash = ?').get(sh)
   let retired = false
+  let at = now
   db.exec('BEGIN')
   let removed = 0
   try {
     removed = db.prepare('DELETE FROM bindings WHERE session_hash = ?').run(sh).changes ?? 0
     db.prepare('DELETE FROM session_seen WHERE session_hash = ?').run(sh)
     if (!already) {
-      db.prepare('INSERT INTO tombstones (session_hash, op, at, actor, reason) VALUES (?,?,?,?,?)')
-        .run(sh, 'forget', now, actor ? String(actor) : null, reason ? String(reason) : null)
+      at = tombOf(db).append(sh, 'forget', { actor, reason }).at   // 事件流由 kit 承载（协议 §19）
     }
     if (retireName && bound && bound.name) {
       const r = retireIdentity(db, bound.name, reason ? String(reason) : null)
@@ -624,8 +628,7 @@ export function forgetSession(db, { sessionHash, actor, reason, retireName = fal
 export function liftTombstone(db, { sessionHash, actor, reason } = {}) {
   const sh = normSessionHash(sessionHash)
   if (!isForgotten(db, sh)) return { ok: true, sessionHash: sh, lifted: false, alreadyActive: true }
-  db.prepare('INSERT INTO tombstones (session_hash, op, at, actor, reason) VALUES (?,?,?,?,?)')
-    .run(sh, 'lift', new Date().toISOString(), actor ? String(actor) : null, reason ? String(reason) : null)
+  tombOf(db).append(sh, 'lift', { actor, reason })
   return { ok: true, sessionHash: sh, lifted: true }
 }
 
@@ -637,24 +640,15 @@ export function liftTombstone(db, { sessionHash, actor, reason } = {}) {
  * 改名/别名**不进事件流**：读取时按 hash 解析已覆盖（C1 口径）。
  */
 export function changesSince(db, since = 0) {
-  const from = Number.isFinite(Number(since)) ? Number(since) : 0
-  const tombstones = db.prepare('SELECT id, session_hash, op, at, actor, reason FROM tombstones WHERE id > ? ORDER BY id').all(from)
-  const maxRow = db.prepare('SELECT MAX(id) AS m FROM tombstones').get()
-  // 当前仍处于墓碑态的会话（最新一条事件是 'forget'）——**全量快照**，与 identities/bindings 同构。
-  // 为什么要有它：消费方要回答"这个会话是不是被删了"，若只能拉 since:0 的全量事件流来查态，
-  // 就会踩上「顺手推水位 → 漏事件」的坑（被炉实测踩到过，本字段因此补）。查态与消费事件由此分开。
-  const forgotten = db.prepare(`
-    SELECT session_hash FROM tombstones t
-    WHERE t.op = 'forget'
-      AND t.id = (SELECT MAX(id) FROM tombstones WHERE session_hash = t.session_hash)
-    ORDER BY session_hash
-  `).all().map(r => r.session_hash)
+  // 增量事件 + forgotten 快照由 kit 承载（协议 §19）；本函数保留的是 infra 的 wire 格式
+  // （tombstones 行带 session_hash 字段，被炉消费侧按它读）与 identities/bindings 两个全量表。
+  const c = tombOf(db).changesSince(since)
   return {
-    seq: maxRow && maxRow.m ? maxRow.m : 0,
+    seq: c.seq,
     identities: listIdentities(db),
     bindings: listBindings(db),
-    forgotten,
-    tombstones,
+    forgotten: c.forgotten,
+    tombstones: c.events.map(e => ({ id: e.id, session_hash: e.key, op: e.op, at: e.at, actor: e.actor, reason: e.reason })),
   }
 }
 
@@ -1313,24 +1307,18 @@ function registerTools(ctx, cfg, state) {  ctx.effect(() => ctx.tools.register(
 /** 把服务挂上宿主通道：优先 ctx.provide（cordis 标准形），回退 ctx.reflect.provide；
  *  两者都没有 → 明确告警（不静默），工具面仍可单独承担改名/解绑。 */
 function provideService(ctx, state) {
-  const svc = buildInfraService(state)
-  const arm = (label, fn) => {
-    try {
-      const disposer = fn('liubianInfra', svc)
-      ctx.logger?.info?.(`[${PLUGIN_NAME}] 跨插件服务已挂载：liubianInfra v${svc.version}（${label}）`)
-      return disposer
-    } catch (e) {
-      ctx.logger?.warn?.(`[${PLUGIN_NAME}] 跨插件服务挂载失败（${label}）：${(e && e.message) || e}`)
-      return undefined
-    }
-  }
-  if (typeof ctx.provide === 'function') {
-    ctx.effect(() => arm('ctx.provide', (n, v) => ctx.provide(n, v)), 'dsh-liubian-infra: 跨插件服务')
-  } else if (typeof ctx.reflect?.provide === 'function') {
-    ctx.effect(() => arm('ctx.reflect.provide', (n, v) => ctx.reflect.provide(n, v)), 'dsh-liubian-infra: 跨插件服务')
-  } else {
-    ctx.logger?.warn?.(`[${PLUGIN_NAME}] 宿主无 provide 通道（ctx.provide / ctx.reflect.provide 皆不可用）——跨插件写服务未挂载；改名/解绑仍可走 infra 工具面`)
-  }
+  // 协议 §19 第一批：provide 形态（provide→reflect 回退、{ok,error} 包装、挂载双行含 kit 版本）
+  // 由 liubian-kit 的 BaseLiubianService 承载；本函数只剩**业务装配**（方法表来自 buildInfraService）。
+  const svc = new BaseLiubianService({
+    name: 'liubianInfra',
+    version: 1,
+    methods: buildInfraService(state),
+    logger: ctx.logger,
+    pluginName: PLUGIN_NAME,
+    kitVersion: KIT_VERSION,
+  })
+  ctx.effect(() => svc.mount(ctx), 'dsh-liubian-infra: 跨插件服务')
+  return svc
 }
 
 /* ══ 入口 ══ */
