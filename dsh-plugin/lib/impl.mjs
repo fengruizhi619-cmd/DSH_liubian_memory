@@ -10,6 +10,7 @@
  */
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { randomUUID, createHash } from 'node:crypto'
+import { BaseLiubianService, KIT_VERSION } from 'liubian-kit'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -24,7 +25,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
 
 /** 版本号（同时写进挂载日志，方便确认热注入拿到的是新代码而不是 ESM 缓存里的旧模块）。 */
-export const PLUGIN_VERSION = '1.0.2'
+export const PLUGIN_VERSION = '1.0.3'
 
 /** DSH 家目录（身份文件落在这里，与 Codex 侧凭据互不干扰）。 */
 export const DSH_HOME = process.env.DSH_HOME || join(HOME, '.dsh')
@@ -619,7 +620,7 @@ export function registerTools(ctx, cfg) {
         }
         list.push(text)
         saveLessons(list, scope, ws)
-        return `[OK] 已添加到${scope === 'workspace' ? '工作区' : '全局'}清单（现共 ${list.length} 条），下次会话开始自动注入。`
+        return `[OK] 已添加到${scope === 'workspace' ? '工作区' : '全局'}清单（现共 ${list.length} 条）。清单由流变·孪生作送监审查材料消费（不注入执行侧）；完整清单用 action=list 查看。`
       }
       if (action === 'remove') {
         const id = Number(args.id)
@@ -633,7 +634,7 @@ export function registerTools(ctx, cfg) {
         const r = await generateLessons(cfg, { count: args.count, log: ctx.logger, scope, ws })
         if (!r.ok) return `[错误] ${r.error}`
         if (!r.added) return `[无新增] ${r.note || '没有产出新条目'}`
-        return `[OK] 新增 ${r.added} 条通用教训（现共 ${r.total} 条），下次会话开始自动注入：\n`
+        return `[OK] 新增 ${r.added} 条通用教训（现共 ${r.total} 条）：\n`
           + r.lessons.map((t, i) => `${i + 1}. ${t}`).join('\n')
       }
       return `[错误] 未知 action: ${action}`
@@ -1813,26 +1814,107 @@ export function buildWikiService(cfg, opts = {}) {
   return svc
 }
 
-/** 挂服务：`ctx.provide` 优先 / `ctx.reflect.provide` 回退 / 皆无则明确告警（不静默）。 */
+/** 挂服务（协议 §19 第一批形态）：BaseLiubianService 承载——provide→reflect 回退、
+ *  双行日志含 kit 版本、方法调用绝不抛。kit 0.1.1 起方法表铺到实例上，
+ *  直调形态（`svc.create(...)`，协议 §17 模板）与 `call()` 并存。 */
 function provideWikiService(ctx, cfg) {
-  const svc = buildWikiService(cfg)
-  const arm = (label, fn) => {
-    try {
-      const disposer = fn('liubianWiki', svc)
-      ctx.logger?.info?.(`[dsh-liubian] 跨插件服务已挂载：liubianWiki v${svc.version}（${label}）`)
-      return disposer
-    } catch (e) {
-      ctx.logger?.warn?.(`[dsh-liubian] 跨插件服务挂载失败（${label}）：${(e && e.message) || e}`)
-      return undefined
-    }
+  const impl = buildWikiService(cfg)
+  const svc = new BaseLiubianService({
+    name: 'liubianWiki',
+    version: impl.version,
+    methods: impl,
+    logger: ctx.logger,
+    pluginName: 'dsh-liubian',
+    kitVersion: KIT_VERSION,
+  })
+  ctx.effect(() => svc.mount(ctx), 'dsh-liubian: 跨插件服务')
+  return svc
+}
+
+/* ══ 跨插件服务：liubianLessons v1（教训支路，协议 §20，2026-10-05）═══════════
+ * 消费方：便签（分流·教训支路的写入通道）。两个方法 **add / list**——`generate`
+ * （LLM 蒸馏，重操作）与 `remove`（删除口）**不进服务面**，走工具面/人工。
+ *
+ * 归因 v1 口径：lessons 文件格式保持 **strings**（孪生按 strings 读——§7 字段只增不改；
+ * v1 不落归因列，与工具面现行为一致）。账目＝本插件日志 + 返回值原样回传 `sessionHash`。
+ * 如需文件内归因列，v1.1 按「字段只增不改、读侧容忍缺失」补 `credits`。
+ *
+ * 容量两步走（银杏 10-05 裁定）：上线闸 **global 80 / workspace 50** → 银杏首轮策展
+ * （global 78→≤50）并经守夜人确认后，global 收至 50（生效时点写死进契约）。
+ * 满闸报错**指向工具面**（服务面无 remove）并带策展责任——活闸，不是死闸。
+ */
+export const LESSONS_SERVICE_VERSION = 1
+export const LESSONS_CAPACITY = { global: 80, workspace: 50 }
+export const LESSONS_CURATOR = '银杏'
+
+/** add 的容量/去重判定（纯函数，便于桩测）。去重口径与工具面一致：空白折叠后比对。 */
+export function lessonsAddDecision(list, text, cap) {
+  const clean = String(text || '').trim()
+  if (!clean) return { action: 'invalid' }
+  const cur = Array.isArray(list) ? list : []
+  if (cur.some(t => normLesson(t) === normLesson(clean))) return { action: 'duplicate', total: cur.length }
+  if (Number(cap) > 0 && cur.length >= Number(cap)) return { action: 'full', total: cur.length }
+  return { action: 'add', total: cur.length + 1 }
+}
+
+/** 建服务对象。`opts.load/save` 仅自测/预演用（注入存储，不碰真实清单文件）。 */
+export function buildLessonsService(cfg, opts = {}) {
+  const load = opts.load || loadLessons
+  const save = opts.save || saveLessons
+  const scopeOf = (req = {}) => {
+    const scope = String(req.scope || 'global').toLowerCase() === 'workspace' ? 'workspace' : 'global'
+    return { scope, ws: scope === 'workspace' ? String(req.workspace || '').trim() : '' }
   }
-  if (typeof ctx.provide === 'function') {
-    ctx.effect(() => arm('ctx.provide', (n, v) => ctx.provide(n, v)), 'dsh-liubian: 跨插件服务')
-  } else if (typeof ctx.reflect?.provide === 'function') {
-    ctx.effect(() => arm('ctx.reflect.provide', (n, v) => ctx.reflect.provide(n, v)), 'dsh-liubian: 跨插件服务')
-  } else {
-    ctx.logger?.warn?.('[dsh-liubian] 宿主无 provide 通道（ctx.provide / ctx.reflect.provide 皆不可用）——wiki 写入服务未挂载；wiki 工具面不受影响')
+  return {
+    version: LESSONS_SERVICE_VERSION,
+    add: async (req = {}) => {
+      try {
+        const { scope, ws } = scopeOf(req)
+        if (scope === 'workspace' && !ws) return { ok: false, error: 'scope=workspace 需要 workspace 参数（服务通道无会话上下文）' }
+        const list = load(scope, ws)
+        const d = lessonsAddDecision(list, req.text, LESSONS_CAPACITY[scope])
+        if (d.action === 'invalid') return { ok: false, error: 'add 需要 text（一句话教训，跨领域通用）' }
+        if (d.action === 'full') {
+          return { ok: false, full: true, error: `清单已满（${list.length}/${LESSONS_CAPACITY[scope]}）；remove 走工具面（人工），策展责任＝${LESSONS_CURATOR}` }
+        }
+        if (d.action === 'duplicate') {
+          return { ok: true, added: false, duplicate: true, total: d.total, scope, workspace: ws || undefined }
+        }
+        const text = String(req.text).trim()
+        save(list.concat([text]), scope, ws)
+        activeLogger?.info?.(`[dsh-liubian] liubianLessons.add：${scope}${ws ? '（' + ws + '）' : ''} 现 ${d.total} 条（来源会话 ${String(req.sessionHash || '') || '未带'}）`)
+        return { ok: true, added: true, duplicate: false, total: d.total, scope, workspace: ws || undefined, sessionHash: String(req.sessionHash || '') || undefined }
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || String(e) }
+      }
+    },
+    list: async (req = {}) => {
+      try {
+        const { scope, ws } = scopeOf(req)
+        if (scope === 'workspace' && !ws) return { ok: false, error: 'scope=workspace 需要 workspace 参数（服务通道无会话上下文）' }
+        const all = load(scope, ws)
+        const max = Number(req.max) > 0 ? Number(req.max) : all.length
+        return { ok: true, scope, workspace: ws || undefined, total: all.length, lessons: all.slice(0, max) }
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || String(e) }
+      }
+    },
   }
+}
+
+/** 挂载：与 provideWikiService 同形（BaseLiubianService 承载，kit 版本进挂载行）。 */
+function provideLessonsService(ctx, cfg) {
+  const impl = buildLessonsService(cfg)
+  const svc = new BaseLiubianService({
+    name: 'liubianLessons',
+    version: impl.version,
+    methods: impl,
+    logger: ctx.logger,
+    pluginName: 'dsh-liubian',
+    kitVersion: KIT_VERSION,
+  })
+  ctx.effect(() => svc.mount(ctx), 'dsh-liubian: 跨插件服务')
+  return svc
 }
 
 /** 纯函数测试缝（自检 / 诊断用，不参与运行时）。 */
@@ -1894,10 +1976,13 @@ export const __test = {
   // - 归因二分（规则 7）-
   sessionHashFor,
   buildWikiRequest,
-  // - 跨插件服务 liubianWiki -
+  // - 跨插件服务 liubianWiki / liubianLessons -
   wikiServiceRequest,
   buildWikiService,
   WIKI_SERVICE_METHODS,
+  lessonsAddDecision,
+  buildLessonsService,
+  LESSONS_CAPACITY,
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -2999,6 +3084,9 @@ export function apply(ctx, input = {}) {
 
   // 跨插件服务：便签升格等消费方在**插件内**写 wiki 的唯一通道（工具面插件调不到）
   provideWikiService(ctx, cfg)
+
+  // 跨插件服务：教训支路（便签 → lessons 写入通道，协议 §20）
+  provideLessonsService(ctx, cfg)
 
   // 上下文插入：会话启动身份卡 + 每轮联合检索注入（对照 DSH 记忆插件的接线）
   mountContextInjection(ctx, cfg)
