@@ -23,8 +23,10 @@ export class BaseJsonlFile {
    * @param {string} o.file     jsonl 文件绝对路径
    * @param {string} o.schema   _meta 里的 schema 名（如 'pending-promotions'）
    * @param {number} [o.version=1]           _meta 里的 version
-   * @param {(row:object)=>string} [o.keyOf] 可选：行 → 键串（供 removeByKey 便捷层；
-   *        键的组成是**业务决定**——必须取够字段保证唯一，宁长勿短）
+   * @param {(row:object)=>string} [o.keyOf] 可选：行 → 键串（供 removeByKey 便捷层）。
+   *        ⚠ 键的组成是**业务决定**，必须取够字段保证唯一、宁长勿短；拼接分隔符要选**字段值中
+   *        不可能出现的字符**（字段值不可控时用 `JSON.stringify([...parts])` 组键），
+   *        防两行因字段值含分隔符而撞键。
    */
   constructor({ file, schema = '', version = 1, keyOf = null } = {}) {
     this.file = String(file || '')
@@ -101,11 +103,13 @@ export class BaseJsonlFile {
 
   /**
    * 按谓词摘除（**只删命中行**；_meta 行与坏行原样保留）。原子写（tmp + rename）。
+   * 🔴 v0.2.1（青简源作者复核建议）：重写时顺手过 `ensureMeta` 语义——**凡写必带 meta**，
+   * 存量无 meta 的文件经一次摘除即升级，不必等下一次 append。
    * @returns {number} removed 条数；**-1 = 写失败**（与 0 = 没删到严格区分，调用方必须如实回告）
    */
   removeWhere(match) {
     if (typeof match !== 'function') return -1
-    const lines = this.rawLines()
+    let lines = this.rawLines()
     const keep = []
     let removed = 0
     for (const line of lines) {
@@ -118,6 +122,7 @@ export class BaseJsonlFile {
       keep.push(line)
     }
     if (!removed) return 0
+    if (!this._firstIsMeta(keep)) keep.unshift(this._metaLine())   // 凡写必带 meta
     try {
       const tmp = `${this.file}.tmp-${process.pid}`
       writeFileSync(tmp, keep.join('\n') + '\n', 'utf8')

@@ -205,6 +205,16 @@ console.log('== BaseJsonlFile（协议 §7 #19/#21：JSONL 数据文件即接口
     return `removed=${removed}｜总行=${raw.length}`
   })
   t('没删到 = 0（与 -1 写失败严格区分）', () => eq(f4.removeWhere(row => row.id === '查无此人'), 0))
+  t('🔴 v0.2.1：摘除重写时对存量无 meta 文件**顺手补 _meta**（凡写必带 meta）', () => {
+    const f5 = new BaseJsonlFile({ file: join(dir, 'legacy2.jsonl'), schema: 'legacy2' })
+    writeFileSync(join(dir, 'legacy2.jsonl'), '{"id":"keep-me"}\n{"id":"drop-me"}\n', 'utf8')   // 无 _meta 的存量
+    const removed = f5.removeWhere(row => row.id === 'drop-me')
+    eq(removed, 1)
+    const rows = f5.rows()
+    eq(rows.length, 1)
+    eq(rows[0].id, 'keep-me', '幸存行无损')
+    if (!f5.hasMeta()) throw new Error('摘除重写后应已补 _meta（凡写必带 meta）')
+  })
   t('append 后文件以换行结尾（append-only 卫生）', () => {
     const s = readFileSync(f4.file, 'utf8')
     if (!s.endsWith('\n')) throw new Error('尾行应有换行')
