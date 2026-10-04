@@ -1,5 +1,6 @@
-/** kit 自身版本（协议 §19：kit 版本必须出现在服务挂载行——版本漂移可观测）。 */
-export const KIT_VERSION = '0.1.0'
+/** kit 自身版本（协议 §19：kit 版本必须出现在服务挂载行——版本漂移可观测）。
+ *  ⚠ 与 package.json 的 version **双处同步**——改这里必须改那份，反之亦然。 */
+export const KIT_VERSION = '0.1.1'
 
 /**
  * BaseLiubianService —— 跨插件服务**提供方**的形态基类（协议 §19）。
@@ -25,8 +26,18 @@ export class BaseLiubianService {
 
   constructor({ name, version, methods, logger, pluginName, kitVersion } = {}) {
     if (name) this.name = String(name)
-    if (version != null) this.version = Number(version) || 1
-    if (methods) this.methods = methods
+    const declared = Number(version) || 1
+    this.version = declared
+    if (methods) {
+      this.methods = methods
+      // 直调形态（协议 §17 消费模板 + 全部既有消费方的调用方式）：把方法铺到实例上，
+      // 让 `svc.foo()` 与 `svc.call('foo')` 并存。
+      // ⚠ v0.1.1 补（守夜人行使验收权实测）：v0.1.0 只有 call()，infra v0.5.0 装载后
+      //   被炉三个消费点的直调（isForgotten/changes/forgetSession）全部落空——
+      //   「提供方活着」不等于「消费方可用」，验收必须含一次消费方公开形态的真调。
+      Object.assign(this, methods)
+      this.version = declared   // 方法表里若带 version 字段，不得覆盖声明的服务版本
+    }
     this.logger = logger || null
     this.pluginName = pluginName || ''
     this.kitVersion = kitVersion || null
@@ -35,6 +46,8 @@ export class BaseLiubianService {
   /**
    * 绝不抛：调用方法表中的方法，异常一律折成 { ok:false, error }（协议 #4）。
    * 未知方法名 → { ok:false, error }（不是静默兜底成别的方法）。
+   * 注意：直调形态（svc.foo()）**不带这层包装**——"方法自身不抛、返回 {ok,error}"
+   * 是提供方写方法表时的契约义务（三家现役服务均已守约）。
    */
   async call(method, args = {}) {
     const fn = this.methods[method]

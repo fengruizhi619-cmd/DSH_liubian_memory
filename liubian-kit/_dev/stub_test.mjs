@@ -89,6 +89,21 @@ t('consumeLiubianService：拿得到就返回、拿不到 null、ctx 异常 null
   eq(consumeLiubianService(null, 'x'), null)
 })
 
+await ta('直调形态：方法铺到实例上（协议 §17 模板 + 全部既有消费方的调用方式）', async () => {
+  const s = new BaseLiubianService({ name: 'liubianT', version: 2, methods: { foo: async () => ({ ok: true }), version: 99 } })
+  eq(typeof s.foo, 'function', 'v0.1.0 缺这个——被炉三个消费点直调落空的根因')
+  eq((await s.foo()).ok, true, '直调应能用')
+  eq(s.version, 2, '方法表里的 version 字段不得覆盖声明的版本')
+  eq((await s.call('foo')).ok, true, '直调与 call() 应并存')
+  return 'typeof 与 call() 双形态'
+})
+await ta('直调的业务异常：方法自身守约返回 {ok,error}（kit 不二次包装直调）', async () => {
+  const s = new BaseLiubianService({ name: 'liubianT', methods: { bad: async () => ({ ok: false, error: '按契约返回' }) } })
+  const r = await s.bad()
+  eq(r.ok, false)
+  eq(r.error, '按契约返回')
+})
+
 console.log('== BaseTombstones ==')
 const tom = new BaseTombstones(db, { keyColumn: 'session_hash' })
 tom.ensureSchema()
