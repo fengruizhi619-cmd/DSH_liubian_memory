@@ -19,8 +19,10 @@ const {
   sessionHashFor, buildWikiRequest,
   wikiServiceRequest, buildWikiService, WIKI_SERVICE_METHODS,
   lessonsAddDecision, buildLessonsService, LESSONS_CAPACITY,
-  reminderTurnDecision,
+  reminderTurnDecision, registerTools,
 } = __test
+
+const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
 const kit = await import('liubian-kit')
 
@@ -371,6 +373,25 @@ t('无真实轮次：同条数不再 fire（旧行为保留，含其已知缺陷
 })
 t('humanCount=0（无人类内容轮）不 fire', () => {
   eq(reminderTurnDecision({ turnReminderCount: 0 }, 0).fire, false)
+})
+
+/* ── 10. wiki 工具 schema（观澜 #3/#4 的防回归格） ─────────────────────────── */
+console.log('\n== wiki 工具 schema（move 通道 / 归因更正留痕） ==')
+t('schema 暴露 newFamilyPath 与 force（用假 ctx 真注册一次）', () => {
+  const captured = []
+  const fakeCtx = {
+    effect: (fn) => fn(),
+    tools: { register: (t) => captured.push(t) },
+    logger: { info() {}, warn() {}, debug() {} },
+  }
+  registerTools(fakeCtx, { workspace: '工作组', memoryTimeoutMs: 1000 })
+  ok(captured.length >= 10, '应注册 10 个工具，实际 ' + captured.length)
+  ok(captured.every((t) => t.name.startsWith(TOOL_PREFIX)), '无裸名注册（§3.2.1）：' + captured.map((t) => t.name).join(','))
+  const wiki = captured.find((t) => t.name === TOOL_PREFIX + 'wiki')
+  ok(wiki, 'wiki 工具应在')
+  const props = wiki.parameters && wiki.parameters.properties   // defineTool 转 JSON-Schema：参数在 properties 下
+  ok(props && 'newFamilyPath' in props, 'move 通道：schema 必须暴露 newFamilyPath（否则工具层 move 永远「必填」报错）')
+  ok(props && 'force' in props, '归因更正留痕：schema 必须暴露 force')
 })
 
 console.log(`\n== 结果：${pass} 过 / ${fail} 败 ==`)

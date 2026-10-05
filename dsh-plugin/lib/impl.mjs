@@ -399,13 +399,16 @@ export function registerTools(ctx, cfg) {
   register(ctx, {
     name: 'wiki',
     description: '流变·记忆 wiki 条目操作（长期记忆新形态）。action: create 创建条目（slug+家族路径+标题+简介+正文）'
-      + '｜update 修订正文/简介/家族（自动落梯度稀释检查点+修订账目）｜get 读条目（全文+修订史+检查点清单）'
-      + '｜tree 森林视图｜move 改挂家族（子树批量跟随）｜rollback 回滚到指定检查点槽位。'
-      + '贡献者自动取当前会话身份；家族路径形如「平台/DSH/会话」。',
+      + '｜update 修订正文/简介/标题/状态（自动落梯度稀释检查点+修订账目；force=内容未变也落一条修订，用于归因/元数据更正留痕）'
+      + '｜get 读条目（全文+修订史+检查点清单）｜tree 森林视图'
+      + '｜move 改挂家族（newFamilyPath=目标家族全路径，须已存在；子树批量跟随）｜rollback 回滚到指定检查点槽位。'
+      + '贡献者：执行者由当前会话绑定派生；contributor 只作内容来源者；家族路径形如「平台/DSH/会话」。',
     parameters: {
       action: { type: 'string', enum: ['create', 'update', 'get', 'tree', 'list', 'move', 'rollback', 'search'], required: true, description: '操作' },
       slug: { type: 'string', description: '条目 slug（全局唯一，不含 /，不可变）' },
-      familyPath: { type: 'string', description: '家族路径（如「水果/梨果」）；create 时 =slug 即根条目；move 传新路径（须已存在，防孤儿）' },
+      familyPath: { type: 'string', description: '家族路径（如「水果/梨果」）；create 时 =slug 即根条目（move 的目标请用 newFamilyPath）' },
+      newFamilyPath: { type: 'string', description: 'move 用：目标家族全路径（须已存在，防孤儿）' },
+      force: { type: 'boolean', description: 'update 用：内容未变也强制落一条修订（归因/元数据更正留痕，规则 6「存疑只标注不删撤」）' },
       title: { type: 'string', description: '标题（create 必填）' },
       intro: { type: 'string', description: '内容介绍（检索消歧用）' },
       content: { type: 'string', description: '正文' },
@@ -2040,6 +2043,7 @@ export const __test = {
   buildLessonsService,
   LESSONS_CAPACITY,
   reminderTurnDecision,
+  registerTools,
 }
 
 /* ──────────────────────────────────────────────────────────────────────────

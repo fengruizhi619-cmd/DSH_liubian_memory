@@ -335,8 +335,12 @@ def op_update(conn, req):
     executor, resolved, source = attribution(req)
     summary = annotate_fallback(str(req.get("summary") or "").strip(), resolved)
     now = int(time.time() * 1000)
-    if (new_content == old_content and new_intro == old_intro
-            and new_title == old_title and new_status == old_status):
+    unchanged = (new_content == old_content and new_intro == old_intro
+                 and new_title == old_title and new_status == old_status)
+    # force（〈升格流落树约定〉规则 6）：内容未变也强制落一条修订——用于归因/元数据更正
+    # 留痕（「存疑只标注不删撤」需要能留下更正的痕；unchanged 短路会把这条路堵死——
+    # 观澜 10-03 现状梳理 #4）。检查点级联自身有"内容没变不重复入槽"守卫，不会灌槽。
+    if unchanged and not req.get("force"):
         return {"ok": True, "slug": slug, "unchanged": True,
                 "executor": executor, "executorResolved": resolved, "sourceContributor": source or None}
     # ① 梯度稀释检查点：旧正文送入时间稀释槽位（级联保留）
