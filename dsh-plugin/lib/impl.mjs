@@ -10,7 +10,7 @@
  */
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { randomUUID, createHash } from 'node:crypto'
-import { BaseLiubianService, KIT_VERSION } from 'liubian-kit'
+import { BaseLiubianService, consumeLiubianService, KIT_VERSION } from 'liubian-kit'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -649,10 +649,34 @@ export function registerTools(ctx, cfg) {
     async execute(args) {
       const stats = runHelper(cfg, 'registry_stats', [], { timeoutMs: 60000 })
       const cli = runLiubianCli(cfg, ['status'], { workspace: args.workspace })
+      // 跨插件服务查态（协议 §2 #7：消费方公开形态真调）——presence + 每服务一次真实读调用。
+      // 分级口径照拾遗 10-05：缺席 ≠ 在线但缺方法（形态不符），回执分开写、不静默。
+      const svcLines = []
+      const probes = {
+        liubianWiki: (s) => s.tree({}),
+        liubianLessons: (s) => s.list({ scope: 'global', max: 1 }),
+      }
+      for (const [name, probe] of Object.entries(probes)) {
+        try {
+          const svc = consumeLiubianService(ctx, name)
+          if (!svc) { svcLines.push(`  ${name}：经通道取不到（缺席或通道形态）`); continue }
+          const ver = `v${svc.version ?? '?'}`
+          if (typeof probe !== 'function') { svcLines.push(`  ${name} ${ver}：在（探针缺失）`); continue }
+          const r = await probe(svc)
+          svcLines.push(r && r.ok
+            ? `  ${name} ${ver}：在线，实调 ok（${name === 'liubianWiki' ? '条目 ' + (r.count ?? '?') : '教训 ' + (r.total ?? '?')} 条）`
+            : `  ${name} ${ver}：**实调失败** ${(r && r.error) || '未知'}`)
+        } catch (e) {
+          svcLines.push(`  ${name}：**实调异常（形态不符?）** ${(e && e.message) || e}`)
+        }
+      }
       return [
         '[DSH 侧接入]',
         '  写日记：已退役（信息源=便签升格→wiki）',
         '  向量服务：流变基建 dsh-liubian-infra（_dsh_external_dsh_liubian_infra embed-status）',
+        '',
+        '[跨插件服务（消费方公开形态真调）]',
+        ...svcLines,
         '',
         '[注册表统计]',
         stats,
