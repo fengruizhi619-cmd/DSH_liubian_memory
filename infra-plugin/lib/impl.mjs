@@ -25,7 +25,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { BaseLiubianService, BaseTombstones, KIT_VERSION } from 'liubian-kit'
 
 export const PLUGIN_NAME = 'dsh-liubian-infra'
-export const PLUGIN_VERSION = '0.5.1'
+export const PLUGIN_VERSION = '0.5.2'
 export const CONTRACT_VERSION = '1.0'
 
 const HOME = process.env.USERPROFILE || process.env.HOME || 'C:/Users/Feng'
@@ -975,28 +975,43 @@ export async function watchdogTick(cfg, logger) {
   }
 }
 
-/** 周期看门狗，随插件卸载清理。
- *  🔴 v0.5.1 修（2026-10-05 凌晨二次死亡事故）：旧版把 `clearTimeout(timer)` 写进了
- *  `ctx.effect` 的 **fn 体**——而 fn 是立即执行的（家族标准 §11 / 玉簪 🔴-8 同族），
- *  看门狗在挂载的同一微秒被自己清除：**自 v0.2.0 挂牌迁移起从未运行过**，状态行的
- *  「看门狗开（>12288MB/300s）」一直在说谎。10-05 凌晨 llama-server 二次死亡 ≥12 分钟
- *  无人恢复，即此根因。修法：启动循环与清理各归各位——fn 里 `loop()` 启动并返回
- *  真正的 disposer。 */
+/* ── 周期看门狗（v0.5.2：**模块级单例**）──
+ * 🔴 历史教训三连（每条都有事故与证据）：
+ *   v0.2.0–v0.5.0：`clearTimeout` 误写进 ctx.effect 的 fn 体（fn 立即执行，玉簪 🔴-8 同族）
+ *   → 看门狗自挂牌迁移起**从未运行**（10-01 ≥90 分钟停摆、10-05 凌晨二次死亡，同根）；
+ *   v0.5.1：fn 体改 loop() + 返回 disposer → 首 tick 活了（挂载 80ms 后即打出功能自检告警），
+ *   但**真实宿主（bundle 常驻装配）里 disposer 在 apply 结束即触发** → 300s 周期循环仍死
+ *   （10-05 21:00 服务死亡 ≥27 分钟无人看管，被炉 shape-mismatch canary 同期零触发——
+ *   同形 ctx.effect 定时器的被炉 15s 轮询器亦死，跨插件互证）。
+ * v0.5.2 终形：**模块级单例定时器**——
+ *   - 幂等：watchdogRunning 同步栓，双重装配/热挂载/重复 mount 不叠加循环；
+ *   - 与 fiber 解耦：看门狗守的是**机器级服务**，存活期 = 宿主进程生命周期，而非某次装配——
+ *     插件重挂/热挂载的 disposer 时序不再能掐死它（这正是前两版死法的根）；
+ *   - timer.unref()：不阻塞宿主进程的自然退出；
+ *   - embed-stop 的显式停止纪律不变（explicitStop 期间不自动恢复）。
+ * ⚠ 取舍（如实登记）：插件被禁用（而非宿主退出）时，本循环**不会**随之停止——机器级服务的
+ *   看门狗比"随插件开关"更符合它的职责；若未来需要随插件停，加 stopped 栓并把本注释改掉。 */
+let watchdogRunning = false
+let watchdogStopped = false
+let watchdogTimer = null
+let watchdogCfgRef = null
+let watchdogLoggerRef = null
+
 export function mountWatchdog(ctx, cfg) {
   if (!cfg.watchdogEnabled) return
-  let timer = null
-  let stopped = false
+  watchdogCfgRef = cfg
+  watchdogLoggerRef = ctx.logger || null
+  if (watchdogRunning) return   // 幂等：双重装配/热挂载/重复 mount 不叠加循环
+  watchdogRunning = true
+  watchdogStopped = false
   const loop = async () => {
-    await watchdogTick(cfg, ctx.logger)
-    if (!stopped) timer = setTimeout(loop, (Number(cfg.watchdogIntervalSec) || 300) * 1000)
-  }
-  ctx.effect(() => {
-    loop()                              // fn 体 = **启动**（首 tick 立即，此后每 300s）
-    return () => {                      // 清理作为 disposer 返回——绝不放进 fn 体
-      stopped = true                    // 卸载后，在途 tick 完成时不得再把循环复活
-      if (timer) clearTimeout(timer)
+    await watchdogTick(watchdogCfgRef, watchdogLoggerRef)
+    if (!watchdogStopped) {
+      watchdogTimer = setTimeout(loop, (Number(watchdogCfgRef.watchdogIntervalSec) || 300) * 1000)
+      watchdogTimer.unref?.()   // 不阻塞宿主进程自然退出
     }
-  }, 'dsh-liubian-infra: 内存看门狗')
+  }
+  loop()   // 首 tick 立即
 }
 
 /* ══ 注入钩子：未绑定会话注入一条注册提示（v0.2.0，管理员钉；已绑定不注入） ══ */

@@ -507,15 +507,11 @@ await ta('活着时真嵌入 → ok + 维度 > 0（环境无 8082 时记跳过�
   return `维度 ${r.dims}｜${r.elapsedMs}ms`
 })
 
-console.log('== mountWatchdog 的 effect 语义（🔴 v0.5.1：fn 立即执行曾把看门狗掐死在挂载瞬间） ==')
+console.log('== mountWatchdog 模块级单例（v0.5.2：bundle 装配下 effect disposer 即时触发，长周期定时器必须模块级） ==')
 {
   const lines = []
-  let capturedFn = null, disposer = null
-  const ctx = {
-    logger: { info: () => {}, warn: (...a) => lines.push(a.join(' ')) },
-    // 复刻宿主语义：ctx.effect 的 fn **立即执行**，返回值即 disposer（玉簪 🔴-8 的教训形态）
-    effect: (fn, label) => { capturedFn = fn; disposer = fn() },
-  }
+  const logger = { info: (...a) => lines.push(a.join(' ')), warn: (...a) => lines.push('W ' + a.join(' ')) }
+  const deadCtx = { logger }
   // 死配置：exe 不存在 + 端口不可达 → tick 走"存活恢复"分支但 launch 失败（warn 留痕、绝不 spawn 真进程）
   const deadCfg = {
     watchdogEnabled: true, watchdogIntervalSec: 300, watchdogLimitMb: 12288,
@@ -523,18 +519,22 @@ console.log('== mountWatchdog 的 effect 语义（🔴 v0.5.1：fn 立即执行�
     serverExe: 'definitely-not-a-real-llama.exe', serverCwd: '',
     autoEnsureOnLoad: true, probeTimeoutMs: 200, probeEmbedTimeoutMs: 400,
   }
-  mountWatchdog(ctx, deadCfg)
+  mountWatchdog(deadCtx, deadCfg)   // 首 tick 立即
+  mountWatchdog(deadCtx, deadCfg)   // 幂等：双重装配/热挂载不叠加
   await new Promise(r => setTimeout(r, 1500))   // loop() 异步：等首 tick（probe+tasklist）完成再断言
 
-  t('effect 的 fn 立即执行后，首 tick 真的跑了（恢复告警出现；🔴-8 形态下 timer 被清、永不运行）', () => {
+  t('首 tick 真的跑了（恢复告警出现；🔴-8 形态下 timer 被清、永不运行）', () => {
     const hit = lines.some(l => l.includes('按存活恢复拉起'))
     if (!hit) throw new Error('首 tick 未执行——看门狗死在挂载瞬间')
     return 'deadCfg 下恢复告警已打'
   })
-  t('effect 收到真正的 disposer（函数）且可安全调用', () => {
-    if (typeof disposer !== 'function') throw new Error('fn 必须返回 disposer（旧代码返回 undefined，卸载永远清不掉）')
-    disposer()   // 卸载：stopped 置位；在途 tick 完成后循环不得复活（代码以 stopped 栓保证）
-    return 'disposer 可调用'
+  t('幂等：双重 mount 只起一个循环（恢复告警恰 1 条，不叠加）', () => {
+    const hits = lines.filter(l => l.includes('按存活恢复拉起')).length
+    eq(hits, 1, `期望恰 1 条，实际 ${hits}`)
+    return '无叠加'
+  })
+  t('launch 失败留痕（exe 不存在 → warn，绝不 spawn 真进程）', () => {
+    if (!lines.some(l => l.includes('拉起失败') || l.includes('未找到'))) throw new Error('拉起失败应留痕')
   })
 }
 
