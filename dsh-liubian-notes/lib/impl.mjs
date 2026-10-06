@@ -14,6 +14,7 @@
  * 方案文档：E:\DSH_data\流变系统\docs\便签系统_DSH实施方案.md
  */
 import { randomUUID, createHash } from 'node:crypto'
+import { BaseJsonlFile } from 'liubian-kit' // v0.7.4：账目形态基类（Batch 2 规范化；源实现=本插件账目，kit 0.2.1）
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
@@ -32,7 +33,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.7.3'
+export const PLUGIN_VERSION = '0.7.4'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -599,23 +600,15 @@ export async function buildPromoteRequest(cfg, note, logger) {
   return Object.assign({}, req, { head, content })
 }
 
-/** 按（会话, 便签）读 pending 账目里最后一条；无则 null。 */
+/** 按（会话, 便签）读 pending 账目里最后一条；无则 null。（v0.7.4 起读侧走 kit rows()：跳 _meta 与坏行） */
 export function pendingEntry(sessionKey, id) {
   const wantId = String(id || '')
   if (!wantId) return null
-  try {
-    const file = pendingPromotionsFile()
-    if (!existsSync(file)) return null
-    let found = null
-    for (const line of readFileSync(file, 'utf8').split('\n')) {
-      if (!line.trim()) continue
-      try {
-        const e = JSON.parse(line.replace(/^\uFEFF/, ''))
-        if (e && String(e.id) === wantId && String(e.session_key) === String(sessionKey)) found = e
-      } catch { /* 坏行跳过 */ }
-    }
-    return found
-  } catch { return null }
+  let found = null
+  for (const e of accountStore().rows()) {
+    if (String(e.id) === wantId && String(e.session_key) === String(sessionKey)) found = e
+  }
+  return found
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -983,69 +976,39 @@ export async function injectionBlock(pool, cfg, queryText, nowTurn) {
  * 9. 晋级缓存（固化通道暂缓——将来经被炉 P2P + 独特名系统提交 wiki）
  * ────────────────────────────────────────────────────────────────────────── */
 
-function appendPending(entry) {
-  try {
-    mkdirSync(dirname(pendingPromotionsFile()), { recursive: true })
-    const file = pendingPromotionsFile()
-    /* v0.7.3（协议 §19 _meta 首行）：**写方宿主内补插**——首行无 _meta 就插一行，
-     * 存量文件由此升级、读侧容忍缺失。_meta 行**不带 id**（§7 #19：meta 行禁带 id，
-     * 防归因反解按 id 精确匹配时误中）。 */
-    let lines = []
-    try { lines = readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()) } catch { lines = [] }
-    let hasMeta = false
-    if (lines.length) { try { hasMeta = JSON.parse(lines[0].replace(/^\uFEFF/, ''))._meta === true } catch { hasMeta = false } }
-    if (!hasMeta) lines.unshift(JSON.stringify({ _meta: true, schema: 'pending-promotions', version: 1 }))
-    lines.push(JSON.stringify(entry))
-    writeFileSync(file, lines.join('\n') + '\n', 'utf8')
-    return true
-  } catch { return false }
+/* v0.7.4（Batch 2 规范化）：账目迁 `BaseJsonlFile`（kit 0.2.1）——本插件账目正是该基类的源实现。
+ * 迁移后写/摘/读全走 kit 形态：_meta 首行幂等补插（不带 id）、按键摘除只删命中行（坏行与
+ * _meta 原样保留）、原子写 tmp+rename。keyOf = 三元组 session_key+id+queued_at，
+ * 分隔符取 \u0001（不会出现在哈希/ISO 时间戳/编号里，防字段撞键）。 */
+function accountStore() {
+  return new BaseJsonlFile({
+    file: pendingPromotionsFile(),
+    schema: 'pending-promotions',
+    version: 1,
+    keyOf: (r) => [r.session_key, r.id, r.queued_at].join('\u0001'),
+  })
 }
 
-/** 🟡-5：pending 队列里是否已有该（会话, 便签）——用于 promote 幂等（jsonl 无唯一键，只能扫）。 */
+function appendPending(entry) {
+  const r = accountStore().append(entry)
+  if (!r.ok) currentLogger?.warn?.('[dsh-liubian-notes] 账目写入失败：' + (r.error || '未知'))
+  return !!r.ok
+}
+
+/** 🟡-5：pending 队列里是否已有该（会话, 便签）——promote 幂等用。（v0.7.4 起委托 pendingEntry） */
 export function pendingHasId(sessionKey, id) {
-  const wantId = String(id || '')
-  if (!wantId) return false
-  try {
-    const file = pendingPromotionsFile()
-    if (!existsSync(file)) return false
-    return readFileSync(file, 'utf8').split('\n').filter(Boolean).some((line) => {
-      try {
-        const e = JSON.parse(line.replace(/^\uFEFF/, ''))
-        return e && String(e.id) === wantId && (!sessionKey || String(e.session_key) === String(sessionKey))
-      } catch { return false }
-    })
-  } catch { return false }
+  return !!pendingEntry(sessionKey, id)
 }
 
 /** v0.6.0：把一条 pending 条目从队列里摘掉（unqueue 的配套）。jsonl 无唯一键 → 整表重写。
  *  返回被摘掉的条数；**-1 = 写失败**（调用方必须如实回告，不得假装成功）。 */
 export function removePendingEntry(sessionKey, id, queuedAt) {
-  /* v0.7.3：**三元组键摘除**（session_key+id+queued_at，只删命中行）。
-   * 真实事故：同 id 二次送审按 (session_key,id) 摘除，把历史那条（bid=47）一并摘掉，
-   * 账目少一条（后按宿主日志重建）。键不够唯一时，**删除比写入更危险**。 */
-  const wantQueued = queuedAt === undefined || queuedAt === null ? null : String(queuedAt)
-  const wantId = String(id || '')
-  if (!wantId) return 0
-  const file = pendingPromotionsFile()
-  if (!existsSync(file)) return 0
-  let lines = []
-  try { lines = readFileSync(file, 'utf8').split('\n').filter(Boolean) } catch { return -1 }
-  const keep = []
-  let removed = 0
-  for (const line of lines) {
-    let e = null
-    try { e = JSON.parse(line.replace(/^\uFEFF/, '')) } catch { keep.push(line); continue }
-    const qOk = wantQueued === null || String(e.queued_at) === wantQueued
-    if (e && String(e.id) === wantId && qOk && (!sessionKey || String(e.session_key) === String(sessionKey))) { removed += 1; continue }
-    keep.push(line)
-  }
-  if (!removed) return 0
-  try {
-    const tmp = `${file}.tmp-${process.pid}`
-    writeFileSync(tmp, keep.join('\n') + '\n', 'utf8')
-    renameSync(tmp, file)
-    return removed
-  } catch { return -1 }
+  /* v0.7.4：迁移到 kit `removeByKey`——键 = 三元组（session_key+id+queued_at），
+   * 只删命中行、历史条目无损；-1 = 写失败 / 0 = 没删到（语义与 v0.7.3 一致）。
+   * queuedAt 缺省 → 键段为空串 → 不匹配任何行 = 安全 no-op（与 v0.7.3 行为一致）。
+   * 事故出处：同 id 二次送审曾把历史条目一并摘掉（bid=47，后按宿主日志重建）。 */
+  const key = [sessionKey, id, queuedAt].join('\u0001')
+  return accountStore().removeByKey(key)
 }
 
 /* v0.6.3：此处原有的「五连发升格标签」派生（'便签升格' + 工作区名 + 头内取词 + 补位填充）
