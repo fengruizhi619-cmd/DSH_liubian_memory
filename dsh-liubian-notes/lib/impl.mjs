@@ -33,7 +33,7 @@ try {
   if (typeof llm.createUserMessage === 'function') createUserMessageFn = llm.createUserMessage
 } catch { createUserMessageFn = null }
 
-export const PLUGIN_VERSION = '0.7.4'
+export const PLUGIN_VERSION = '0.8.0'
 export const PLUGIN_SOURCE = 'dsh-liubian-notes'
 const TOOL_PREFIX = '_dsh_external_dsh_liubian_'
 
@@ -704,7 +704,9 @@ export async function graduateOnce(cfg, pool, logger) {
   const req = await buildPromoteRequest(cfg, note, logger)
   /* v0.7.1：**池键顶到正文首行** —— board 服务会把 fromRef 改写成 svc: 来源标记，
    * 收件方（银杏）因此拿不到"这是哪张便签"，回执与对账会卡在这一格（他 20:0x 实测反馈）。 */
-  req.content = '便签坐标：' + pool.sessionKey + '/' + note.id + '\n' + req.content
+  req.content = '便签坐标：' + pool.sessionKey + '/' + note.id + '\n'
+    + (note.lane ? '建议去向：' + (note.lane === 'lesson' ? '教训支路（常驻挂载候选）' : '记忆支路') + '\n' : '')
+    + req.content
   const svc = serviceOf('kotatsuBoard')
   const entry = {
     queued_at: new Date().toISOString(),
@@ -958,11 +960,21 @@ export async function injectionBlock(pool, cfg, queryText, nowTurn) {
   if (!eligible.length) return ''
   const qv = await embedTexts(cfg, [queryText])
   if (!qv || !qv[0]) return ''   // 8082 不可用 → 静默降级（只存不注）
-  let ranked = eligible
+  /* v0.8.0 任务三①（管理员拍板：**分块制**）——置顶块与算法块**各自计额、互不挤占**：
+   * pinned 块上限 = pinnedInjectTop（缺省 = injectTop），块内按热度降序截断；
+   * 算法块 = sim top-injectTop，行为与改动前逐字节一致。pinned 豁免 minSim（手动选中 = 意志表达）。
+   * 分块骨架同时为决议的"记忆下行 / 教训常驻挂载"预留：将来各配各的块和上限。 */
+  const pinTop = Math.max(1, Number(cfg.pinnedInjectTop) || Number(cfg.injectTop) || 3)
+  const scored = eligible
     .map(note => ({ note, sim: cosine(qv[0], note.vector), heat: heatScore(note, nowTurn, cfg.heatRounds) }))
+  const pinned = scored.filter(r => r.note.pinned === true)
+    .sort((a, b) => (b.heat - a.heat) || (b.sim - a.sim))
+    .slice(0, pinTop)
+  const rest = scored.filter(r => r.note.pinned !== true)
     .sort((a, b) => b.sim - a.sim)
     .slice(0, cfg.injectTop)
-  if (cfg.minSim > 0) ranked = ranked.filter(r => r.sim >= cfg.minSim)
+  let ranked = [...pinned, ...rest]
+  if (cfg.minSim > 0) ranked = ranked.filter(r => r.note.pinned === true || r.sim >= cfg.minSim)
   if (!ranked.length) return ''
   for (const r of ranked) {
     r.note.heat.push(nowTurn)                          // 每被注入一次记 1 条热度
@@ -1111,7 +1123,9 @@ export async function noteToolAction(cfg, args = {}, logger, exec = null) {
       }
       const ws = String(args.workspace || cfg.workspace || '工作组').trim()
       const req = await buildPromoteRequest(cfg, note, logger)
-      req.content = '便签坐标：' + pool.sessionKey + '/' + note.id + '\n' + req.content   // v0.7.1：同自动件
+      req.content = '便签坐标：' + pool.sessionKey + '/' + note.id + '\n'
+        + (note.lane ? '建议去向：' + (note.lane === 'lesson' ? '教训支路（常驻挂载候选）' : '记忆支路') + '\n' : '')
+        + req.content   // v0.8.0：任务三③ 建议去向随请求送银杏终审
       const svc = serviceOf('kotatsuBoard')
       const entry = {
         queued_at: new Date().toISOString(),
@@ -1163,6 +1177,39 @@ export async function noteToolAction(cfg, args = {}, logger, exec = null) {
    * queued 原本是单向态（promote 只能置位、drop 对 queued 明确拒绝），串池误标后工具面无法修复。
    * 本动作是唯一**缓存一致**的修复路径：在宿主内改内存对象再落盘，不会像"直接改 pools/*.json"
    * 那样被活会话的内存快照静默回滚（loadPool 命中缓存直接返回，不比对 mtime）。 */
+  if (action === 'pin') {
+    /* v0.8.0 任务三①：手动选中注入（置顶）。pinned 便签优先占满注入名额（见 injectionBlock）。 */
+    return withPoolLock(pool.sessionKey, async () => {
+      const note = pool.notes.find(n => n.id === String(args.id || ''))
+      if (!note) return `[未找到] 便签 ${args.id}。`
+      if (note.status === 'retired') return `[拒绝] ${note.id} 在回收站里，先 restore 再置顶。`
+      const want = args.pinned === undefined ? !(note.pinned === true) : !!args.pinned
+      note.pinned = want
+      const savedOk = savePool(pool)
+      return `${want ? '已置顶' : '已取消置顶'}：${note.id}「${firstLine(note.head, 24)}」——注入排序中优先占满名额（上限 ${cfg.injectTop}）。`
+        + (savedOk ? '' : '（⚠ 池状态落盘失败）')
+    })
+  }
+
+  if (action === 'lane') {
+    /* v0.8.0 任务三③：便签分区（§20 分流 UI 前置）——lane 是**建议去向**，随升格请求送银杏终审。
+     * 本刀不做自动分流：路由语义待裁（免审直达 vs 经银杏），接口已留（本字段即接口）。 */
+    const lane = String(args.lane || '').trim()
+    if (lane && lane !== 'memory' && lane !== 'lesson') {
+      return `[拒绝] lane 只支持 memory / lesson（或留空清除），收到：${lane}。`
+    }
+    return withPoolLock(pool.sessionKey, async () => {
+      const note = pool.notes.find(n => n.id === String(args.id || ''))
+      if (!note) return `[未找到] 便签 ${args.id}。`
+      note.lane = lane || null
+      const savedOk = savePool(pool)
+      const msg = lane
+        ? `分区已记：${note.id} → ${lane} 支路（作为"建议去向"随升格请求送银杏终审，非自动分流）。`
+        : `分区已清除：${note.id}（回到现制自动）。`
+      return msg + (savedOk ? '' : '（⚠ 池状态落盘失败）')
+    })
+  }
+
   if (action === 'unqueue') {
     return withPoolLock(pool.sessionKey, async () => {
       const note = pool.notes.find(n => n.id === String(args.id || ''))
@@ -1556,7 +1603,7 @@ export function apply(ctx, input = {}) {
       + 'unqueue 解除待固化（queued→active 并摘除 pending 条目，串池误标后的修复路径）；drop/restore 回收站。'
       + '默认操作本对话的池（＝调用方会话）；session 可选，用于显式指定别的会话。',
     parameters: {
-      action: { type: 'string', required: true, description: 'list | show | stick | promote | unqueue | drop | restore', enum: ['list', 'show', 'stick', 'promote', 'unqueue', 'drop', 'restore'] },
+      action: { type: 'string', required: true, description: 'list | show | stick | pin | lane | promote | unqueue | drop | restore', enum: ['list', 'show', 'stick', 'pin', 'lane', 'promote', 'unqueue', 'drop', 'restore'] },
       head: { type: 'string', description: 'stick 用：便签头（一句话简介，向量来源）' },
       body: { type: 'string', description: 'stick 用：便签正文' },
       id: { type: 'string', description: 'show/promote/unqueue/drop/restore 用：便签 ID，如 NT-1' },
@@ -1566,6 +1613,8 @@ export function apply(ctx, input = {}) {
        * 而 schema 一直没有它 → 任何照 schema 调的调用方永远拿不到（list 因此永远只能显示
        * 「N 条」原始记录数、显示不出 l/m 热度窗口分）。同类缺口参考：wiki move 的 newFamilyPath。 */
       nowTurn: { type: 'number', description: '可选：当前回合号。list 用它把热度显示成 l/m 窗口分；stick/restore 用它标 born_turn（省略则按池内进度推定）' },
+      pinned: { type: 'boolean', description: 'pin 用：true=置顶注入（优先占满注入名额），false=取消；省略 = 翻转' },
+      lane: { type: 'string', description: 'lane 用：分区（建议去向）——memory=记忆支路 / lesson=教训支路；留空 = 清除。随升格请求送银杏终审，非自动分流' },
     },
     async execute(args, exec) {
       // 🔴-9：第 2 形参（调用方上下文）必须转发——旧包装只接 args，exec 被丢掉，
